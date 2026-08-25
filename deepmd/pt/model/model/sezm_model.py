@@ -1271,7 +1271,37 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         embedding_only=embedding_only,
                         atomic_output_only=atomic_output_only,
                     )
+        model_predict = self._merge_lr_scatter_outputs(model_predict, atype)
         return self._output_type_cast(model_predict, input_prec)
+
+    def _merge_lr_scatter_outputs(
+        self,
+        model_predict: dict[str, torch.Tensor],
+        atype: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Merge long-range force/virial outputs into the scatter-domain keys.
+
+        No-op for the base model.  ``SeZMSOGModel`` produces ``lr_force`` and
+        ``lr_virial_atom`` inside ``core_compute`` keyed by the local-atom
+        axis; they are merged into the scatter-domain ``energy_derv_r`` /
+        ``energy_derv_c`` here, outside the (possibly traced) core graph,
+        where the shapes are concrete and the two axes are known to coincide
+        on the single-domain path.
+        """
+        if "lr_force" not in model_predict:
+            return model_predict
+        nf, nloc = atype.shape[:2]
+        lr_force = model_predict.pop("lr_force")
+        lr_virial_atom = model_predict.pop("lr_virial_atom")
+        edr = model_predict["energy_derv_r"]
+        fpad = torch.zeros_like(edr)
+        fpad[:, :nloc, :, :] = lr_force.unsqueeze(-2).to(edr.dtype)
+        model_predict["energy_derv_r"] = edr + fpad
+        edc = model_predict["energy_derv_c"]
+        vpad = torch.zeros_like(edc)
+        vpad[:, :nloc, :, :] = lr_virial_atom.reshape(nf, nloc, 1, 9).to(edc.dtype)
+        model_predict["energy_derv_c"] = edc + vpad
+        return model_predict
 
     def forward_common_lower_dens(
         self,
@@ -1553,7 +1583,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # forwarded unconditionally -- ``forward_with_edges`` ignores ``nloc``
         # without ``comm_dict``, and ``extended_coord`` only supplies the device.
         with nvtx_range("SeZM/descriptor"):
-            descriptor, _ = descriptor_model.forward_with_edges(
+            descriptor, latent = descriptor_model.forward_with_edges(
                 extended_coord=coord,
                 extended_atype=descriptor_atype,
                 edge_index=edge_index,
@@ -1567,15 +1597,21 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
         # === Step 3. Fitting net ===
         # The same fitting forward serves both modes; ``embedding_only`` only asks
-        # it to also return the last hidden activation.
+        # it to also return the last hidden activation.  Fittings that read the
+        # equivariant latent (e.g. the SOG dipole head) opt in via the
+        # ``use_dipole`` attribute to keep this call signature stable.
         with nvtx_range("SeZM/fitting_net"):
-            fit_ret = self.atomic_model.fitting_net(
-                descriptor,
-                atype,
-                fparam=fparam,
-                aparam=aparam,
-                return_atomic_feature=embedding_only,
-            )
+            fitting_net = self.atomic_model.fitting_net
+            fit_kwargs: dict[str, Any] = {
+                "fparam": fparam,
+                "aparam": aparam,
+                "return_atomic_feature": embedding_only,
+            }
+            if getattr(fitting_net, "use_dipole", False):
+                fit_kwargs["latent"] = latent
+            if getattr(fitting_net, "use_charge_spin", False):
+                fit_kwargs["charge_spin"] = charge_spin
+            fit_ret = fitting_net(descriptor, atype, **fit_kwargs)
 
         # === Embedding short circuit ===
         # The embedding path returns three plain forward outputs: the per-atom
@@ -1654,6 +1690,18 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         energy_redu = torch.sum(
             energy_atom.to(env.GLOBAL_PT_ENER_FLOAT_PRECISION), dim=1
         )
+        # === Step 6a. Optional long-range energy injection ===
+        # No-op on the base model; SeZMSOGModel evaluates the SOG/LES energy
+        # here so that its latent-charge / dipole dependence rides the same
+        # ``edge_vec`` backward as the short-range energy.  The returned
+        # context is consumed by :meth:`_apply_lr_correction` below.
+        energy_redu, lr_ctx = self._lr_energy_for_edge_path(
+            energy_redu,
+            coord,
+            atype,
+            fit_ret,
+            comm_dict,
+        )
         energy_derv_r, energy_derv_c, energy_derv_c_redu, energy_derv_r_mag = (
             edge_energy_deriv(
                 energy_redu,
@@ -1678,6 +1726,57 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         }
         if energy_derv_r_mag is not None:
             model_ret["energy_derv_r_mag"] = energy_derv_r_mag
+        # === Step 7. Optional long-range correction ===
+        # No-op on the base model; SeZMSOGModel adds the explicit-coordinate
+        # part of the SOG/LES force and virial (the O(N^2) kernel geometry is
+        # a function of ``coord``, not of ``edge_vec``) plus the per-atom
+        # energy spread.
+        return self._apply_lr_correction(
+            model_ret,
+            coord,
+            atype,
+            fit_ret,
+            lr_ctx,
+            create_graph=self.training,
+            comm_dict=comm_dict,
+        )
+
+    def _lr_energy_for_edge_path(
+        self,
+        energy_redu: torch.Tensor,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        fit_ret: dict[str, torch.Tensor],
+        comm_dict: dict[str, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, Any]:
+        """Hook for model-level energy terms (base model: no-op).
+
+        Called in the conservative :meth:`core_compute` path right before
+        :func:`edge_energy_deriv`.  ``SeZMSOGModel`` overrides it to add the
+        SOG/LES long-range energy to ``energy_redu``, so that the dependence
+        on the fitting-produced latent charge / dipole is differentiated
+        through the shared ``edge_vec`` backward.
+        """
+        return energy_redu, None
+
+    def _apply_lr_correction(
+        self,
+        model_ret: dict[str, torch.Tensor],
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        fit_ret: dict[str, torch.Tensor],
+        lr_ctx: Any,
+        create_graph: bool,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Hook for model-level energy corrections (base model: no-op).
+
+        Called at the end of the conservative :meth:`core_compute` path with
+        the assembled lower outputs and the context returned by
+        :meth:`_lr_energy_for_edge_path`.  ``SeZMSOGModel`` overrides it to
+        add the explicit-coordinate SOG/LES force/virial, which cannot ride
+        the ``edge_vec`` autograd branch.
+        """
         return model_ret
 
     def core_compute_dens(

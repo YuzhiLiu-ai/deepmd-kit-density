@@ -165,6 +165,7 @@ source/               # C++ source code and tests
 - **Configuration**: Use `input_torch.json` format typically
 - **Training**: `dp --pt train input_torch.json`
 - **Requirements**: `torch` package
+- **DPA4-LR long-range variant**: model type `dpa4_lr` (alias `sog_sezm`/`sezm_sog`) with fitting type `sog_energy` adds a non-periodic SOG/LES long-range term on top of the DPA4/SeZM descriptor (`deepmd/pt/model/model/sezm_sog_model.py`, `deepmd/pt/model/task/sog_energy_fitting.py`). Only `box=None` systems are supported (periodic SOG/Ewald is not implemented); `use_compile` works and is parity-tested against eager. `.pt2` freeze raises `NotImplementedError`. Tests: `python -m unittest source.tests.pt.model.test_sezm_sog` (compile-parity tests take ~1 min each)
 
 ### JAX Backend
 

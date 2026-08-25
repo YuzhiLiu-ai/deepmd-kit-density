@@ -94,6 +94,9 @@ from .sezm_native_spin_model import (
 from .sezm_property_model import (
     SeZMPropertyModel,
 )
+from .sezm_sog_model import (
+    SeZMSOGModel,
+)
 from .sezm_spin_model import (
     SeZMSpinModel,
 )
@@ -557,6 +560,20 @@ def get_sezm_model(model_params: dict) -> BaseModel:
     if fitting_net["type"] in ("dpa4_ener", "sezm_ener"):
         fitting = BaseFitting(**fitting_net)
         modelcls = SeZMModel
+    elif fitting_net["type"] == "sog_energy":
+        if fitting_net.get("lr_kernel", "les") == "dipole":
+            latent_lmax = getattr(descriptor, "node_readout_lmax", None)
+            channels = getattr(descriptor, "channels", None)
+            if latent_lmax is None or channels is None:
+                raise NotImplementedError(
+                    "`lr_kernel='dipole'` requires a SeZM/DPA4 descriptor that "
+                    "exposes `node_readout_lmax` and `channels` for the "
+                    "equivariant latent dipole readout."
+                )
+            fitting_net["dipole_lmax"] = int(latent_lmax)
+            fitting_net["dipole_channels"] = int(channels)
+        fitting = BaseFitting(**fitting_net)
+        modelcls = SeZMSOGModel
     elif fitting_net["type"] == "property":
         if bridging_method != "NONE":
             raise ValueError(
@@ -577,8 +594,8 @@ def get_sezm_model(model_params: dict) -> BaseModel:
         modelcls = SeZMPropertyModel
     else:
         raise ValueError(
-            "DPA4/SeZM model supports `dpa4_ener`, `sezm_ener`, or `property` "
-            f"fitting, but got `{fitting_net['type']}`."
+            "DPA4/SeZM model supports `dpa4_ener`, `sezm_ener`, `sog_energy`, "
+            f"or `property` fitting, but got `{fitting_net['type']}`."
         )
     atom_exclude_types = model_params.get("atom_exclude_types", [])
     preset_out_bias = model_params.get("preset_out_bias")
@@ -807,6 +824,18 @@ def get_model(model_params: dict) -> Any:
         if "spin" in model_params:
             return get_sezm_spin_model(model_params)
         return get_sezm_model(model_params)
+    elif model_type in ("sezm_sog", "dpa4_lr", "sog_sezm"):
+        if "spin" in model_params:
+            raise NotImplementedError(
+                "SeZM-SOG long-range models do not support spin yet."
+            )
+        sog_fitting_type = model_params.get("fitting_net", {}).get("type", "dpa4_ener")
+        if sog_fitting_type != "sog_energy":
+            raise ValueError(
+                f"Model type '{model_type}' requires fitting type 'sog_energy', "
+                f"but got '{sog_fitting_type}'."
+            )
+        return get_sezm_model(model_params)
     else:
         return BaseModel.get_class_by_type(model_type).get_model(model_params)
 
@@ -825,6 +854,7 @@ __all__ = [
     "SeZMModel",
     "SeZMNativeSpinModel",
     "SeZMPropertyModel",
+    "SeZMSOGModel",
     "SeZMSpinModel",
     "SpinEnergyModel",
     "SpinModel",

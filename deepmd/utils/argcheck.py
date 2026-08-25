@@ -2969,6 +2969,168 @@ def fitting_sezm_ener() -> list[Argument]:
 
 
 @fitting_args_plugin.register(
+    "sog_energy",
+    doc=supported_backends("pt")
+    + "Fit a SOG/LES-energy model (SR + non-periodic LR). Only used with the "
+    "`dpa4_lr` model type (PyTorch backend, non-periodic systems).",
+)
+def fitting_sog_energy() -> list[Argument]:
+    doc_dim_out_lr = (
+        "The output dimension of the long-range (latent charge) fitting branch. "
+        "Must be 1 when `lr_kernel` is 'les'."
+    )
+    doc_neuron_lr = (
+        "The number of neurons in each hidden layer of the long-range fitting net."
+    )
+    doc_bias_atom_q = (
+        "Initial bias values for the latent charge (q) of each atomic type. "
+        "If not set, a trainable type-embedding network is used instead."
+    )
+    doc_amp = "Trainable amplitude parameter used in the SOG correction kernel."
+    doc_bandwidth = (
+        "Trainable base width sigma_m for each Gaussian level in the SOG "
+        "correction kernel. The value is stored as sigma_m and squared "
+        "on-the-fly inside the kernel."
+    )
+    doc_les_alpha = (
+        "Trainable width parameter for the non-periodic LES correction. "
+        "The LES kernel is erf(alpha * r) / r, which behaves as 1/r at long range."
+    )
+    doc_b = "SOG correction hyper-parameter b."
+    doc_sigma = "SOG correction hyper-parameter sigma."
+    doc_M = "SOG correction hyper-parameter M (positive integer)."
+    doc_remove_self_interaction = (
+        "Whether to remove the self-interaction term in the long-range correction."
+    )
+    doc_lr_kernel = (
+        "Long-range kernel used for non-periodic systems. "
+        "'les' (default) applies only the LES erf(alpha*r)/r charge-charge "
+        "kernel; 'dipole' additionally predicts per-atom dipole vectors from "
+        "the SeZM equivariant latent and adds the smeared charge-dipole, "
+        "dipole-dipole, and self-polarization terms; 'sog' applies only the "
+        "SOG Gaussian kernel (with its self-interaction term unless "
+        "remove_self_interaction=True), without any LES part. 'les' and "
+        "'dipole' use physical scalar charges and require dim_out_lr=1."
+    )
+    doc_alpha_pol = (
+        "Base polarizability per element used by the dipole self-polarization "
+        "term sum_i |p_i|^2 / (2 * alpha_pol_i). The value is stored directly "
+        "and squared on-the-fly (same convention as bandwidth) to keep the "
+        "effective polarizability positive during training. A scalar is "
+        "broadcast to all elements. Only used when lr_kernel='dipole'."
+    )
+    doc_use_charge_constraint = (
+        "Whether to enforce the sum of latent charges equals the target total "
+        "charge (from fparam column 0 or charge_spin[:, 0])."
+    )
+    doc_use_self_pol = (
+        "Whether to include the dipole self-polarization term "
+        "sum_i |p_i|^2 / (2 alpha_pol_i). Only used when lr_kernel='dipole'."
+    )
+    return [
+        # The short-range branch shares the dpa4_ener GLU fitting arguments.
+        *fitting_sezm_ener(),
+        Argument(
+            "dim_out_lr",
+            int,
+            optional=True,
+            default=1,
+            doc=supported_backends("pt") + doc_dim_out_lr,
+        ),
+        Argument(
+            "neuron_lr",
+            list[int],
+            optional=True,
+            default=[120, 120, 120],
+            doc=supported_backends("pt") + doc_neuron_lr,
+        ),
+        Argument(
+            "bias_atom_q",
+            list[float],
+            optional=True,
+            doc=supported_backends("pt") + doc_bias_atom_q,
+        ),
+        Argument(
+            "amp",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt") + doc_amp,
+        ),
+        Argument(
+            "bandwidth",
+            [list[float], float, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt") + doc_bandwidth,
+        ),
+        Argument(
+            "les_alpha",
+            [float, type(None)],
+            optional=True,
+            default=1.0,
+            doc=supported_backends("pt") + doc_les_alpha,
+        ),
+        Argument(
+            "b",
+            [float, list[float]],
+            optional=True,
+            default=1.6297670882677647,
+            doc=supported_backends("pt") + doc_b,
+        ),
+        Argument(
+            "sigma",
+            [float, list[float]],
+            optional=True,
+            default=2.180230445405648,
+            doc=supported_backends("pt") + doc_sigma,
+        ),
+        Argument(
+            "M",
+            int,
+            optional=True,
+            default=12,
+            doc=supported_backends("pt") + doc_M,
+        ),
+        Argument(
+            "remove_self_interaction",
+            bool,
+            optional=True,
+            default=False,
+            doc=supported_backends("pt") + doc_remove_self_interaction,
+        ),
+        Argument(
+            "lr_kernel",
+            str,
+            optional=True,
+            default="les",
+            doc=supported_backends("pt") + doc_lr_kernel,
+        ),
+        Argument(
+            "alpha_pol",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt") + doc_alpha_pol,
+        ),
+        Argument(
+            "use_charge_constraint",
+            bool,
+            optional=True,
+            default=False,
+            doc=supported_backends("pt") + doc_use_charge_constraint,
+        ),
+        Argument(
+            "use_self_pol",
+            bool,
+            optional=True,
+            default=True,
+            doc=supported_backends("pt") + doc_use_self_pol,
+        ),
+    ]
+
+
+@fitting_args_plugin.register(
     "dos", doc=supported_backends("tf", "pt", "pt_expt", "tf2") + doc_dos
 )
 def fitting_dos() -> list[Argument]:
@@ -3808,6 +3970,96 @@ def sezm_model_args() -> Argument:
         ],
         alias=["DPA4", "SeZM", "sezm"],
         doc=supported_backends("pt", "pt_expt") + doc_model,
+    )
+    return ca
+
+
+@model_args_plugin.register(
+    "dpa4_lr",
+    alias=["sog_sezm", "sezm_sog"],
+)
+def sezm_sog_model_args() -> Argument:
+    doc_descrpt = (
+        "Descriptor configuration for atomic environments. DPA4-LR uses the "
+        "SeZM descriptor."
+    )
+    doc_fitting = (
+        "Fitting network configuration. DPA4-LR requires the `sog_energy` "
+        "fitting, which augments the `dpa4_ener` GLU energy fitting with a "
+        "long-range latent-charge branch."
+    )
+    doc_enable_tf32 = (
+        "If True, enable TF32 matmul precision for CUDA training forwards. "
+        "This training-time setting is independent of `use_compile`; eval-time "
+        "TF32 is controlled separately by `validating.tf32_infer` or "
+        "`DP_TF32_INFER`."
+    )
+    doc_use_compile = (
+        "Experimental feature. If True, use compact sparse edges together with "
+        "symbolic make_fx and torch.compile in the DPA4-LR model. "
+        "Requires torch==2.11."
+    )
+    doc_model = (
+        "DPA4-LR model scaffold: the SeZM descriptor plus a non-periodic "
+        "SOG/LES long-range term evaluated from the latent charges (and "
+        "optional latent dipoles) produced by the `sog_energy` fitting. "
+        "Only the PyTorch backend and non-periodic systems (no box) are "
+        "supported."
+    )
+    ca = Argument(
+        "dpa4_lr",
+        dict,
+        [
+            Argument(
+                "descriptor",
+                dict,
+                [],
+                [
+                    Variant(
+                        "type",
+                        [descrpt_args_plugin.get_argument("dpa4")],
+                        optional=True,
+                        default_tag="dpa4",
+                        doc="The type of the descriptor.",
+                    )
+                ],
+                doc=supported_backends("pt") + doc_descrpt,
+            ),
+            Argument(
+                "fitting_net",
+                dict,
+                [],
+                [
+                    Variant(
+                        "type",
+                        [
+                            fitting_args_plugin.get_argument("sog_energy"),
+                        ],
+                        optional=True,
+                        default_tag="sog_energy",
+                        doc="The type of the fitting.",
+                    )
+                ],
+                doc=supported_backends("pt") + doc_fitting,
+            ),
+            Argument(
+                "use_compile",
+                bool,
+                optional=True,
+                default=False,
+                doc=supported_backends("pt") + doc_use_compile,
+            ),
+            Argument(
+                "enable_tf32",
+                bool,
+                optional=True,
+                default=True,
+                doc=supported_backends("pt") + doc_enable_tf32,
+            ),
+            *_bridging_method_args(),
+        ],
+        alias=["sog_sezm", "sezm_sog"],
+        doc=supported_backends("pt") + doc_model,
     )
     return ca
 

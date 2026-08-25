@@ -165,10 +165,15 @@ def is_sezm_checkpoint(ckpt_path: str) -> bool:
 
     def _is_sezm_params(branch_params: dict[str, Any]) -> bool:
         # the flag spelling and the canonical bridged linear spelling both
-        # realize a SeZMModel in the pt backend
+        # realize a SeZMModel in the pt backend; the SOG variants are routed
+        # here as well so freeze fails with a clear message instead of an
+        # opaque fallback to the legacy exporter
         return str(branch_params.get("type", "")).lower() in (
             "sezm",
             "dpa4",
+            "sezm_sog",
+            "dpa4_lr",
+            "sog_sezm",
         ) or is_bridged_sezm_config(branch_params)
 
     if "model_dict" in params:
@@ -882,6 +887,11 @@ def freeze_sezm_to_pt2(
     state_dict, params = _select_model_head(state_dict, params, head)
 
     model_type = str(params.get("type", "")).lower()
+    if model_type in ("sezm_sog", "dpa4_lr", "sog_sezm"):
+        raise NotImplementedError(
+            "SeZM-SOG long-range checkpoints are not supported by the .pt2 "
+            "exporter yet (the SOG/LES long-range branch is eager-only)."
+        )
     if model_type not in ("sezm", "dpa4") and not is_bridged_sezm_config(params):
         raise ValueError(
             f"freeze_sezm_to_pt2 expects a SeZM/DPA4 checkpoint, got type={params.get('type')!r}."
