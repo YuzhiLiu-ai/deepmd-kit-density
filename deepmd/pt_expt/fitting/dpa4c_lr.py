@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""PyTorch-exportable wrapper for the DPA4C long-range fitting."""
+
+from typing import (
+    Any,
+)
+
+import torch
+
+from deepmd.dpmodel.fitting.dpa4c_lr import (
+    DPA4CLRFitting as DPA4CLRFittingDP,
+)
+from deepmd.pt_expt.common import (
+    register_dpmodel_mapping,
+    torch_module,
+)
+
+from .base_fitting import (
+    BaseFitting,
+)
+
+
+@BaseFitting.register("dpa4c_lr")
+@torch_module
+class DPA4CLRFitting(DPA4CLRFittingDP):
+    """DPA4C long-range fitting net for the pt_expt backend."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # In the dpmodel these are plain numpy arrays, which the wrapper stores
+        # as non-trainable buffers.  Promote them to Parameters so the LES width
+        # and per-type latent-charge bias are optimized, matching the SOG
+        # fitting's treatment of ``les_alpha`` and ``bias_atom_q``.
+        self._promote_to_parameter("les_alpha")
+        self._promote_to_parameter("bias_atom_q")
+
+    def _promote_to_parameter(self, name: str) -> None:
+        value = getattr(self, name, None)
+        if value is None or isinstance(value, torch.nn.Parameter):
+            return
+        tensor = (
+            value.detach().clone()
+            if isinstance(value, torch.Tensor)
+            else torch.as_tensor(value)
+        )
+        if name in self._buffers:
+            del self._buffers[name]
+        self.register_parameter(
+            name, torch.nn.Parameter(tensor, requires_grad=bool(self.trainable))
+        )
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.call(*args, **kwargs)
+
+
+register_dpmodel_mapping(
+    DPA4CLRFittingDP,
+    lambda v: DPA4CLRFitting.deserialize(v.serialize()),
+)

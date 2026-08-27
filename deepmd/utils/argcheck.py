@@ -3131,6 +3131,82 @@ def fitting_sog_energy() -> list[Argument]:
 
 
 @fitting_args_plugin.register(
+    "dpa4c_lr",
+    doc=supported_backends("pt_expt")
+    + "Fit a DPA4C latent-charge energy model (SR + non-periodic LES).",
+)
+def fitting_dpa4c_lr() -> list[Argument]:
+    doc_dim_out_lr = (
+        "The output dimension of the long-range (latent charge) fitting branch. "
+        "Must be 1 for the LES kernel."
+    )
+    doc_neuron_lr = (
+        "The number of neurons in each hidden layer of the latent-charge fitting net."
+    )
+    doc_bias_atom_q = (
+        "Initial bias values for the latent charge (q) of each atomic type. "
+        "If not set, a trainable per-type array is used."
+    )
+    doc_les_alpha = (
+        "Trainable width parameter for the non-periodic LES correction. "
+        "The LES kernel is erf(alpha * r) / r, which behaves as 1/r at long range."
+    )
+    doc_lr_kernel = (
+        "Long-range kernel used for non-periodic systems. "
+        "'les' (default) applies only the LES erf(alpha*r)/r charge-charge kernel. "
+        "'sog' is reserved for future use and not yet supported by the DPA4C model layer."
+    )
+    doc_use_charge_constraint = (
+        "Whether to enforce the sum of latent charges equals the target total "
+        "charge (from charge_spin[:, 0] or fparam[:, 0])."
+    )
+    return [
+        *fitting_sezm_ener(),
+        Argument(
+            "dim_out_lr",
+            int,
+            optional=True,
+            default=1,
+            doc=supported_backends("pt_expt") + doc_dim_out_lr,
+        ),
+        Argument(
+            "neuron_lr",
+            list[int],
+            optional=True,
+            default=[64, 64],
+            doc=supported_backends("pt_expt") + doc_neuron_lr,
+        ),
+        Argument(
+            "bias_atom_q",
+            list[float],
+            optional=True,
+            doc=supported_backends("pt_expt") + doc_bias_atom_q,
+        ),
+        Argument(
+            "les_alpha",
+            [float, type(None)],
+            optional=True,
+            default=1.0,
+            doc=supported_backends("pt_expt") + doc_les_alpha,
+        ),
+        Argument(
+            "lr_kernel",
+            str,
+            optional=True,
+            default="les",
+            doc=supported_backends("pt_expt") + doc_lr_kernel,
+        ),
+        Argument(
+            "use_charge_constraint",
+            bool,
+            optional=True,
+            default=False,
+            doc=supported_backends("pt_expt") + doc_use_charge_constraint,
+        ),
+    ]
+
+
+@fitting_args_plugin.register(
     "dos", doc=supported_backends("tf", "pt", "pt_expt", "tf2") + doc_dos
 )
 def fitting_dos() -> list[Argument]:
@@ -4060,6 +4136,64 @@ def sezm_sog_model_args() -> Argument:
         ],
         alias=["sog_sezm", "sezm_sog"],
         doc=supported_backends("pt") + doc_model,
+    )
+    return ca
+
+
+@model_args_plugin.register("dpa4c_lr")
+def dpa4c_lr_model_args() -> Argument:
+    doc_descrpt = (
+        "Descriptor configuration for atomic environments. DPA4C-LR uses the "
+        "compact DPA4C descriptor."
+    )
+    doc_fitting = (
+        "Fitting network configuration. DPA4C-LR requires the `dpa4c_lr` "
+        "fitting, which augments the `dpa4_ener` GLU energy fitting with a "
+        "long-range latent-charge branch."
+    )
+    doc_model = (
+        "DPA4C-LR model scaffold: the compact DPA4C descriptor plus a "
+        "non-periodic LES long-range term evaluated from the latent charges "
+        "produced by the `dpa4c_lr` fitting. Only the pt_expt backend and "
+        "non-periodic systems (no box) are supported."
+    )
+    ca = Argument(
+        "dpa4c_lr",
+        dict,
+        [
+            Argument(
+                "descriptor",
+                dict,
+                [],
+                [
+                    Variant(
+                        "type",
+                        [descrpt_args_plugin.get_argument("dpa4c")],
+                        optional=True,
+                        default_tag="dpa4c",
+                        doc="The type of the descriptor.",
+                    )
+                ],
+                doc=supported_backends("pt_expt") + doc_descrpt,
+            ),
+            Argument(
+                "fitting_net",
+                dict,
+                [],
+                [
+                    Variant(
+                        "type",
+                        [fitting_args_plugin.get_argument("dpa4c_lr")],
+                        optional=True,
+                        default_tag="dpa4c_lr",
+                        doc="The type of the fitting.",
+                    )
+                ],
+                doc=supported_backends("pt_expt") + doc_fitting,
+            ),
+            *_bridging_method_args(),
+        ],
+        doc=supported_backends("pt_expt") + doc_model,
     )
     return ca
 
