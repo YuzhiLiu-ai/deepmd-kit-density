@@ -293,7 +293,7 @@ class DPA4CLREnergyModel(EnergyModel):
                 create_graph=self.training,
                 retain_graph=True,
             )
-            lr_force, _, lr_virial = edge_force_virial(
+            lr_force, lr_atom_virial, lr_virial = edge_force_virial(
                 g_lr,
                 lr_edge_vec,
                 lr_edge_index,
@@ -311,6 +311,12 @@ class DPA4CLREnergyModel(EnergyModel):
                 ] + lr_virial.reshape(nf, 1, 9).to(
                     model_ret["energy_derv_c_redu"].dtype
                 )
+                if do_atomic_virial:
+                    model_ret["energy_derv_c"] = model_ret[
+                        "energy_derv_c"
+                    ] + lr_atom_virial.reshape(-1, 1, 9).to(
+                        model_ret["energy_derv_c"].dtype
+                    )
 
         return model_ret
 
