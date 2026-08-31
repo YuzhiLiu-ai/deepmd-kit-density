@@ -15,6 +15,7 @@ from deepmd.pt.model.model.sezm_sog_model import (
     E2_PER_ANGSTROM_TO_EV,
     SeZMSOGModel,
     _SogLRKernel,
+    _les_radial_coefficients,
 )
 from deepmd.pt.model.task.sog_energy_fitting import (
     SOGEnergyFittingNet,
@@ -185,6 +186,55 @@ class TestSogLRKernelMath(unittest.TestCase):
         kernel_without = _SogLRKernel(lr_kernel="dipole")
         e_without = kernel_without(**args, alpha_pol_atom=None)
         self.assertGreater(e_with.item(), e_without.item())
+
+    def test_les_radial_coefficients_are_finite_at_zero(self) -> None:
+        r_sq = torch.tensor(
+            [0.0, 1e-24, 1e-12, 1e-4, 1.0],
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        alpha = torch.tensor(
+            0.8, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+        coeffs = _les_radial_coefficients(r_sq, alpha)
+        grad_r, grad_alpha = torch.autograd.grad(
+            sum(value.sum() for value in coeffs), (r_sq, alpha)
+        )
+        for value in (*coeffs, grad_r, grad_alpha):
+            self.assertTrue(torch.isfinite(value).all().item())
+
+    def test_les_dipole_coincident_atoms_float32_is_finite(self) -> None:
+        positions = torch.zeros(
+            (1, 2, 3), dtype=torch.float32, device=self.device, requires_grad=True
+        )
+        q = torch.tensor(
+            [[[0.4], [-0.3]]],
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        p = torch.tensor(
+            [[[0.2, -0.1, 0.3], [-0.1, 0.4, 0.2]]],
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+        alpha = torch.tensor(
+            0.8, dtype=torch.float32, device=self.device, requires_grad=True
+        )
+        energy = _SogLRKernel(lr_kernel="dipole")(
+            positions,
+            q,
+            amp=torch.zeros(1, dtype=torch.float32, device=self.device),
+            bandwidth=torch.ones(1, dtype=torch.float32, device=self.device),
+            les_alpha=alpha,
+            latent_dipoles=p,
+        ).sum()
+        gradients = torch.autograd.grad(energy, (positions, q, p, alpha))
+        self.assertTrue(torch.isfinite(energy).all().item())
+        for gradient in gradients:
+            self.assertTrue(torch.isfinite(gradient).all().item())
 
 
 class TestSeZMSOGModel(unittest.TestCase):

@@ -45,6 +45,62 @@ E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 _SQRT_PI = 1.7724538509055160272981674833411451827975494561224
 
 
+def _les_radial_coefficients(
+    r_sq: torch.Tensor,
+    alpha_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return stable ``K``, ``K'/r`` and ``(K''-K'/r)/r^2`` coefficients.
+
+    The direct derivative formulas subtract terms that diverge separately near
+    the origin.  A Taylor branch keeps the dipole energy and its force-loss
+    backward finite in float32, while the analytic branch is clamped so even
+    the unselected side of ``torch.where`` cannot generate NaNs.
+    """
+    alpha = alpha_t.to(dtype=r_sq.dtype, device=r_sq.device)
+    r_sq_safe = r_sq.clamp_min(torch.finfo(r_sq.dtype).eps)
+    r = torch.sqrt(r_sq_safe)
+    x_sq = alpha * alpha * r_sq
+    exp_t = torch.exp(-x_sq)
+    erf_t = torch.erf(alpha * r)
+
+    k_analytic = erf_t / r
+    a_analytic = (2.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe - erf_t / (r_sq_safe * r)
+    kpp = (
+        -(4.0 * alpha**3 / _SQRT_PI) * exp_t
+        - (4.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe
+        + 2.0 * erf_t / (r_sq_safe * r)
+    )
+    c_analytic = (kpp - a_analytic) / r_sq_safe
+
+    alpha2 = alpha * alpha
+    alpha3 = alpha * alpha2
+    alpha5 = alpha3 * alpha2
+    alpha7 = alpha5 * alpha2
+    alpha9 = alpha7 * alpha2
+    r4 = r_sq * r_sq
+    r6 = r4 * r_sq
+    k_series = (2.0 / _SQRT_PI) * (
+        alpha - alpha3 * r_sq / 3.0 + alpha5 * r4 / 10.0 - alpha7 * r6 / 42.0
+    )
+    a_series = (
+        -4.0 * alpha3 / (3.0 * _SQRT_PI)
+        + 4.0 * alpha5 * r_sq / (5.0 * _SQRT_PI)
+        - 2.0 * alpha7 * r4 / (7.0 * _SQRT_PI)
+        + 2.0 * alpha9 * r6 / (27.0 * _SQRT_PI)
+    )
+    c_series = (
+        8.0 * alpha5 / (5.0 * _SQRT_PI)
+        - 8.0 * alpha7 * r_sq / (7.0 * _SQRT_PI)
+        + 4.0 * alpha9 * r4 / (9.0 * _SQRT_PI)
+    )
+    small = x_sq < 0.04
+    return (
+        torch.where(small, k_series, k_analytic),
+        torch.where(small, a_series, a_analytic),
+        torch.where(small, c_series, c_analytic),
+    )
+
+
 def _les_dipole_energy(
     r_ij: torch.Tensor,
     r: torch.Tensor,
@@ -90,30 +146,24 @@ def _les_dipole_energy(
             "LES dipole terms require scalar latent charges (dim_out_lr=1), "
             f"got latent charge dim {q.shape[-1]}."
         )
-    alpha2 = alpha_t * alpha_t
-    exp_t = torch.exp(-alpha2 * r * r)
-    erf_t = torch.erf(alpha_t * r)
-    r2 = r * r
-    kp = (2.0 * alpha_t / _SQRT_PI) * exp_t / r - erf_t / r2
-    kpp = (
-        -(4.0 * alpha_t * alpha2 / _SQRT_PI) * exp_t
-        - (4.0 * alpha_t / _SQRT_PI) * exp_t / r2
-        + 2.0 * erf_t / (r2 * r)
-    )
-    r_hat = r_ij / r.unsqueeze(-1)  # (..., n, n, 3)
+    del r  # Stable coefficients are evaluated from squared displacements.
+    r_sq = torch.sum(r_ij * r_ij, dim=-1)
+    _, a_coeff, c_coeff = _les_radial_coefficients(r_sq, alpha_t)
 
     q_s = q.squeeze(-1)
     q_i = q_s.unsqueeze(-1)  # (..., n, 1)
     q_j = q_s.unsqueeze(-2)  # (..., 1, n)
-    p_i_dot_r = torch.sum(p.unsqueeze(-2) * r_hat, dim=-1)  # p_i . r_hat_ij
-    p_j_dot_r = torch.sum(p.unsqueeze(-3) * r_hat, dim=-1)  # p_j . r_hat_ij
+    p_i_dot_r = torch.sum(p.unsqueeze(-2) * r_ij, dim=-1)  # p_i . r_ij
+    p_j_dot_r = torch.sum(p.unsqueeze(-3) * r_ij, dim=-1)  # p_j . r_ij
     p_dot_p = torch.sum(p.unsqueeze(-2) * p.unsqueeze(-3), dim=-1)  # p_i . p_j
 
-    e_qp = 0.5 * torch.sum((q_j * p_i_dot_r - q_i * p_j_dot_r) * kp * eye, dim=(-2, -1))
-    kp_over_r = kp / r
-    b_coeff = kpp - kp_over_r
+    e_qp = 0.5 * torch.sum(
+        (q_j * p_i_dot_r - q_i * p_j_dot_r) * a_coeff * eye,
+        dim=(-2, -1),
+    )
     e_pp = -0.5 * torch.sum(
-        (kp_over_r * p_dot_p + b_coeff * p_i_dot_r * p_j_dot_r) * eye, dim=(-2, -1)
+        (a_coeff * p_dot_p + c_coeff * p_i_dot_r * p_j_dot_r) * eye,
+        dim=(-2, -1),
     )
     e_dip = e_qp + e_pp
     if alpha_pol_atom is not None:
@@ -203,7 +253,7 @@ class _SogLRKernel(nn.Module):
             # E = 0.5 * C * sum_{i!=j} q_i q_j * erf(alpha * r_ij) / r_ij
             alpha_t = les_alpha.to(dtype=r_raw.dtype, device=r_raw.device)
             r = torch.sqrt(r_sq.squeeze(-1) + 1e-12)
-            les_kernel = torch.erf(alpha_t * r) / r
+            les_kernel, _, _ = _les_radial_coefficients(r_sq.squeeze(-1), alpha_t)
             les_kernel = les_kernel * eye
             pot = 0.5 * torch.sum(pair_q * les_kernel.unsqueeze(-1), dim=(1, 2, 3))
             if self.lr_kernel == "dipole":
