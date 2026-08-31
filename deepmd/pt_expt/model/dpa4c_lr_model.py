@@ -76,6 +76,15 @@ from .transform_output import (
 E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 
 
+def _les_kernel_from_squared_distance(
+    r_sq: torch.Tensor,
+    les_alpha: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate ``erf(alpha * r) / r`` with a finite derivative at ``r=0``."""
+    r = torch.sqrt(r_sq + 1e-12)
+    return torch.erf(les_alpha * r) / r
+
+
 def _disable_pointless_cumsum_pattern() -> None:
     """Remove Inductor's ``pointless_cumsum_replacement`` pattern.
 
@@ -134,14 +143,13 @@ class _LESKernel(nn.Module):
         q = latent_charges.to(positions.dtype)
         r_ij = positions.unsqueeze(1) - positions.unsqueeze(2)  # (nf,nloc,nloc,3)
         r_sq = torch.sum(r_ij * r_ij, dim=-1)
-        r = torch.sqrt(r_sq + 1e-12)
         eye = 1.0 - torch.eye(
             nloc, dtype=positions.dtype, device=positions.device
         ).unsqueeze(0)
         pair_q = q.unsqueeze(2) * q.unsqueeze(1)  # (nf,nloc,nloc,1)
 
         alpha_t = les_alpha.to(positions.dtype)
-        kernel = torch.erf(alpha_t * r) / r
+        kernel = _les_kernel_from_squared_distance(r_sq, alpha_t)
         kernel = kernel * eye
         pot = 0.5 * torch.sum(pair_q.squeeze(-1) * kernel, dim=(1, 2))  # (nf,)
         return pot * self.norm_factor
@@ -399,8 +407,7 @@ class DPA4CLREnergyModel(EnergyModel):
                 )
             else:
                 les_alpha = les_alpha.to(dtype=dtype, device=lr_edge_vec.device)
-            r = torch.sqrt(r_sq)
-            K = torch.erf(les_alpha * r) / (r + 1e-12)
+            K = _les_kernel_from_squared_distance(r_sq, les_alpha)
         else:
             amp = fitting.amp.to(dtype=dtype, device=lr_edge_vec.device)
             bandwidth_sq = fitting.bandwidth.to(

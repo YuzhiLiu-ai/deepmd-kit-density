@@ -19,6 +19,7 @@ from deepmd.pt_expt.model.get_model import (
 from deepmd.pt_expt.model.dpa4c_lr_model import (
     E2_PER_ANGSTROM_TO_EV,
     _SOGKernel,
+    _les_kernel_from_squared_distance,
 )
 from deepmd.pt_expt.train.wrapper import (
     ModelWrapper,
@@ -114,6 +115,20 @@ def test_sog_kernel_matches_closed_form() -> None:
     pair = torch.dot(charges[0, 0], charges[0, 1]) * kernel_at_r
     energy = _SOGKernel()(positions, charges, amp, bandwidth)
     torch.testing.assert_close(energy[0], pair * E2_PER_ANGSTROM_TO_EV)
+
+
+def test_les_masked_zero_edge_has_finite_gradient() -> None:
+    """A zero-length guard edge must not inject NaN into the LES force."""
+    edge_vec = torch.zeros(
+        (1, 3), dtype=torch.float64, device=env.DEVICE, requires_grad=True
+    )
+    alpha = torch.tensor(1.0, dtype=torch.float64, device=env.DEVICE)
+    edge_mask = torch.zeros(1, dtype=torch.float64, device=env.DEVICE)
+    r_sq = torch.sum(edge_vec * edge_vec, dim=-1)
+    energy = (_les_kernel_from_squared_distance(r_sq, alpha) * edge_mask).sum()
+    (gradient,) = torch.autograd.grad(energy, edge_vec)
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) == 0
 
 
 def test_energy_force_are_finite_and_phantom_atoms_are_force_free() -> None:
