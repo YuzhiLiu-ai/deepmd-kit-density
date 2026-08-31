@@ -3027,6 +3027,17 @@ def fitting_sog_energy() -> list[Argument]:
         "Whether to include the dipole self-polarization term "
         "sum_i |p_i|^2 / (2 alpha_pol_i). Only used when lr_kernel='dipole'."
     )
+    doc_lr_update_steps = (
+        "Number of shared non-self-consistent long-range field updates applied "
+        "to charge and dipole before evaluating the final energy. A positive "
+        "value currently requires lr_kernel='dipole'."
+    )
+    doc_lr_update_neuron = (
+        "Hidden widths of the shared charge/dipole field-update network."
+    )
+    doc_lr_update_damping = (
+        "Residual damping factor for every charge/dipole field update."
+    )
     return [
         # The short-range branch shares the dpa4_ener GLU fitting arguments.
         *fitting_sezm_ener(),
@@ -3126,6 +3137,27 @@ def fitting_sog_energy() -> list[Argument]:
             optional=True,
             default=True,
             doc=supported_backends("pt") + doc_use_self_pol,
+        ),
+        Argument(
+            "lr_update_steps",
+            int,
+            optional=True,
+            default=0,
+            doc=supported_backends("pt") + doc_lr_update_steps,
+        ),
+        Argument(
+            "lr_update_neuron",
+            list[int],
+            optional=True,
+            default=[64, 64],
+            doc=supported_backends("pt") + doc_lr_update_neuron,
+        ),
+        Argument(
+            "lr_update_damping",
+            float,
+            optional=True,
+            default=0.2,
+            doc=supported_backends("pt") + doc_lr_update_damping,
         ),
     ]
 

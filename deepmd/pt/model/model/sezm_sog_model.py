@@ -45,6 +45,95 @@ E2_PER_ANGSTROM_TO_EV = 14.3996454784255
 _SQRT_PI = 1.7724538509055160272981674833411451827975494561224
 
 
+def _les_radial_coefficients(
+    r_sq: torch.Tensor,
+    alpha_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return stable ``K``, ``K'/r`` and ``(K''-K'/r)/r^2`` coefficients.
+
+    Directly evaluating the derivatives of ``erf(alpha*r)/r`` subtracts
+    individually divergent terms near the origin.  The small-distance Taylor
+    branch below keeps both the forward field and the force-loss backward
+    finite in float32.  The regular analytic branch uses a clamped radius so
+    the unselected diagonal branch cannot create NaNs through ``torch.where``.
+    """
+    alpha = alpha_t.to(dtype=r_sq.dtype, device=r_sq.device)
+    r_sq_safe = r_sq.clamp_min(torch.finfo(r_sq.dtype).eps)
+    r = torch.sqrt(r_sq_safe)
+    x_sq = alpha * alpha * r_sq
+    exp_t = torch.exp(-x_sq)
+    erf_t = torch.erf(alpha * r)
+
+    k_analytic = erf_t / r
+    a_analytic = (2.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe - erf_t / (r_sq_safe * r)
+    kpp = (
+        -(4.0 * alpha**3 / _SQRT_PI) * exp_t
+        - (4.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe
+        + 2.0 * erf_t / (r_sq_safe * r)
+    )
+    c_analytic = (kpp - a_analytic) / r_sq_safe
+
+    alpha2 = alpha * alpha
+    alpha3 = alpha * alpha2
+    alpha5 = alpha3 * alpha2
+    alpha7 = alpha5 * alpha2
+    alpha9 = alpha7 * alpha2
+    r4 = r_sq * r_sq
+    r6 = r4 * r_sq
+    k_series = (2.0 / _SQRT_PI) * (
+        alpha - alpha3 * r_sq / 3.0 + alpha5 * r4 / 10.0 - alpha7 * r6 / 42.0
+    )
+    a_series = (
+        -4.0 * alpha3 / (3.0 * _SQRT_PI)
+        + 4.0 * alpha5 * r_sq / (5.0 * _SQRT_PI)
+        - 2.0 * alpha7 * r4 / (7.0 * _SQRT_PI)
+        + 2.0 * alpha9 * r6 / (27.0 * _SQRT_PI)
+    )
+    c_series = (
+        8.0 * alpha5 / (5.0 * _SQRT_PI)
+        - 8.0 * alpha7 * r_sq / (7.0 * _SQRT_PI)
+        + 4.0 * alpha9 * r4 / (9.0 * _SQRT_PI)
+    )
+    small = x_sq < 0.04
+    return (
+        torch.where(small, k_series, k_analytic),
+        torch.where(small, a_series, a_analytic),
+        torch.where(small, c_series, c_analytic),
+    )
+
+
+def _les_potential_and_field(
+    r_ij: torch.Tensor,
+    eye: torch.Tensor,
+    q: torch.Tensor,
+    p: torch.Tensor,
+    alpha_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-atom LES potential and electric field from ``q``/``p``.
+
+    The source multipoles use the same convention as
+    :func:`_les_dipole_energy`.  Returned shapes are ``(..., n, 1)`` and
+    ``(..., n, 3)`` and self interactions are excluded.
+    """
+    r_sq = torch.sum(r_ij * r_ij, dim=-1)
+    kernel, a_coeff, c_coeff = _les_radial_coefficients(r_sq, alpha_t)
+    mask = eye.to(dtype=r_ij.dtype)
+    q_j = q.squeeze(-1).unsqueeze(-2)
+    p_j = p.unsqueeze(-3)
+    p_j_dot_r = torch.sum(p_j * r_ij, dim=-1)
+
+    potential_pair = q_j * kernel - a_coeff * p_j_dot_r
+    potential = torch.sum(potential_pair * mask, dim=-1, keepdim=True)
+
+    field_pair = (
+        q_j.unsqueeze(-1) * a_coeff.unsqueeze(-1) * r_ij
+        - a_coeff.unsqueeze(-1) * p_j
+        - c_coeff.unsqueeze(-1) * p_j_dot_r.unsqueeze(-1) * r_ij
+    )
+    field = torch.sum(field_pair * mask.unsqueeze(-1), dim=-2)
+    return potential, field
+
+
 def _les_dipole_energy(
     r_ij: torch.Tensor,
     r: torch.Tensor,
@@ -90,30 +179,24 @@ def _les_dipole_energy(
             "LES dipole terms require scalar latent charges (dim_out_lr=1), "
             f"got latent charge dim {q.shape[-1]}."
         )
-    alpha2 = alpha_t * alpha_t
-    exp_t = torch.exp(-alpha2 * r * r)
-    erf_t = torch.erf(alpha_t * r)
-    r2 = r * r
-    kp = (2.0 * alpha_t / _SQRT_PI) * exp_t / r - erf_t / r2
-    kpp = (
-        -(4.0 * alpha_t * alpha2 / _SQRT_PI) * exp_t
-        - (4.0 * alpha_t / _SQRT_PI) * exp_t / r2
-        + 2.0 * erf_t / (r2 * r)
-    )
-    r_hat = r_ij / r.unsqueeze(-1)  # (..., n, n, 3)
+    del r  # Stable coefficients are evaluated from squared displacements.
+    r_sq = torch.sum(r_ij * r_ij, dim=-1)
+    _, a_coeff, c_coeff = _les_radial_coefficients(r_sq, alpha_t)
 
     q_s = q.squeeze(-1)
     q_i = q_s.unsqueeze(-1)  # (..., n, 1)
     q_j = q_s.unsqueeze(-2)  # (..., 1, n)
-    p_i_dot_r = torch.sum(p.unsqueeze(-2) * r_hat, dim=-1)  # p_i . r_hat_ij
-    p_j_dot_r = torch.sum(p.unsqueeze(-3) * r_hat, dim=-1)  # p_j . r_hat_ij
+    p_i_dot_r = torch.sum(p.unsqueeze(-2) * r_ij, dim=-1)  # p_i . r_ij
+    p_j_dot_r = torch.sum(p.unsqueeze(-3) * r_ij, dim=-1)  # p_j . r_ij
     p_dot_p = torch.sum(p.unsqueeze(-2) * p.unsqueeze(-3), dim=-1)  # p_i . p_j
 
-    e_qp = 0.5 * torch.sum((q_j * p_i_dot_r - q_i * p_j_dot_r) * kp * eye, dim=(-2, -1))
-    kp_over_r = kp / r
-    b_coeff = kpp - kp_over_r
+    e_qp = 0.5 * torch.sum(
+        (q_j * p_i_dot_r - q_i * p_j_dot_r) * a_coeff * eye,
+        dim=(-2, -1),
+    )
     e_pp = -0.5 * torch.sum(
-        (kp_over_r * p_dot_p + b_coeff * p_i_dot_r * p_j_dot_r) * eye, dim=(-2, -1)
+        (a_coeff * p_dot_p + c_coeff * p_i_dot_r * p_j_dot_r) * eye,
+        dim=(-2, -1),
     )
     e_dip = e_qp + e_pp
     if alpha_pol_atom is not None:
@@ -203,7 +286,7 @@ class _SogLRKernel(nn.Module):
             # E = 0.5 * C * sum_{i!=j} q_i q_j * erf(alpha * r_ij) / r_ij
             alpha_t = les_alpha.to(dtype=r_raw.dtype, device=r_raw.device)
             r = torch.sqrt(r_sq.squeeze(-1) + 1e-12)
-            les_kernel = torch.erf(alpha_t * r) / r
+            les_kernel, _, _ = _les_radial_coefficients(r_sq.squeeze(-1), alpha_t)
             les_kernel = les_kernel * eye
             pot = 0.5 * torch.sum(pair_q * les_kernel.unsqueeze(-1), dim=(1, 2, 3))
             if self.lr_kernel == "dipole":
@@ -308,6 +391,7 @@ class SeZMSOGModel(SeZMModel):
         energy_redu: torch.Tensor,
         coord: torch.Tensor,
         atype: torch.Tensor,
+        descriptor: torch.Tensor,
         fit_ret: dict[str, torch.Tensor],
         comm_dict: dict[str, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, Any]:
@@ -342,6 +426,36 @@ class SeZMSOGModel(SeZMModel):
         )
 
         coord_lr = coord[:, :nloc, :].detach().requires_grad_(True)
+        if fitting.lr_update_steps > 0:
+            if p is None:
+                raise RuntimeError("Long-range polar updates require latent dipoles.")
+            r_ij = coord_lr.unsqueeze(1) - coord_lr.unsqueeze(2)
+            eye = 1.0 - torch.eye(
+                nloc, dtype=coord_lr.dtype, device=coord_lr.device
+            ).unsqueeze(0)
+            local_p = p
+            atom_mask = fit_ret["mask"][:, :nloc].to(torch.bool)
+            target_charge = q.sum(dim=1, keepdim=True)
+            for _ in range(fitting.lr_update_steps):
+                potential, field = _les_potential_and_field(
+                    r_ij,
+                    eye,
+                    q.to(coord_lr.dtype),
+                    p.to(coord_lr.dtype),
+                    fitting.les_alpha,
+                )
+                q, p = fitting.update_polar_state(
+                    descriptor[:, :nloc, :],
+                    q,
+                    p,
+                    local_p,
+                    potential,
+                    field,
+                    atom_mask,
+                    target_charge,
+                )
+            fit_ret["latent_charge"] = q
+            fit_ret["latent_dipole"] = p
         e_lr = self.sog_kernel(
             coord_lr,
             q,
