@@ -3133,12 +3133,12 @@ def fitting_sog_energy() -> list[Argument]:
 @fitting_args_plugin.register(
     "dpa4c_lr",
     doc=supported_backends("pt_expt")
-    + "Fit a DPA4C latent-charge energy model (SR + non-periodic LES).",
+    + "Fit a DPA4C latent-charge energy model (SR + non-periodic LES/SOG).",
 )
 def fitting_dpa4c_lr() -> list[Argument]:
     doc_dim_out_lr = (
         "The output dimension of the long-range (latent charge) fitting branch. "
-        "Must be 1 for the LES kernel."
+        "Must be 1 for the LES kernel; SOG supports multiple channels."
     )
     doc_neuron_lr = (
         "The number of neurons in each hidden layer of the latent-charge fitting net."
@@ -3151,10 +3151,19 @@ def fitting_dpa4c_lr() -> list[Argument]:
         "Trainable width parameter for the non-periodic LES correction. "
         "The LES kernel is erf(alpha * r) / r, which behaves as 1/r at long range."
     )
+    doc_amp = "Trainable amplitude of each Gaussian level in the SOG kernel."
+    doc_bandwidth = (
+        "Trainable width of each Gaussian level in the SOG kernel. The stored "
+        "value is squared inside the kernel."
+    )
+    doc_b = "Geometric ratio used to initialize the SOG bandwidths."
+    doc_sigma = "Base width used to initialize the SOG bandwidths."
+    doc_M = "Number of Gaussian levels used to initialize the SOG kernel."
     doc_lr_kernel = (
         "Long-range kernel used for non-periodic systems. "
         "'les' (default) applies only the LES erf(alpha*r)/r charge-charge kernel. "
-        "'sog' is reserved for future use and not yet supported by the DPA4C model layer."
+        "'sog' applies a trainable sum-of-Gaussians kernel over distinct atom "
+        "pairs (i != j) and supports multi-channel latent charges."
     )
     doc_use_charge_constraint = (
         "Whether to enforce the sum of latent charges equals the target total "
@@ -3183,11 +3192,46 @@ def fitting_dpa4c_lr() -> list[Argument]:
             doc=supported_backends("pt_expt") + doc_bias_atom_q,
         ),
         Argument(
+            "amp",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt") + doc_amp,
+        ),
+        Argument(
+            "bandwidth",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt") + doc_bandwidth,
+        ),
+        Argument(
             "les_alpha",
             [float, type(None)],
             optional=True,
             default=1.0,
             doc=supported_backends("pt_expt") + doc_les_alpha,
+        ),
+        Argument(
+            "b",
+            float,
+            optional=True,
+            default=1.6297670882677647,
+            doc=supported_backends("pt_expt") + doc_b,
+        ),
+        Argument(
+            "sigma",
+            float,
+            optional=True,
+            default=2.180230445405648,
+            doc=supported_backends("pt_expt") + doc_sigma,
+        ),
+        Argument(
+            "M",
+            int,
+            optional=True,
+            default=12,
+            doc=supported_backends("pt_expt") + doc_M,
         ),
         Argument(
             "lr_kernel",
@@ -4153,7 +4197,7 @@ def dpa4c_lr_model_args() -> Argument:
     )
     doc_model = (
         "DPA4C-LR model scaffold: the compact DPA4C descriptor plus a "
-        "non-periodic LES long-range term evaluated from the latent charges "
+        "non-periodic LES or SOG term evaluated from the latent charges "
         "produced by the `dpa4c_lr` fitting. Only the pt_expt backend and "
         "non-periodic systems (no box) are supported."
     )

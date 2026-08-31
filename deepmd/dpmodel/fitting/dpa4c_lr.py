@@ -41,6 +41,10 @@ from .invar_fitting import (
     InvarFitting,
 )
 
+SOG_DEFAULT_B = 1.62976708826776469
+SOG_DEFAULT_SIGMA = 2.180230445405648
+SOG_DEFAULT_M = 12
+
 
 @InvarFitting.register("dpa4c_lr")
 @fitting_check_output
@@ -50,7 +54,8 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
     Parameters
     ----------
     dim_out_lr : int
-        Latent charge dimension.  Must be 1 for the LES kernel.
+        Latent charge dimension.  Must be 1 for the LES kernel; SOG supports
+        multiple latent channels.
     neuron_lr : list[int], optional
         Hidden widths of the latent-charge GLU branch.
     bias_atom_q : list[float] | None
@@ -58,14 +63,20 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         allocated.
     les_alpha : float
         Initial width of the LES kernel ``erf(alpha * r) / r``.
+    amp : float | list[float] | None
+        Initial amplitudes of the SOG Gaussian levels.
+    bandwidth : float | list[float] | None
+        Initial widths of the SOG Gaussian levels.
+    b, sigma, M
+        Hyperparameters used to initialize geometric SOG widths when
+        ``bandwidth`` is not provided.
     use_charge_constraint : bool
         Whether to enforce that the sum of latent charges equals the total
         charge.  In the graph path this is applied by the model layer, because
         the per-frame sum is not available inside ``call_graph``.
     lr_kernel : str
-        Long-range kernel selector.  ``"les"`` is the only value supported by
-        the DPA4C model layer (DPA4C has no equivariant latent, so ``"dipole"``
-        is impossible).
+        Long-range kernel selector.  DPA4C supports ``"les"`` and ``"sog"``;
+        it has no equivariant latent, so ``"dipole"`` is impossible.
     """
 
     def __init__(
@@ -74,7 +85,12 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         dim_out_lr: int = 1,
         neuron_lr: list[int] | None = None,
         bias_atom_q: list[float] | None = None,
+        amp: float | list[float] | None = None,
+        bandwidth: float | list[float] | None = None,
         les_alpha: float | None = None,
+        b: float | None = None,
+        sigma: float | None = None,
+        M: int | None = None,
         use_charge_constraint: bool = False,
         lr_kernel: str = "les",
         **kwargs: Any,
@@ -96,6 +112,12 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
             raise NotImplementedError(
                 "DPA4C has no equivariant latent output, so `lr_kernel='dipole'` "
                 "is not supported."
+            )
+        if lr_kernel == "les" and self.dim_out_lr != 1:
+            raise ValueError(
+                "`lr_kernel='les'` requires `dim_out_lr=1`, got "
+                f"{self.dim_out_lr}. Use `lr_kernel='sog'` for multiple latent "
+                "channels."
             )
         self.lr_kernel = lr_kernel
 
@@ -147,6 +169,43 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         if les_alpha_value <= 0.0:
             raise ValueError("`les_alpha` should be positive.")
         self.les_alpha = np.array(les_alpha_value, dtype=self.prec)
+
+        # --- SOG Gaussian levels ---
+        self.b = SOG_DEFAULT_B if b is None else float(b)
+        self.sigma = SOG_DEFAULT_SIGMA if sigma is None else float(sigma)
+        self.M = max(1, SOG_DEFAULT_M if M is None else int(M))
+        if not np.isfinite(self.b) or self.b <= 0.0:
+            raise ValueError("`b` should be finite and positive.")
+        if not np.isfinite(self.sigma) or self.sigma <= 0.0:
+            raise ValueError("`sigma` should be finite and positive.")
+
+        if bandwidth is None:
+            bandwidth_array = self.sigma * np.power(
+                self.b, np.arange(self.M, dtype=self.prec)
+            )
+        else:
+            bandwidth_array = np.asarray(bandwidth, dtype=self.prec).reshape(-1)
+        if bandwidth_array.size < 1 or not np.all(np.isfinite(bandwidth_array)):
+            raise ValueError("`bandwidth` should contain finite values.")
+        if not np.all(bandwidth_array > 0.0):
+            raise ValueError("`bandwidth` should contain positive values.")
+
+        if amp is None:
+            amp_array = np.full_like(bandwidth_array, 4.0 * np.pi * np.log(self.b))
+        else:
+            amp_array = np.asarray(amp, dtype=self.prec).reshape(-1)
+        if amp_array.size == 1 and bandwidth_array.size > 1:
+            amp_array = np.full_like(bandwidth_array, amp_array[0])
+        elif amp_array.size != bandwidth_array.size:
+            raise ValueError(
+                "`amp` should be scalar or have the same length as `bandwidth`."
+            )
+        if not np.all(np.isfinite(amp_array)):
+            raise ValueError("`amp` should contain finite values.")
+
+        self.bandwidth = bandwidth_array
+        self.amp = amp_array
+        self.M = int(bandwidth_array.size)
 
     def output_def(self) -> FittingOutputDef:
         return FittingOutputDef(
@@ -322,9 +381,14 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         data["nets_lr"] = self.filter_layers_lr.serialize()
         data["use_charge_constraint"] = self.use_charge_constraint
         data["lr_kernel"] = self.lr_kernel
+        data["b"] = self.b
+        data["sigma"] = self.sigma
+        data["M"] = self.M
         variables = data.setdefault("@variables", {})
         variables["bias_atom_q"] = to_numpy_array(self.bias_atom_q)
         variables["les_alpha"] = to_numpy_array(self.les_alpha)
+        variables["amp"] = to_numpy_array(self.amp)
+        variables["bandwidth"] = to_numpy_array(self.bandwidth)
         return data
 
     @classmethod
@@ -334,19 +398,22 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         variables = data.get("@variables", {}).copy()
         bias_atom_q = variables.pop("bias_atom_q", None)
         les_alpha = variables.pop("les_alpha", None)
+        amp = variables.pop("amp", None)
+        bandwidth = variables.pop("bandwidth", None)
         nets_lr = data.pop("nets_lr", None)
+        # Feed LR variables through the constructor. This preserves their
+        # Parameter status when ``cls`` is the pt_expt torch wrapper; assigning
+        # numpy arrays after construction would replace Parameters with buffers.
+        if bias_atom_q is not None:
+            data["bias_atom_q"] = np.asarray(bias_atom_q).tolist()
+        if les_alpha is not None:
+            data["les_alpha"] = float(np.asarray(les_alpha).reshape(-1)[0])
+        if amp is not None:
+            data["amp"] = np.asarray(amp).reshape(-1).tolist()
+        if bandwidth is not None:
+            data["bandwidth"] = np.asarray(bandwidth).reshape(-1).tolist()
         data["@variables"] = variables
         obj = super().deserialize(data)
         if nets_lr is not None:
             obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
-        if bias_atom_q is not None:
-            new_bias = np.asarray(bias_atom_q, dtype=obj.prec).reshape(
-                obj.ntypes, obj.dim_out_lr
-            )
-            obj.bias_atom_q = new_bias
-        if les_alpha is not None:
-            new_alpha = float(np.asarray(les_alpha).reshape(-1)[0])
-            if new_alpha <= 0.0:
-                raise ValueError("`les_alpha` should be positive.")
-            obj.les_alpha = np.array(new_alpha, dtype=obj.prec)
         return obj

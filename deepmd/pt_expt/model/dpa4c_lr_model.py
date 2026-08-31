@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""DPA4C energy model with a non-periodic LES long-range term (pt_expt).
+"""DPA4C energy model with a non-periodic LES/SOG term (pt_expt).
 
 The short-range part is the standard DPA4C graph-native energy model.  The
 long-range correction is evaluated from per-atom latent charges produced by
@@ -8,7 +8,7 @@ long-range correction is evaluated from per-atom latent charges produced by
 The graph lower consumes two edge sets:
 
 * the short-range edges (within ``rcut``) used by the descriptor;
-* the long-range edges (all pairs within each frame) used by the LES kernel.
+* the long-range edges (all pairs within each frame) used by the LR kernel.
 
 Both edge sets are built eagerly outside the compiled region and passed in as
 inputs, so the compiled graph lower contains no data-dependent Python ints.
@@ -147,9 +147,46 @@ class _LESKernel(nn.Module):
         return pot * self.norm_factor
 
 
+class _SOGKernel(nn.Module):
+    """Batched non-periodic SOG kernel over distinct atom pairs ``i != j``."""
+
+    def __init__(self, norm_factor: float = E2_PER_ANGSTROM_TO_EV) -> None:
+        super().__init__()
+        self.norm_factor = float(norm_factor)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        latent_charges: torch.Tensor,
+        amp: torch.Tensor,
+        bandwidth: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the per-frame SOG energy."""
+        nloc = positions.shape[1]
+        q = latent_charges.to(dtype=positions.dtype, device=positions.device)
+        r_ij = positions.unsqueeze(1) - positions.unsqueeze(2)
+        r_sq = torch.sum(r_ij * r_ij, dim=-1, keepdim=True)
+        eye = 1.0 - torch.eye(
+            nloc, dtype=positions.dtype, device=positions.device
+        ).unsqueeze(0)
+        pair_q = q.unsqueeze(2) * q.unsqueeze(1)
+
+        amp_t = amp.to(dtype=positions.dtype, device=positions.device).view(1, 1, 1, -1)
+        bandwidth_sq = (
+            bandwidth.to(dtype=positions.dtype, device=positions.device)
+            .square()
+            .view(1, 1, 1, -1)
+        )
+        kernel = torch.sum(amp_t * torch.exp(-0.5 * r_sq / bandwidth_sq), dim=-1)
+        kernel = kernel * eye
+        pot = 0.5 * torch.sum(pair_q * kernel.unsqueeze(-1), dim=(1, 2, 3))
+
+        return pot * self.norm_factor
+
+
 @BaseModel.register("dpa4c_lr")
 class DPA4CLREnergyModel(EnergyModel):
-    """DPA4C model with a non-periodic LES long-range correction."""
+    """DPA4C model with a non-periodic LES or SOG correction."""
 
     model_type = "dpa4c_lr"
     _needs_long_range_edges = True
@@ -163,12 +200,12 @@ class DPA4CLREnergyModel(EnergyModel):
                 f"(type 'dpa4c_lr'), got {type(fitting).__name__}."
             )
         self.lr_kernel = fitting.lr_kernel
-        if self.lr_kernel not in ("les",):
+        if self.lr_kernel not in ("les", "sog"):
             raise NotImplementedError(
-                "DPA4CLREnergyModel currently only supports `lr_kernel='les'`, "
-                f"got {self.lr_kernel!r}."
+                f"Unsupported DPA4C-LR kernel {self.lr_kernel!r}."
             )
         self.les_kernel = _LESKernel(norm_factor=E2_PER_ANGSTROM_TO_EV)
+        self.sog_kernel = _SOGKernel(norm_factor=E2_PER_ANGSTROM_TO_EV)
         _disable_pointless_cumsum_pattern()
 
     def call_common(
@@ -178,7 +215,7 @@ class DPA4CLREnergyModel(EnergyModel):
         box: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        """Reject periodic cells; the LES kernel is non-periodic."""
+        """Reject periodic cells; both LR kernels are non-periodic."""
         if box is not None:
             xp = array_api_compat.array_namespace(box)
             if bool(xp.any(box != 0)):
@@ -188,7 +225,7 @@ class DPA4CLREnergyModel(EnergyModel):
         return super().call_common(coord, atype, box=box, **kwargs)
 
     # ------------------------------------------------------------------
-    # Graph lower with LES
+    # Graph lower with LES/SOG
     # ------------------------------------------------------------------
 
     def forward_common_lower_graph(
@@ -214,7 +251,7 @@ class DPA4CLREnergyModel(EnergyModel):
         lr_edge_vec: torch.Tensor | None = None,
         lr_edge_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Graph lower with the LES long-range correction.
+        """Graph lower with the long-range correction.
 
         The short-range ``edge_*`` tensors and the long-range ``lr_edge_*``
         tensors are built eagerly by the caller and consumed as inputs, so the
@@ -260,7 +297,7 @@ class DPA4CLREnergyModel(EnergyModel):
             comm_dict=comm_dict,
         )
 
-        # LES energy on the long-range edge set.
+        # LR energy on the long-range edge set.
         lr_edge_vec = lr_edge_vec.detach().requires_grad_(True)
         atomic_ret, e_lr = self._apply_lr_correction_graph(
             atomic_ret,
@@ -330,7 +367,7 @@ class DPA4CLREnergyModel(EnergyModel):
         fparam: torch.Tensor | None,
         charge_spin: torch.Tensor | None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
-        """Compute the LES energy on the long-range edge set.
+        """Compute the LES or SOG energy on the long-range edge set.
 
         The long-range edges are built eagerly by the caller and passed in as
         inputs.  They contain only intra-frame all-pairs, so the storage scales
@@ -351,19 +388,33 @@ class DPA4CLREnergyModel(EnergyModel):
         if fitting.use_charge_constraint:
             q = self._constrain_charges_flat(q, frame_id, n_node, fparam, charge_spin)
 
-        les_alpha = fitting.les_alpha
-        if not isinstance(les_alpha, torch.Tensor):
-            les_alpha = torch.tensor(les_alpha, dtype=dtype, device=lr_edge_vec.device)
-        else:
-            les_alpha = les_alpha.to(dtype=dtype, device=lr_edge_vec.device)
-
         q_src = q[lr_edge_index[0]]  # (E_lr, dim)
         q_dst = q[lr_edge_index[1]]  # (E_lr, dim)
-        r = torch.norm(lr_edge_vec, dim=-1)  # (E_lr,)
-        K = torch.erf(les_alpha * r) / (r + 1e-12)
+        r_sq = torch.sum(lr_edge_vec * lr_edge_vec, dim=-1)  # (E_lr,)
+        if self.lr_kernel == "les":
+            les_alpha = fitting.les_alpha
+            if not isinstance(les_alpha, torch.Tensor):
+                les_alpha = torch.tensor(
+                    les_alpha, dtype=dtype, device=lr_edge_vec.device
+                )
+            else:
+                les_alpha = les_alpha.to(dtype=dtype, device=lr_edge_vec.device)
+            r = torch.sqrt(r_sq)
+            K = torch.erf(les_alpha * r) / (r + 1e-12)
+        else:
+            amp = fitting.amp.to(dtype=dtype, device=lr_edge_vec.device)
+            bandwidth_sq = fitting.bandwidth.to(
+                dtype=dtype, device=lr_edge_vec.device
+            ).square()
+            K = torch.sum(
+                amp.unsqueeze(0)
+                * torch.exp(-0.5 * r_sq.unsqueeze(-1) / bandwidth_sq.unsqueeze(0)),
+                dim=-1,
+            )
         e_edge = (q_src * q_dst).sum(-1) * K * lr_edge_mask.to(dtype)  # (E_lr,)
         edge_frame = frame_id[lr_edge_index[1]]  # (E_lr,) frame of dst
-        e_lr = segment_sum(e_edge, edge_frame, nf) * (0.5 * E2_PER_ANGSTROM_TO_EV)
+        e_lr_raw = segment_sum(e_edge, edge_frame, nf)
+        e_lr = e_lr_raw * (0.5 * E2_PER_ANGSTROM_TO_EV)
 
         # Spread the frame LR energy evenly over the real atoms.
         nreal = n_node.to(e_lr.dtype).clamp_min(1)
@@ -415,7 +466,7 @@ class DPA4CLREnergyModel(EnergyModel):
         charge_spin: torch.Tensor | None = None,
         spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Ragged graph forward with the LES correction."""
+        """Ragged graph forward with the LR correction."""
         if not (self.mixed_types() and self.atomic_model.uses_graph_lower()):
             raise NotImplementedError(
                 "a flat node axis requires a mixed_types descriptor with a graph lower"
@@ -478,7 +529,7 @@ class DPA4CLREnergyModel(EnergyModel):
         spin: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Carry-all graph forward with the LES correction.
+        """Carry-all graph forward with the LR correction.
 
         Mirrors the base :meth:`_call_common_graph` but builds the long-range
         all-pairs graph eagerly and passes it into
@@ -598,7 +649,7 @@ class DPA4CLREnergyModel(EnergyModel):
         comm_dict: dict | None = None,
         charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Dense lower with the LES long-range correction folded in."""
+        """Dense lower with the LR correction folded in."""
         atomic_ret = self.atomic_model.forward_common_atomic(
             extended_coord,
             extended_atype,
@@ -633,7 +684,7 @@ class DPA4CLREnergyModel(EnergyModel):
         fparam: torch.Tensor | None,
         charge_spin: torch.Tensor | None,
     ) -> dict[str, torch.Tensor]:
-        """Add the LES energy to the per-atom short-range energy (dense path)."""
+        """Add the LR energy to the per-atom short-range energy (dense path)."""
         if "latent_charge" not in atomic_ret:
             return atomic_ret
 
@@ -651,16 +702,20 @@ class DPA4CLREnergyModel(EnergyModel):
         if fitting.use_charge_constraint:
             q = self._constrain_charges(q, mask_bool, fparam, charge_spin)
 
-        les_alpha = fitting.les_alpha
-        if not isinstance(les_alpha, torch.Tensor):
-            les_alpha = torch.tensor(
-                les_alpha,
-                dtype=cc.dtype,
-                device=cc.device,
-            )
+        q = q * mask_bool.unsqueeze(-1).to(q.dtype)
+        if self.lr_kernel == "les":
+            les_alpha = fitting.les_alpha
+            if not isinstance(les_alpha, torch.Tensor):
+                les_alpha = torch.tensor(
+                    les_alpha,
+                    dtype=cc.dtype,
+                    device=cc.device,
+                )
+            else:
+                les_alpha = les_alpha.to(dtype=cc.dtype, device=cc.device)
+            e_lr = self.les_kernel(cc, q, les_alpha)
         else:
-            les_alpha = les_alpha.to(dtype=cc.dtype, device=cc.device)
-        e_lr = self.les_kernel(cc, q, les_alpha)
+            e_lr = self.sog_kernel(cc, q, fitting.amp, fitting.bandwidth)
 
         # Evenly spread the frame LR energy over the real atoms so that the
         # per-atom sum matches the corrected total.

@@ -28,10 +28,14 @@ class DPA4CLRFitting(DPA4CLRFittingDP):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # In the dpmodel these are plain numpy arrays, which the wrapper stores
-        # as non-trainable buffers.  Promote them to Parameters so the LES width
-        # and per-type latent-charge bias are optimized, matching the SOG
-        # fitting's treatment of ``les_alpha`` and ``bias_atom_q``.
-        self._promote_to_parameter("les_alpha")
+        # as non-trainable buffers. Promote only the parameters used by the
+        # selected kernel so every registered Parameter participates in loss
+        # backpropagation.
+        if self.lr_kernel == "les":
+            self._promote_to_parameter("les_alpha")
+        elif self.lr_kernel == "sog":
+            self._promote_to_parameter("amp")
+            self._promote_to_parameter("bandwidth")
         self._promote_to_parameter("bias_atom_q")
 
     def _promote_to_parameter(self, name: str) -> None:

@@ -1,12 +1,27 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Tests for the DPA4C-LR non-periodic latent-charge model."""
 
+import copy
+
 import numpy as np
 import pytest
 import torch
 
+from deepmd.infer import (
+    DeepPot,
+)
+from deepmd.pt_expt.fitting.dpa4c_lr import (
+    DPA4CLRFitting,
+)
 from deepmd.pt_expt.model.get_model import (
     get_model,
+)
+from deepmd.pt_expt.model.dpa4c_lr_model import (
+    E2_PER_ANGSTROM_TO_EV,
+    _SOGKernel,
+)
+from deepmd.pt_expt.train.wrapper import (
+    ModelWrapper,
 )
 from deepmd.pt_expt.utils import (
     env,
@@ -17,9 +32,9 @@ from ..compile_utils import (
 )
 
 
-def _config() -> dict:
+def _config(lr_kernel: str = "les") -> dict:
     """Minimal float64 DPA4C-LR config for unit tests."""
-    return {
+    config = {
         "type": "dpa4c_lr",
         "type_map": ["A", "B"],
         "descriptor": {
@@ -43,11 +58,22 @@ def _config() -> dict:
             "les_alpha": 1.0,
         },
     }
+    if lr_kernel == "sog":
+        config["fitting_net"].update(
+            {
+                "dim_out_lr": 3,
+                "use_charge_constraint": False,
+                "lr_kernel": "sog",
+                "amp": [0.7, -0.2, 0.1],
+                "bandwidth": [0.8, 1.7, 3.2],
+            }
+        )
+    return config
 
 
-def _build_model(train: bool = False) -> torch.nn.Module:
+def _build_model(train: bool = False, lr_kernel: str = "les") -> torch.nn.Module:
     """Build a small DPA4C-LR model on the default test device."""
-    model = get_model(_config()).to(env.DEVICE)
+    model = get_model(_config(lr_kernel)).to(env.DEVICE)
     if train:
         model.train()
     else:
@@ -69,6 +95,25 @@ def _make_batch(
         padded_coord[index, :nloc] = rng.uniform(0.0, 6.0, (nloc, 3))
         padded_atype[index, :nloc] = rng.integers(0, 2, nloc)
     return padded_coord, padded_atype
+
+
+def test_sog_kernel_matches_closed_form() -> None:
+    """The dense SOG kernel contains only distinct-atom pairs."""
+    positions = torch.tensor(
+        [[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]],
+        dtype=torch.float64,
+        device=env.DEVICE,
+    )
+    charges = torch.tensor(
+        [[[1.0, 2.0], [-0.5, 1.5]]], dtype=torch.float64, device=env.DEVICE
+    )
+    amp = torch.tensor([0.7, -0.2], dtype=torch.float64, device=env.DEVICE)
+    bandwidth = torch.tensor([0.8, 1.7], dtype=torch.float64, device=env.DEVICE)
+
+    kernel_at_r = torch.sum(amp * torch.exp(-0.5 * 4.0 / bandwidth.square()))
+    pair = torch.dot(charges[0, 0], charges[0, 1]) * kernel_at_r
+    energy = _SOGKernel()(positions, charges, amp, bandwidth)
+    torch.testing.assert_close(energy[0], pair * E2_PER_ANGSTROM_TO_EV)
 
 
 def test_energy_force_are_finite_and_phantom_atoms_are_force_free() -> None:
@@ -130,10 +175,11 @@ def test_frames_do_not_interact_across_batch() -> None:
         )
 
 
-def test_force_matches_finite_difference() -> None:
+@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+def test_force_matches_finite_difference(lr_kernel: str) -> None:
     """The public model force agrees with a central finite-difference stencil."""
     torch.manual_seed(1234)
-    model = _build_model()
+    model = _build_model(lr_kernel=lr_kernel)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.copy_(torch.randn_like(parameter) * 0.1)
@@ -167,10 +213,34 @@ def test_force_matches_finite_difference() -> None:
     np.testing.assert_allclose(force, force_fd, atol=1e-6, rtol=1e-6)
 
 
-def test_ragged_matches_padded() -> None:
+@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+def test_atom_virial_sums_to_total_virial(lr_kernel: str) -> None:
+    """Per-atom virials include the explicit LR geometry contribution."""
+    torch.manual_seed(1234)
+    model = _build_model(lr_kernel=lr_kernel)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.copy_(torch.randn_like(parameter) * 0.1)
+
+    coord, atype = _make_batch((4, 7, 3), seed=31)
+    result = model(
+        torch.tensor(coord, dtype=torch.float64, device=env.DEVICE),
+        torch.tensor(atype, dtype=torch.long, device=env.DEVICE),
+        do_atomic_virial=True,
+    )
+    torch.testing.assert_close(
+        result["atom_virial"].sum(dim=1),
+        result["virial"],
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+def test_ragged_matches_padded(lr_kernel: str) -> None:
     """Ragged and padded layouts must describe the same batch."""
     torch.manual_seed(1234)
-    model = _build_model()
+    model = _build_model(lr_kernel=lr_kernel)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.copy_(torch.randn_like(parameter) * 0.1)
@@ -245,10 +315,46 @@ def test_periodic_box_is_rejected() -> None:
         model(coord, atype, box=box)
 
 
-def test_graph_training_gradient_reaches_lr_parameters() -> None:
+@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+def test_pt_checkpoint_deep_eval_matches_direct_forward(
+    tmp_path, lr_kernel: str
+) -> None:
+    """Checkpoint inference builds and passes the required long-range graph."""
+    torch.manual_seed(1234)
+    model = _build_model(lr_kernel=lr_kernel)
+    checkpoint = tmp_path / f"dpa4c_lr_{lr_kernel}.pt"
+    wrapper = ModelWrapper(model, model_params=copy.deepcopy(_config(lr_kernel)))
+    torch.save({"model": wrapper.state_dict()}, checkpoint)
+
+    coord, atype = _make_batch((4, 4), seed=29)
+    coord_t = torch.tensor(coord, dtype=torch.float64, device=env.DEVICE)
+    atype_t = torch.tensor(atype, dtype=torch.long, device=env.DEVICE)
+    expected = model(coord_t, atype_t, do_atomic_virial=True)
+
+    dp = DeepPot(str(checkpoint), auto_batch_size=False)
+    output_names = ("energy", "force", "virial", "atom_energy", "atom_virial")
+    actual = dict(
+        zip(
+            output_names,
+            dp.eval(coord, None, atype, atomic=True),
+            strict=True,
+        )
+    )
+    for name in output_names:
+        np.testing.assert_allclose(
+            actual[name],
+            expected[name].detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-10,
+            err_msg=name,
+        )
+
+
+@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+def test_graph_training_gradient_reaches_lr_parameters(lr_kernel: str) -> None:
     """Backprop through the graph lower reaches descriptor and LR fitting params."""
     torch.manual_seed(1234)
-    model = _build_model(train=True)
+    model = _build_model(train=True, lr_kernel=lr_kernel)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.copy_(torch.randn_like(parameter) * 0.1)
@@ -273,8 +379,41 @@ def test_graph_training_gradient_reaches_lr_parameters() -> None:
         assert torch.isfinite(gradient).all(), name
 
 
+def test_sog_parameters_serialize_and_remain_trainable() -> None:
+    """SOG amplitudes and widths survive fitting serialization as Parameters."""
+    fitting = _build_model(lr_kernel="sog").get_fitting_net()
+    named_parameters = dict(fitting.named_parameters())
+    assert "amp" in named_parameters
+    assert "bandwidth" in named_parameters
+    assert "les_alpha" not in named_parameters
+
+    restored = DPA4CLRFitting.deserialize(fitting.serialize()).to(env.DEVICE)
+    assert restored.lr_kernel == "sog"
+    assert restored.dim_out_lr == 3
+    restored_parameters = dict(restored.named_parameters())
+    assert "amp" in restored_parameters
+    assert "bandwidth" in restored_parameters
+    torch.testing.assert_close(restored.amp, fitting.amp)
+    torch.testing.assert_close(restored.bandwidth, fitting.bandwidth)
+
+
+def test_sog_graph_matches_dense_legacy_path() -> None:
+    """SOG graph and rectangular dense paths produce the same observables."""
+    torch.manual_seed(1234)
+    model = _build_model(lr_kernel="sog")
+    coord, atype = _make_batch((5, 5), seed=37)
+    coord_t = torch.tensor(coord, dtype=torch.float64, device=env.DEVICE)
+    atype_t = torch.tensor(atype, dtype=torch.long, device=env.DEVICE)
+
+    graph = model(coord_t, atype_t)
+    dense = model(coord_t, atype_t, neighbor_graph_method="legacy")
+    for name in ("energy", "force", "virial"):
+        torch.testing.assert_close(graph[name], dense[name], rtol=1e-10, atol=1e-10)
+
+
 @REQUIRES_SUPPORTED_COMPILE
-def test_compiled_lower_matches_eager() -> None:
+@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+def test_compiled_lower_matches_eager(lr_kernel: str) -> None:
     """The compiled graph lower must reproduce the eager energy and force."""
     from deepmd.pt_expt.train.training import (
         _CompiledModel,
@@ -282,7 +421,7 @@ def test_compiled_lower_matches_eager() -> None:
     )
 
     torch.manual_seed(0)
-    model = _build_model()
+    model = _build_model(lr_kernel=lr_kernel)
     compiled = _CompiledModel(model, _get_model_structure_key(model))
     compiled.eval()
 
