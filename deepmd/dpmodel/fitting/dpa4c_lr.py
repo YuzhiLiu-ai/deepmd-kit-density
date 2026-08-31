@@ -174,38 +174,44 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         self.b = SOG_DEFAULT_B if b is None else float(b)
         self.sigma = SOG_DEFAULT_SIGMA if sigma is None else float(sigma)
         self.M = max(1, SOG_DEFAULT_M if M is None else int(M))
-        if not np.isfinite(self.b) or self.b <= 0.0:
-            raise ValueError("`b` should be finite and positive.")
-        if not np.isfinite(self.sigma) or self.sigma <= 0.0:
-            raise ValueError("`sigma` should be finite and positive.")
+        if self.lr_kernel == "sog":
+            if not np.isfinite(self.b) or self.b <= 0.0:
+                raise ValueError("`b` should be finite and positive.")
+            if not np.isfinite(self.sigma) or self.sigma <= 0.0:
+                raise ValueError("`sigma` should be finite and positive.")
 
-        if bandwidth is None:
-            bandwidth_array = self.sigma * np.power(
-                self.b, np.arange(self.M, dtype=self.prec)
-            )
+            if bandwidth is None:
+                bandwidth_array = self.sigma * np.power(
+                    self.b, np.arange(self.M, dtype=self.prec)
+                )
+            else:
+                bandwidth_array = np.asarray(bandwidth, dtype=self.prec).reshape(-1)
+            if bandwidth_array.size < 1 or not np.all(np.isfinite(bandwidth_array)):
+                raise ValueError("`bandwidth` should contain finite values.")
+            if not np.all(bandwidth_array > 0.0):
+                raise ValueError("`bandwidth` should contain positive values.")
+
+            if amp is None:
+                amp_array = np.full_like(bandwidth_array, 4.0 * np.pi * np.log(self.b))
+            else:
+                amp_array = np.asarray(amp, dtype=self.prec).reshape(-1)
+            if amp_array.size == 1 and bandwidth_array.size > 1:
+                amp_array = np.full_like(bandwidth_array, amp_array[0])
+            elif amp_array.size != bandwidth_array.size:
+                raise ValueError(
+                    "`amp` should be scalar or have the same length as `bandwidth`."
+                )
+            if not np.all(np.isfinite(amp_array)):
+                raise ValueError("`amp` should contain finite values.")
+
+            self.bandwidth = bandwidth_array
+            self.amp = amp_array
+            self.M = int(bandwidth_array.size)
         else:
-            bandwidth_array = np.asarray(bandwidth, dtype=self.prec).reshape(-1)
-        if bandwidth_array.size < 1 or not np.all(np.isfinite(bandwidth_array)):
-            raise ValueError("`bandwidth` should contain finite values.")
-        if not np.all(bandwidth_array > 0.0):
-            raise ValueError("`bandwidth` should contain positive values.")
-
-        if amp is None:
-            amp_array = np.full_like(bandwidth_array, 4.0 * np.pi * np.log(self.b))
-        else:
-            amp_array = np.asarray(amp, dtype=self.prec).reshape(-1)
-        if amp_array.size == 1 and bandwidth_array.size > 1:
-            amp_array = np.full_like(bandwidth_array, amp_array[0])
-        elif amp_array.size != bandwidth_array.size:
-            raise ValueError(
-                "`amp` should be scalar or have the same length as `bandwidth`."
-            )
-        if not np.all(np.isfinite(amp_array)):
-            raise ValueError("`amp` should contain finite values.")
-
-        self.bandwidth = bandwidth_array
-        self.amp = amp_array
-        self.M = int(bandwidth_array.size)
+            # LES checkpoints created before SOG existed have no such keys.
+            # Keep the unused SOG attributes out of the module state entirely.
+            self.bandwidth = None
+            self.amp = None
 
     def output_def(self) -> FittingOutputDef:
         return FittingOutputDef(
@@ -387,8 +393,9 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         variables = data.setdefault("@variables", {})
         variables["bias_atom_q"] = to_numpy_array(self.bias_atom_q)
         variables["les_alpha"] = to_numpy_array(self.les_alpha)
-        variables["amp"] = to_numpy_array(self.amp)
-        variables["bandwidth"] = to_numpy_array(self.bandwidth)
+        if self.lr_kernel == "sog":
+            variables["amp"] = to_numpy_array(self.amp)
+            variables["bandwidth"] = to_numpy_array(self.bandwidth)
         return data
 
     @classmethod

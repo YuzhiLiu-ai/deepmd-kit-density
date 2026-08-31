@@ -56,6 +56,21 @@ class DPA4CLRFitting(DPA4CLRFittingDP):
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.call(*args, **kwargs)
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if self.lr_kernel == "les":
+            # A short-lived SOG implementation registered these unused buffers
+            # on LES models. Ignore them when reading such a checkpoint, while
+            # older LES checkpoints naturally have neither key.
+            state_dict.pop(prefix + "amp", None)
+            state_dict.pop(prefix + "bandwidth", None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
 
 register_dpmodel_mapping(
     DPA4CLRFittingDP,

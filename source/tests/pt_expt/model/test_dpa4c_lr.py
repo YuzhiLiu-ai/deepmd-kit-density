@@ -397,6 +397,23 @@ def test_sog_parameters_serialize_and_remain_trainable() -> None:
     torch.testing.assert_close(restored.bandwidth, fitting.bandwidth)
 
 
+def test_les_checkpoint_does_not_require_sog_parameters() -> None:
+    """LES state loading accepts checkpoints from before and during SOG rollout."""
+    fitting = _build_model(lr_kernel="les").get_fitting_net()
+    state_dict = fitting.state_dict()
+    assert "amp" not in state_dict
+    assert "bandwidth" not in state_dict
+
+    # Simulate the short-lived format that stored unused SOG buffers in LES.
+    transitional_state = state_dict.copy()
+    transitional_state["amp"] = torch.ones(12, device=env.DEVICE)
+    transitional_state["bandwidth"] = torch.ones(12, device=env.DEVICE)
+
+    restored = _build_model(lr_kernel="les").get_fitting_net()
+    restored.load_state_dict(state_dict, strict=True)
+    restored.load_state_dict(transitional_state, strict=True)
+
+
 def test_sog_graph_matches_dense_legacy_path() -> None:
     """SOG graph and rectangular dense paths produce the same observables."""
     torch.manual_seed(1234)
