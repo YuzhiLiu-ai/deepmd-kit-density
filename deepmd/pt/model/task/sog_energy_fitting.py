@@ -607,12 +607,17 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         # fused GLU backward on CUDA.  The model casts the final state once at
         # the long-range-kernel boundary.
         dtype = self.prec
-        descriptor = descriptor.to(dtype)
-        q = charge.to(dtype)
-        p = dipole.to(dtype)
-        p0 = local_dipole.to(dtype)
-        phi = potential.to(dtype)
-        electric = field.to(dtype)
+        # ``descriptor`` and the latent states can be views whose leading
+        # stride depends on the padded nloc/nscatter of the current mixed-size
+        # batch.  AOTAutograd saves some of these inputs for the force-loss
+        # double backward; giving the GLU a canonical layout prevents its
+        # compiled backward from retaining the trace batch's leading stride.
+        descriptor = descriptor.to(dtype).contiguous()
+        q = charge.to(dtype).contiguous()
+        p = dipole.to(dtype).contiguous()
+        p0 = local_dipole.to(dtype).contiguous()
+        phi = potential.to(dtype).contiguous()
+        electric = field.to(dtype).contiguous()
 
         p_sq = torch.sum(p * p, dim=-1, keepdim=True)
         e_sq = torch.sum(electric * electric, dim=-1, keepdim=True)

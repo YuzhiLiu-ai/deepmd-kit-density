@@ -437,11 +437,10 @@ class SeZMSOGModel(SeZMModel):
             q_output_dtype = q.dtype
             p_output_dtype = p.dtype
             update_dtype = fitting.prec
-            q = q.to(update_dtype)
-            p = p.to(update_dtype)
-            r_ij = coord_lr.to(update_dtype).unsqueeze(1) - coord_lr.to(
-                update_dtype
-            ).unsqueeze(2)
+            q = q.to(update_dtype).contiguous()
+            p = p.to(update_dtype).contiguous()
+            coord_update = coord_lr.to(update_dtype).contiguous()
+            r_ij = coord_update.unsqueeze(1) - coord_update.unsqueeze(2)
             eye = 1.0 - torch.eye(
                 nloc, dtype=update_dtype, device=coord_lr.device
             ).unsqueeze(0)
@@ -466,8 +465,8 @@ class SeZMSOGModel(SeZMModel):
                     atom_mask,
                     target_charge,
                 )
-            q = q.to(q_output_dtype)
-            p = p.to(p_output_dtype)
+            q = q.to(q_output_dtype).contiguous()
+            p = p.to(p_output_dtype).contiguous()
             fit_ret["latent_charge"] = q
             fit_ret["latent_dipole"] = p
         e_lr = self.sog_kernel(

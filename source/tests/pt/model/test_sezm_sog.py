@@ -814,7 +814,7 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
         TestSeZMSOGModel._randomize_params(model)
         return model
 
-    def _check_compile_parity(self, extra: dict, tag: str) -> None:
+    def _check_compile_parity(self, extra: dict, tag: str) -> SeZMSOGModel:
         m_eager = self._make_model(extra, False)
         m_comp = self._make_model(extra, True)
 
@@ -864,6 +864,7 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
                 atol=1e-10,
                 err_msg=f"[{tag}] grad of {k}",
             )
+        return m_comp
 
     @unittest.skipIf(_SKIP_OFF_COMPILE_TORCH, _SKIP_OFF_COMPILE_TORCH_REASON)
     def test_compile_eager_parity_les(self) -> None:
@@ -882,16 +883,24 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
 
     @unittest.skipIf(_SKIP_OFF_COMPILE_TORCH, _SKIP_OFF_COMPILE_TORCH_REASON)
     def test_compile_eager_parity_iterative_dipole(self) -> None:
-        self._check_compile_parity(
+        model = self._check_compile_parity(
             {
                 "lr_kernel": "dipole",
                 "use_self_pol": False,
                 "use_charge_constraint": True,
                 "lr_update_steps": 2,
                 "lr_update_neuron": [8],
+                "precision": "float32",
             },
             "iterative-dipole",
         )
+        # Reuse the same dynamic compiled graph with a different nloc.  Polar
+        # update views must not retain the first batch's leading strides in the
+        # AOTAutograd force-loss backward.
+        model.zero_grad()
+        ret = model.forward(self.coord[:, :5, :], self.atype[:, :5])
+        loss = ret["energy"].sum() + 0.1 * (ret["force"] ** 2).sum()
+        loss.backward()
 
 
 if __name__ == "__main__":
