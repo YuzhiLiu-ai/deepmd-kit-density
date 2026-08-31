@@ -34,6 +34,7 @@ from deepmd.pt.model.model.model import (
 )
 from deepmd.pt.model.task.sog_energy_fitting import (
     SOGEnergyFittingNet,
+    _materialize_compact,
 )
 
 from .sezm_model import (
@@ -437,9 +438,9 @@ class SeZMSOGModel(SeZMModel):
             q_output_dtype = q.dtype
             p_output_dtype = p.dtype
             update_dtype = fitting.prec
-            q = q.to(update_dtype).contiguous()
-            p = p.to(update_dtype).contiguous()
-            coord_update = coord_lr.to(update_dtype).contiguous()
+            q = _materialize_compact(q, update_dtype)
+            p = _materialize_compact(p, update_dtype)
+            coord_update = _materialize_compact(coord_lr, update_dtype)
             r_ij = coord_update.unsqueeze(1) - coord_update.unsqueeze(2)
             eye = 1.0 - torch.eye(
                 nloc, dtype=update_dtype, device=coord_lr.device
@@ -465,8 +466,8 @@ class SeZMSOGModel(SeZMModel):
                     atom_mask,
                     target_charge,
                 )
-            q = q.to(q_output_dtype).contiguous()
-            p = p.to(p_output_dtype).contiguous()
+            q = _materialize_compact(q, q_output_dtype)
+            p = _materialize_compact(p, p_output_dtype)
             fit_ret["latent_charge"] = q
             fit_ret["latent_dipole"] = p
         e_lr = self.sog_kernel(

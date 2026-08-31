@@ -55,6 +55,22 @@ SOG_DEFAULT_SIGMA = to_numpy_array(np.array(2.180230445405648))
 SOG_DEFAULT_M = 12
 
 
+def _materialize_compact(
+    value: torch.Tensor,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Copy a possibly padded-stride view into compact row-major storage.
+
+    An explicit allocation plus ``copy_`` is intentional here.  In a large
+    dynamic Inductor graph, ``slice.contiguous()`` can be incorrectly elided
+    when the trace batch has a size-one leading dimension, leaving a saved
+    AOTAutograd tensor with the preceding batch's padded leading stride.
+    """
+    source = value.to(dtype) if dtype is not None else value
+    result = torch.empty(source.shape, dtype=source.dtype, device=source.device)
+    return result.copy_(source)
+
+
 @Fitting.register("sog_energy")
 @fitting_check_output
 class SOGEnergyFittingNet(SeZMEnergyFittingNet):
@@ -612,12 +628,12 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         # batch.  AOTAutograd saves some of these inputs for the force-loss
         # double backward; giving the GLU a canonical layout prevents its
         # compiled backward from retaining the trace batch's leading stride.
-        descriptor = descriptor.to(dtype).contiguous()
-        q = charge.to(dtype).contiguous()
-        p = dipole.to(dtype).contiguous()
-        p0 = local_dipole.to(dtype).contiguous()
-        phi = potential.to(dtype).contiguous()
-        electric = field.to(dtype).contiguous()
+        descriptor = _materialize_compact(descriptor, dtype)
+        q = _materialize_compact(charge, dtype)
+        p = _materialize_compact(dipole, dtype)
+        p0 = _materialize_compact(local_dipole, dtype)
+        phi = _materialize_compact(potential, dtype)
+        electric = _materialize_compact(field, dtype)
 
         p_sq = torch.sum(p * p, dim=-1, keepdim=True)
         e_sq = torch.sum(electric * electric, dim=-1, keepdim=True)
