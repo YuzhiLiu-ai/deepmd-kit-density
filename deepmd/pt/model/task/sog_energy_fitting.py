@@ -600,7 +600,14 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         if self.polar_update_net is None:
             return charge, dipole
 
-        dtype = descriptor.dtype
+        # Keep the complete recurrent update in the fitting precision.  In
+        # particular, do not cast the GLU output back to the global model
+        # precision after every step: that creates a repeated fp32 -> fp64 ->
+        # fp32 chain which is both unnecessary and problematic for Inductor's
+        # fused GLU backward on CUDA.  The model casts the final state once at
+        # the long-range-kernel boundary.
+        dtype = self.prec
+        descriptor = descriptor.to(dtype)
         q = charge.to(dtype)
         p = dipole.to(dtype)
         p0 = local_dipole.to(dtype)
@@ -646,7 +653,7 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
             deficit = target_charge.to(dtype) - q_new.sum(dim=1, keepdim=True)
             q_new = q_new + weights * deficit
-        return q_new.to(charge.dtype), p_new.to(dipole.dtype)
+        return q_new, p_new
 
     # ------------------------------------------------------------------
     # Overrides

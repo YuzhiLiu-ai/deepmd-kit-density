@@ -429,9 +429,21 @@ class SeZMSOGModel(SeZMModel):
         if fitting.lr_update_steps > 0:
             if p is None:
                 raise RuntimeError("Long-range polar updates require latent dipoles.")
-            r_ij = coord_lr.unsqueeze(1) - coord_lr.unsqueeze(2)
+            # Mirror the regular DPA4 fitting path: keep all recurrent neural
+            # network work in fitting precision, then cross the global model
+            # precision boundary only once.  Recasting q/p after every update
+            # can make Inductor fuse a mixed fp32/fp64 GLU kernel that Triton
+            # cannot lower on CUDA.
+            q_output_dtype = q.dtype
+            p_output_dtype = p.dtype
+            update_dtype = fitting.prec
+            q = q.to(update_dtype)
+            p = p.to(update_dtype)
+            r_ij = coord_lr.to(update_dtype).unsqueeze(1) - coord_lr.to(
+                update_dtype
+            ).unsqueeze(2)
             eye = 1.0 - torch.eye(
-                nloc, dtype=coord_lr.dtype, device=coord_lr.device
+                nloc, dtype=update_dtype, device=coord_lr.device
             ).unsqueeze(0)
             local_p = p
             atom_mask = fit_ret["mask"][:, :nloc].to(torch.bool)
@@ -440,9 +452,9 @@ class SeZMSOGModel(SeZMModel):
                 potential, field = _les_potential_and_field(
                     r_ij,
                     eye,
-                    q.to(coord_lr.dtype),
-                    p.to(coord_lr.dtype),
-                    fitting.les_alpha,
+                    q,
+                    p,
+                    fitting.les_alpha.to(update_dtype),
                 )
                 q, p = fitting.update_polar_state(
                     descriptor[:, :nloc, :],
@@ -454,6 +466,8 @@ class SeZMSOGModel(SeZMModel):
                     atom_mask,
                     target_charge,
                 )
+            q = q.to(q_output_dtype)
+            p = p.to(p_output_dtype)
             fit_ret["latent_charge"] = q
             fit_ret["latent_dipole"] = p
         e_lr = self.sog_kernel(

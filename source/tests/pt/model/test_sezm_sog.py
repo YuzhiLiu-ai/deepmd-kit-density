@@ -642,6 +642,39 @@ class TestSeZMSOGModel(unittest.TestCase):
             atol=1e-12,
         )
 
+    def test_polar_update_keeps_fitting_precision(self) -> None:
+        fitting = SOGEnergyFittingNet(
+            ntypes=2,
+            dim_descrpt=8,
+            neuron=[8],
+            neuron_lr=[8],
+            use_self_pol=False,
+            lr_kernel="dipole",
+            dipole_lmax=1,
+            dipole_channels=2,
+            lr_update_steps=2,
+            lr_update_neuron=[8],
+            precision="float32",
+            seed=3,
+        )
+        nf, nloc = 1, 4
+        descriptor = torch.randn(nf, nloc, 8, dtype=torch.float64, device=self.device)
+        q = torch.randn(nf, nloc, 1, dtype=torch.float64, device=self.device)
+        p = torch.randn(nf, nloc, 3, dtype=torch.float64, device=self.device)
+        mask = torch.ones(nf, nloc, dtype=torch.bool, device=self.device)
+        q_new, p_new = fitting.update_polar_state(
+            descriptor,
+            q,
+            p,
+            p,
+            torch.randn_like(q),
+            torch.randn_like(p),
+            mask,
+            q.sum(dim=1, keepdim=True),
+        )
+        self.assertEqual(q_new.dtype, torch.float32)
+        self.assertEqual(p_new.dtype, torch.float32)
+
     def test_serialize_deserialize_iterative_fitting(self) -> None:
         extra = {
             "lr_kernel": "dipole",
