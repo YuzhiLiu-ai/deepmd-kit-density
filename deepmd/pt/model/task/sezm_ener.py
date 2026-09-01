@@ -348,6 +348,52 @@ class GLUFittingNet(torch.nn.Module):
                 xx = layer(xx)
         return self.output_layer(xx)
 
+    def forward_from_blocks(self, blocks: list[torch.Tensor]) -> torch.Tensor:
+        """Forward without concatenating the inputs before the first linear.
+
+        Splitting the first linear by input-feature blocks is algebraically
+        equivalent to ``forward(torch.cat(blocks, dim=-1))``.  It is useful in
+        higher-order compiled graphs: the backward of ``cat`` returns narrow
+        size-one views whose leading stride may be specialized by AOTAutograd
+        to the trace batch's atom count.
+        """
+        if self.case_film_embd:
+            raise NotImplementedError(
+                "Blockwise GLU input does not support case FiLM conditioning."
+            )
+        if not blocks:
+            raise ValueError("Blockwise GLU input requires at least one tensor.")
+
+        first_projection = (
+            self.hidden_layers[0].linear if self.hidden_layers else self.output_layer
+        )
+        offset = 0
+        projected: torch.Tensor | None = None
+        for block in blocks:
+            width = block.shape[-1]
+            next_offset = offset + width
+            term = torch.nn.functional.linear(
+                block.to(first_projection.prec),
+                first_projection.matrix[offset:next_offset, :].t(),
+                first_projection.bias if offset == 0 else None,
+            )
+            projected = term if projected is None else projected + term
+            offset = next_offset
+        if offset != self.in_dim:
+            raise ValueError(
+                f"Blockwise GLU input width is {offset}, expected {self.in_dim}."
+            )
+        assert projected is not None
+
+        if not self.hidden_layers:
+            return projected
+        first_hidden = self.hidden_layers[0]
+        value, gate = projected.chunk(2, dim=-1)
+        xx = value * first_hidden.activation(gate)
+        for layer in self.hidden_layers[1:]:
+            xx = layer(xx)
+        return self.output_layer(xx)
+
     def call_until_last(
         self,
         xx: torch.Tensor,

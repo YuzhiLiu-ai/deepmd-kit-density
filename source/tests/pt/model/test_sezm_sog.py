@@ -675,6 +675,42 @@ class TestSeZMSOGModel(unittest.TestCase):
         self.assertEqual(q_new.dtype, torch.float32)
         self.assertEqual(p_new.dtype, torch.float32)
 
+    def test_polar_update_blockwise_glu_parity(self) -> None:
+        fitting = SOGEnergyFittingNet(
+            ntypes=2,
+            dim_descrpt=8,
+            neuron=[8],
+            neuron_lr=[8],
+            use_self_pol=False,
+            lr_kernel="dipole",
+            dipole_lmax=1,
+            dipole_channels=2,
+            lr_update_steps=2,
+            lr_update_neuron=[8, 8],
+            precision="float64",
+            seed=3,
+        )
+        update_net = fitting.polar_update_net
+        assert update_net is not None
+        with torch.no_grad():
+            for parameter in update_net.parameters():
+                parameter.copy_(0.1 * torch.randn_like(parameter))
+        blocks = [
+            torch.randn(2, 4, 8, dtype=torch.float64, device=self.device),
+            *[
+                torch.randn(2, 4, 1, dtype=torch.float64, device=self.device)
+                for _ in range(5)
+            ],
+        ]
+        expected = update_net(torch.cat(blocks, dim=-1))
+        actual = update_net.forward_from_blocks(blocks)
+        np.testing.assert_allclose(
+            actual.detach().cpu().numpy(),
+            expected.detach().cpu().numpy(),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
     def test_serialize_deserialize_iterative_fitting(self) -> None:
         extra = {
             "lr_kernel": "dipole",
