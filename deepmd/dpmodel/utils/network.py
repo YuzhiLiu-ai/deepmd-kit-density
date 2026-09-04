@@ -1203,6 +1203,11 @@ class NetworkCollection:
         if len(networks) and all(net is not None for net in networks):
             self.check_completeness()
 
+    @property
+    def networks(self) -> list:
+        """Return the list of networks (compatibility with SeZMNetworkCollection)."""
+        return self._networks
+
     def check_completeness(self) -> None:
         """Check whether the collection is complete.
 

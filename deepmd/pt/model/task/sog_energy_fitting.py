@@ -32,6 +32,10 @@ from deepmd.dpmodel.utils.seed import (
 from deepmd.pt.model.network.network import (
     TypeEmbedNet,
 )
+from deepmd.pt.model.network.mlp import (
+    FittingNet,
+    NetworkCollection,
+)
 from deepmd.pt.model.task.fitting import (
     Fitting,
 )
@@ -147,6 +151,8 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         alpha_pol: float | list[float] | torch.Tensor | None = None,
         dipole_lmax: int | None = None,
         dipole_channels: int | None = None,
+        charge_bound: float | None = None,
+        use_glu: bool = True,
         lr_update_steps: int = 0,
         lr_update_neuron: list[int] | None = None,
         lr_update_damping: float = 0.2,
@@ -165,6 +171,8 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         self.use_charge_constraint = bool(use_charge_constraint)
         self.use_self_pol = bool(use_self_pol)
         self.bias_atom_q_bound = 3.0
+        self.charge_bound = None if charge_bound is None else float(charge_bound)
+        self.use_glu = bool(use_glu)
         self.lr_update_steps = int(lr_update_steps)
         if self.lr_update_steps < 0:
             raise ValueError("`lr_update_steps` should be non-negative.")
@@ -223,7 +231,10 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
                 "`sog_energy` fitting does not support `case_film_embd` yet."
             )
 
-        # --- LR (latent charge) GLU branch ---
+        # --- LR (latent charge) branch ---
+        # use_glu=True (default) uses GLUFittingNet; use_glu=False uses standard
+        # FittingNet (MLP) which is less expressive but more stable (no
+        # unbounded val branch that can blow up the latent charge).
         in_dim = (
             self.dim_descrpt
             + self.numb_fparam
@@ -231,28 +242,49 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             + self.dim_case_embd
         )
         n_networks = self.ntypes if not self.mixed_types else 1
-        self.filter_layers_lr = SeZMNetworkCollection(
-            1 if not self.mixed_types else 0,
-            self.ntypes,
-            network_type="sezm_fitting_network",
-            networks=[
-                GLUFittingNet(
-                    in_dim,
-                    self.dim_out_lr,
-                    self.neuron_lr,
-                    activation_function=self.activation_function,
-                    resnet_dt=self.resnet_dt,
-                    precision=self.precision,
-                    bias_out=self.bias_out,
-                    seed=child_seed(self.seed, 10_000 + idx),
-                    trainable=self.trainable,
-                    descriptor_dim=self.dim_descrpt,
-                    dim_case_embd=self.dim_case_embd,
-                    case_film_embd=False,
-                )
-                for idx in range(n_networks)
-            ],
-        )
+        if self.use_glu:
+            self.filter_layers_lr = SeZMNetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="sezm_fitting_network",
+                networks=[
+                    GLUFittingNet(
+                        in_dim,
+                        self.dim_out_lr,
+                        self.neuron_lr,
+                        activation_function=self.activation_function,
+                        resnet_dt=self.resnet_dt,
+                        precision=self.precision,
+                        bias_out=self.bias_out,
+                        seed=child_seed(self.seed, 10_000 + idx),
+                        trainable=self.trainable,
+                        descriptor_dim=self.dim_descrpt,
+                        dim_case_embd=self.dim_case_embd,
+                        case_film_embd=False,
+                    )
+                    for idx in range(n_networks)
+                ],
+            )
+        else:
+            self.filter_layers_lr = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        in_dim,
+                        self.dim_out_lr,
+                        self.neuron_lr,
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=self.bias_out,
+                        seed=child_seed(self.seed, 10_000 + idx),
+                        trainable=self.trainable,
+                    )
+                    for idx in range(n_networks)
+                ],
+            )
 
         # --- bias_atom_q (LR-specific) ---
         if bias_atom_q is None:
@@ -583,6 +615,8 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
 
         mask = self.emask(atype).to(torch.bool)
         lr_out = torch.where(mask[:, :, None], lr_out, 0.0)
+        if self.charge_bound is not None:
+            lr_out = self.charge_bound * torch.tanh(lr_out / self.charge_bound)
         return lr_out
 
     def update_polar_state(
@@ -765,6 +799,8 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         data["lr_kernel"] = self.lr_kernel
         data["dipole_lmax"] = self.dipole_lmax
         data["dipole_channels"] = self.dipole_channels
+        data["charge_bound"] = self.charge_bound
+        data["use_glu"] = self.use_glu
         data["lr_update_steps"] = self.lr_update_steps
         data["lr_update_neuron"] = self.lr_update_neuron
         data["lr_update_damping"] = self.lr_update_damping
@@ -797,12 +833,16 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         }
         polar_update_net = data.pop("polar_update_net", None)
         nets_lr = data.pop("nets_lr", None)
+        use_glu = data.get("use_glu", True)  # Default True for backward compatibility
         data["@variables"] = variables
 
         obj = super().deserialize(data)
 
         if nets_lr is not None:
-            obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
+            if use_glu:
+                obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
+            else:
+                obj.filter_layers_lr = NetworkCollection.deserialize(nets_lr)
 
         with torch.no_grad():
             target_shape = obj.bandwidth.shape

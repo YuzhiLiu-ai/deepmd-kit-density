@@ -3159,6 +3159,28 @@ def fitting_sog_energy() -> list[Argument]:
             default=0.2,
             doc=supported_backends("pt") + doc_lr_update_damping,
         ),
+        Argument(
+            "charge_bound",
+            [float, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt")
+            + "Bound for the total latent charge (GLU output + bias). "
+            + "GLU's value branch is unbounded, so without this the charge can "
+            + "extrapolate to very large values and blow up the long-range kernel. "
+            + "If None (default), no bound is applied (backward compatible).",
+        ),
+        Argument(
+            "use_glu",
+            bool,
+            optional=True,
+            default=True,
+            doc=supported_backends("pt")
+            + "Whether to use GLU (Gated Linear Unit) for the long-range branch. "
+            + "If True (default), use GLUFittingNet which is more expressive but "
+            + "can produce unbounded outputs. If False, use standard FittingNet "
+            + "(MLP) which is more stable (no unbounded val branch).",
+        ),
     ]
 
 
@@ -3278,6 +3300,28 @@ def fitting_dpa4c_lr() -> list[Argument]:
             optional=True,
             default=False,
             doc=supported_backends("pt_expt") + doc_use_charge_constraint,
+        ),
+        Argument(
+            "charge_bound",
+            [float, type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt")
+            + "Bound for the total latent charge (GLU output + bias). "
+            + "GLU's value branch is unbounded, so without this the charge can "
+            + "extrapolate to very large values and blow up the long-range kernel. "
+            + "If None (default), no bound is applied (backward compatible).",
+        ),
+        Argument(
+            "use_glu",
+            bool,
+            optional=True,
+            default=True,
+            doc=supported_backends("pt_expt")
+            + "Whether to use GLU (Gated Linear Unit) for the long-range branch. "
+            + "If True (default), use GLUFittingNet which is more expressive but "
+            + "can produce unbounded outputs. If False, use standard FittingNet "
+            + "(MLP) which is more stable (no unbounded val branch).",
         ),
     ]
 
