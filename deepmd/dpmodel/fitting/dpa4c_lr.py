@@ -37,6 +37,10 @@ from .dpa4_ener import (
     SeZMEnergyFittingNet,
     SeZMNetworkCollection,
 )
+from deepmd.dpmodel.utils.network import (
+    FittingNet,
+    NetworkCollection,
+)
 from .invar_fitting import (
     InvarFitting,
 )
@@ -93,6 +97,8 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         M: int | None = None,
         use_charge_constraint: bool = False,
         lr_kernel: str = "les",
+        charge_bound: float | None = None,
+        use_glu: bool = True,
         **kwargs: Any,
     ) -> None:
         # Attributes consulted by output_def() during fitting_check_output must
@@ -103,6 +109,8 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         self.neuron_lr = [64, 64] if neuron_lr is None else [int(x) for x in neuron_lr]
         self.use_charge_constraint = bool(use_charge_constraint)
         self.bias_atom_q_bound = 3.0
+        self.charge_bound = None if charge_bound is None else float(charge_bound)
+        self.use_glu = bool(use_glu)
         lr_kernel = str(lr_kernel).lower()
         if lr_kernel not in ("les", "sog", "dipole"):
             raise ValueError(
@@ -123,7 +131,10 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
 
         super().__init__(*args, **kwargs)
 
-        # --- latent-charge GLU branch ---
+        # --- latent-charge branch ---
+        # use_glu=True (default) uses GLUFittingNet; use_glu=False uses standard
+        # FittingNet (MLP) which is less expressive but more stable (no
+        # unbounded val branch that can blow up the latent charge).
         case_dim = 0 if self.case_film_embd else self.dim_case_embd
         in_dim = (
             self.dim_descrpt
@@ -132,28 +143,53 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
             + case_dim
         )
         n_networks = self.ntypes if not self.mixed_types else 1
-        self.filter_layers_lr = SeZMNetworkCollection(
-            1 if not self.mixed_types else 0,
-            self.ntypes,
-            network_type="sezm_fitting_network",
-            networks=[
-                GLUFittingNet(
-                    in_dim,
-                    self.dim_out_lr,
-                    self.neuron_lr,
-                    activation_function=self.activation_function,
-                    resnet_dt=self.resnet_dt,
-                    precision=self.precision,
-                    bias_out=self.bias_out,
-                    seed=child_seed(self.seed, 10_000 + idx),
-                    trainable=self.trainable,
-                    descriptor_dim=self.dim_descrpt,
-                    dim_case_embd=self.dim_case_embd,
-                    case_film_embd=self.case_film_embd,
-                )
-                for idx in range(n_networks)
-            ],
-        )
+        if self.use_glu:
+            self.filter_layers_lr = SeZMNetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="sezm_fitting_network",
+                networks=[
+                    GLUFittingNet(
+                        in_dim,
+                        self.dim_out_lr,
+                        self.neuron_lr,
+                        activation_function=self.activation_function,
+                        resnet_dt=self.resnet_dt,
+                        precision=self.precision,
+                        bias_out=self.bias_out,
+                        seed=child_seed(self.seed, 10_000 + idx),
+                        trainable=self.trainable,
+                        descriptor_dim=self.dim_descrpt,
+                        dim_case_embd=self.dim_case_embd,
+                        case_film_embd=self.case_film_embd,
+                    )
+                    for idx in range(n_networks)
+                ],
+            )
+        else:
+            self.filter_layers_lr = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        in_dim,
+                        self.dim_out_lr,
+                        self.neuron_lr,
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=self.bias_out,
+                        seed=child_seed(self.seed, 10_000 + idx),
+                        trainable=(
+                            all(self.trainable)
+                            if isinstance(self.trainable, list)
+                            else self.trainable
+                        ),
+                    )
+                    for idx in range(n_networks)
+                ],
+            )
 
         # --- per-element latent-charge bias ---
         if bias_atom_q is None:
@@ -356,6 +392,8 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         exclude_mask = self.emask.build_type_exclude_mask(atype)
         exclude_mask = xp.astype(exclude_mask, xp.bool)
         lr_out = xp.where(exclude_mask[:, :, None], lr_out, xp.zeros_like(lr_out))
+        if self.charge_bound is not None:
+            lr_out = self.charge_bound * xp.tanh(lr_out / self.charge_bound)
         return lr_out
 
     def _get_lr_bias(self, atype: Any, xp: Any) -> Any:
@@ -387,6 +425,8 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         data["nets_lr"] = self.filter_layers_lr.serialize()
         data["use_charge_constraint"] = self.use_charge_constraint
         data["lr_kernel"] = self.lr_kernel
+        data["charge_bound"] = self.charge_bound
+        data["use_glu"] = self.use_glu
         data["b"] = self.b
         data["sigma"] = self.sigma
         data["M"] = self.M
@@ -408,6 +448,7 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         amp = variables.pop("amp", None)
         bandwidth = variables.pop("bandwidth", None)
         nets_lr = data.pop("nets_lr", None)
+        use_glu = data.get("use_glu", True)  # Default True for backward compatibility
         # Feed LR variables through the constructor. This preserves their
         # Parameter status when ``cls`` is the pt_expt torch wrapper; assigning
         # numpy arrays after construction would replace Parameters with buffers.
@@ -422,5 +463,9 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         data["@variables"] = variables
         obj = super().deserialize(data)
         if nets_lr is not None:
-            obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
+            # Use the correct collection type based on use_glu
+            if use_glu:
+                obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
+            else:
+                obj.filter_layers_lr = NetworkCollection.deserialize(nets_lr)
         return obj
