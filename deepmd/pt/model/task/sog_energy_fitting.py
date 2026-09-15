@@ -122,6 +122,14 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         Channel count of the SeZM equivariant latent read by the dipole
         head. Wired automatically from the descriptor. Only used when
         ``lr_kernel="dipole"``.
+    lr_update_steps : int, optional
+        Number of recurrent long-range field updates applied to charge and
+        dipole before evaluating the final energy. Defaults to zero for
+        checkpoint compatibility and currently requires ``lr_kernel="dipole"``.
+    lr_update_neuron : list[int], optional
+        Hidden widths of the shared polar update GLU network.
+    lr_update_damping : float, optional
+        Residual damping applied to every charge and dipole update.
     """
 
     def __init__(
@@ -145,6 +153,9 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         dipole_channels: int | None = None,
         charge_bound: float | None = None,
         use_glu: bool = True,
+        lr_update_steps: int = 0,
+        lr_update_neuron: list[int] | None = None,
+        lr_update_damping: float = 0.2,
         **kwargs: Any,
     ) -> None:
         # NOTE: the config attributes consumed by ``output_def`` must be set
@@ -162,6 +173,17 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         self.bias_atom_q_bound = 3.0
         self.charge_bound = None if charge_bound is None else float(charge_bound)
         self.use_glu = bool(use_glu)
+        self.lr_update_steps = int(lr_update_steps)
+        if self.lr_update_steps < 0:
+            raise ValueError("`lr_update_steps` should be non-negative.")
+        self.lr_update_neuron = (
+            [64, 64]
+            if lr_update_neuron is None
+            else [int(value) for value in lr_update_neuron]
+        )
+        self.lr_update_damping = float(lr_update_damping)
+        if not 0.0 < self.lr_update_damping <= 1.0:
+            raise ValueError("`lr_update_damping` should be in (0, 1].")
 
         lr_kernel = str(lr_kernel).lower()
         if lr_kernel not in ("les", "dipole", "sog"):
@@ -181,6 +203,10 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         # ``use_dipole`` attribute is kept as the readout switch consulted by
         # the model layer (whether to feed the equivariant latent).
         self.use_dipole = lr_kernel == "dipole"
+        if self.lr_update_steps > 0 and not self.use_dipole:
+            raise ValueError(
+                "`lr_update_steps > 0` currently requires `lr_kernel='dipole'`."
+            )
         if self.use_dipole:
             if dipole_lmax is None or int(dipole_lmax) < 1:
                 raise ValueError(
@@ -359,6 +385,29 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             )
         else:
             self.dipole_head = None
+
+        # A single shared update map is reused at every polarisation step, so
+        # the recurrence has a meaningful fixed point.  Its five outputs are
+        # dq, the Fukui log-weight, and three equivariant vector gates.
+        if self.lr_update_steps > 0:
+            self.polar_update_net: GLUFittingNet | None = GLUFittingNet(
+                self.dim_descrpt + 5,
+                5,
+                self.lr_update_neuron,
+                activation_function=self.activation_function,
+                precision=self.precision,
+                bias_out=True,
+                seed=child_seed(self.seed, 10_003),
+                trainable=self.trainable,
+            )
+            # The recurrent branch starts as the identity, which keeps old
+            # predictions stable when fine-tuning a checkpoint.
+            with torch.no_grad():
+                self.polar_update_net.output_layer.matrix.zero_()
+                if self.polar_update_net.output_layer.bias is not None:
+                    self.polar_update_net.output_layer.bias.zero_()
+        else:
+            self.polar_update_net = None
 
         # --- per-element polarizability for the dipole self term ---
         if alpha_pol is None:
@@ -570,6 +619,79 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             lr_out = self.charge_bound * torch.tanh(lr_out / self.charge_bound)
         return lr_out
 
+    def update_polar_state(
+        self,
+        descriptor: torch.Tensor,
+        charge: torch.Tensor,
+        dipole: torch.Tensor,
+        local_dipole: torch.Tensor,
+        potential: torch.Tensor,
+        field: torch.Tensor,
+        atom_mask: torch.Tensor,
+        target_charge: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply one shared, rotation-equivariant charge/dipole update."""
+        if self.polar_update_net is None:
+            return charge, dipole
+
+        # Keep the complete recurrent update in the fitting precision.  In
+        # particular, do not cast the GLU output back to the global model
+        # precision after every step: that creates a repeated fp32 -> fp64 ->
+        # fp32 chain which is both unnecessary and problematic for Inductor's
+        # fused GLU backward on CUDA.  The model casts the final state once at
+        # the long-range-kernel boundary.
+        dtype = self.prec
+        descriptor = descriptor.to(dtype)
+        q = charge.to(dtype)
+        p = dipole.to(dtype)
+        p0 = local_dipole.to(dtype)
+        phi = potential.to(dtype)
+        electric = field.to(dtype)
+
+        p_sq = torch.sum(p * p, dim=-1, keepdim=True)
+        e_sq = torch.sum(electric * electric, dim=-1, keepdim=True)
+        p_scale = torch.sqrt(1.0 + p_sq)
+        e_scale = torch.sqrt(1.0 + e_sq)
+        p_unit = p / p_scale
+        e_unit = electric / e_scale
+        # Evaluate the first update projection blockwise.  A plain cat is
+        # mathematically equivalent, but its higher-order backward produces
+        # size-one views with stride ``(nloc * (dim_descrpt + 5),
+        # dim_descrpt + 5, 1)``.  AOTAutograd can specialize that leading
+        # stride to the first mixed-nloc batch and reject the next one.
+        update = self.polar_update_net.forward_from_blocks(
+            [
+                descriptor,
+                q,
+                torch.tanh(phi),
+                p_sq / (1.0 + p_sq),
+                e_sq / (1.0 + e_sq),
+                torch.sum(p_unit * e_unit, dim=-1, keepdim=True),
+            ]
+        )
+        dq = torch.tanh(update[..., 0:1])
+        fukui = torch.nn.functional.softplus(update[..., 1:2]) + 1e-8
+        gates = torch.tanh(update[..., 2:5])
+        dmu = gates[..., 0:1] * p + gates[..., 1:2] * e_unit + gates[..., 2:3] * p0
+
+        mask = atom_mask.unsqueeze(-1)
+        q_new = torch.where(
+            mask,
+            q + self.lr_update_damping * dq,
+            torch.zeros_like(q),
+        )
+        p_new = torch.where(
+            mask,
+            p + self.lr_update_damping * dmu,
+            torch.zeros_like(p),
+        )
+        if self.use_charge_constraint:
+            weights = torch.where(mask, fukui, torch.zeros_like(fukui))
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            deficit = target_charge.to(dtype) - q_new.sum(dim=1, keepdim=True)
+            q_new = q_new + weights * deficit
+        return q_new, p_new
+
     # ------------------------------------------------------------------
     # Overrides
     # ------------------------------------------------------------------
@@ -679,6 +801,11 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         data["dipole_channels"] = self.dipole_channels
         data["charge_bound"] = self.charge_bound
         data["use_glu"] = self.use_glu
+        data["lr_update_steps"] = self.lr_update_steps
+        data["lr_update_neuron"] = self.lr_update_neuron
+        data["lr_update_damping"] = self.lr_update_damping
+        if self.polar_update_net is not None:
+            data["polar_update_net"] = self.polar_update_net.serialize()
         if self.dipole_head is not None:
             for key, value in self.dipole_head.state_dict().items():
                 variables[f"dipole_head.{key}"] = to_numpy_array(value)
@@ -704,13 +831,18 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             for key in list(variables.keys())
             if key.startswith("dipole_head.")
         }
+        polar_update_net = data.pop("polar_update_net", None)
         nets_lr = data.pop("nets_lr", None)
+        use_glu = data.get("use_glu", True)  # Default True for backward compatibility
         data["@variables"] = variables
 
         obj = super().deserialize(data)
 
         if nets_lr is not None:
-            obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
+            if use_glu:
+                obj.filter_layers_lr = SeZMNetworkCollection.deserialize(nets_lr)
+            else:
+                obj.filter_layers_lr = NetworkCollection.deserialize(nets_lr)
 
         with torch.no_grad():
             target_shape = obj.bandwidth.shape
@@ -769,6 +901,14 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
                     "`lr_kernel` is not 'dipole'."
                 )
             obj.dipole_head.load_state_dict(dipole_head_state)
+
+        if polar_update_net is not None:
+            if obj.polar_update_net is None:
+                raise ValueError(
+                    "Serialized data contains a polar update network but "
+                    "`lr_update_steps` is zero."
+                )
+            obj.polar_update_net = GLUFittingNet.deserialize(polar_update_net)
 
         return obj
 

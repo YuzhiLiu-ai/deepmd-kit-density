@@ -1699,6 +1699,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             energy_redu,
             coord,
             atype,
+            descriptor,
             fit_ret,
             comm_dict,
         )
@@ -1746,6 +1747,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         energy_redu: torch.Tensor,
         coord: torch.Tensor,
         atype: torch.Tensor,
+        descriptor: torch.Tensor,
         fit_ret: dict[str, torch.Tensor],
         comm_dict: dict[str, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, Any]:

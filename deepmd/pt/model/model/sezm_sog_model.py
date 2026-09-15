@@ -51,10 +51,11 @@ def _les_radial_coefficients(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return stable ``K``, ``K'/r`` and ``(K''-K'/r)/r^2`` coefficients.
 
-    The direct derivative formulas subtract terms that diverge separately near
-    the origin.  A Taylor branch keeps the dipole energy and its force-loss
-    backward finite in float32, while the analytic branch is clamped so even
-    the unselected side of ``torch.where`` cannot generate NaNs.
+    Directly evaluating the derivatives of ``erf(alpha*r)/r`` subtracts
+    individually divergent terms near the origin.  The small-distance Taylor
+    branch below keeps both the forward field and the force-loss backward
+    finite in float32.  The regular analytic branch uses a clamped radius so
+    the unselected diagonal branch cannot create NaNs through ``torch.where``.
     """
     alpha = alpha_t.to(dtype=r_sq.dtype, device=r_sq.device)
     r_sq_safe = r_sq.clamp_min(torch.finfo(r_sq.dtype).eps)
@@ -99,6 +100,38 @@ def _les_radial_coefficients(
         torch.where(small, a_series, a_analytic),
         torch.where(small, c_series, c_analytic),
     )
+
+
+def _les_potential_and_field(
+    r_ij: torch.Tensor,
+    eye: torch.Tensor,
+    q: torch.Tensor,
+    p: torch.Tensor,
+    alpha_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-atom LES potential and electric field from ``q``/``p``.
+
+    The source multipoles use the same convention as
+    :func:`_les_dipole_energy`.  Returned shapes are ``(..., n, 1)`` and
+    ``(..., n, 3)`` and self interactions are excluded.
+    """
+    r_sq = torch.sum(r_ij * r_ij, dim=-1)
+    kernel, a_coeff, c_coeff = _les_radial_coefficients(r_sq, alpha_t)
+    mask = eye.to(dtype=r_ij.dtype)
+    q_j = q.squeeze(-1).unsqueeze(-2)
+    p_j = p.unsqueeze(-3)
+    p_j_dot_r = torch.sum(p_j * r_ij, dim=-1)
+
+    potential_pair = q_j * kernel - a_coeff * p_j_dot_r
+    potential = torch.sum(potential_pair * mask, dim=-1, keepdim=True)
+
+    field_pair = (
+        q_j.unsqueeze(-1) * a_coeff.unsqueeze(-1) * r_ij
+        - a_coeff.unsqueeze(-1) * p_j
+        - c_coeff.unsqueeze(-1) * p_j_dot_r.unsqueeze(-1) * r_ij
+    )
+    field = torch.sum(field_pair * mask.unsqueeze(-1), dim=-2)
+    return potential, field
 
 
 def _les_dipole_energy(
@@ -358,6 +391,7 @@ class SeZMSOGModel(SeZMModel):
         energy_redu: torch.Tensor,
         coord: torch.Tensor,
         atype: torch.Tensor,
+        descriptor: torch.Tensor,
         fit_ret: dict[str, torch.Tensor],
         comm_dict: dict[str, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, Any]:
@@ -392,6 +426,50 @@ class SeZMSOGModel(SeZMModel):
         )
 
         coord_lr = coord[:, :nloc, :].detach().requires_grad_(True)
+        if fitting.lr_update_steps > 0:
+            if p is None:
+                raise RuntimeError("Long-range polar updates require latent dipoles.")
+            # Mirror the regular DPA4 fitting path: keep all recurrent neural
+            # network work in fitting precision, then cross the global model
+            # precision boundary only once.  Recasting q/p after every update
+            # can make Inductor fuse a mixed fp32/fp64 GLU kernel that Triton
+            # cannot lower on CUDA.
+            q_output_dtype = q.dtype
+            p_output_dtype = p.dtype
+            update_dtype = fitting.prec
+            q = q.to(update_dtype)
+            p = p.to(update_dtype)
+            r_ij = coord_lr.to(update_dtype).unsqueeze(1) - coord_lr.to(
+                update_dtype
+            ).unsqueeze(2)
+            eye = 1.0 - torch.eye(
+                nloc, dtype=update_dtype, device=coord_lr.device
+            ).unsqueeze(0)
+            local_p = p
+            atom_mask = fit_ret["mask"][:, :nloc].to(torch.bool)
+            target_charge = q.sum(dim=1, keepdim=True)
+            for _ in range(fitting.lr_update_steps):
+                potential, field = _les_potential_and_field(
+                    r_ij,
+                    eye,
+                    q,
+                    p,
+                    fitting.les_alpha.to(update_dtype),
+                )
+                q, p = fitting.update_polar_state(
+                    descriptor[:, :nloc, :],
+                    q,
+                    p,
+                    local_p,
+                    potential,
+                    field,
+                    atom_mask,
+                    target_charge,
+                )
+            q = q.to(q_output_dtype)
+            p = p.to(p_output_dtype)
+            fit_ret["latent_charge"] = q
+            fit_ret["latent_dipole"] = p
         e_lr = self.sog_kernel(
             coord_lr,
             q,

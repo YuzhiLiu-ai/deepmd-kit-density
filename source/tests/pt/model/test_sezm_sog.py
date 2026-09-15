@@ -15,6 +15,7 @@ from deepmd.pt.model.model.sezm_sog_model import (
     E2_PER_ANGSTROM_TO_EV,
     SeZMSOGModel,
     _SogLRKernel,
+    _les_potential_and_field,
     _les_radial_coefficients,
 )
 from deepmd.pt.model.task.sog_energy_fitting import (
@@ -198,9 +199,8 @@ class TestSogLRKernelMath(unittest.TestCase):
             0.8, dtype=torch.float32, device=self.device, requires_grad=True
         )
         coeffs = _les_radial_coefficients(r_sq, alpha)
-        grad_r, grad_alpha = torch.autograd.grad(
-            sum(value.sum() for value in coeffs), (r_sq, alpha)
-        )
+        loss = sum(value.sum() for value in coeffs)
+        grad_r, grad_alpha = torch.autograd.grad(loss, (r_sq, alpha))
         for value in (*coeffs, grad_r, grad_alpha):
             self.assertTrue(torch.isfinite(value).all().item())
 
@@ -235,6 +235,56 @@ class TestSogLRKernelMath(unittest.TestCase):
         self.assertTrue(torch.isfinite(energy).all().item())
         for gradient in gradients:
             self.assertTrue(torch.isfinite(gradient).all().item())
+
+    def test_les_field_matches_multipole_energy_derivatives(self) -> None:
+        positions = torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.2, -0.3, 0.4], [-0.2, 1.1, 0.7]]],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        q = torch.tensor(
+            [[[0.3], [-0.2], [0.1]]],
+            dtype=self.dtype,
+            device=self.device,
+            requires_grad=True,
+        )
+        p = torch.tensor(
+            [[[0.1, -0.2, 0.3], [0.2, 0.1, -0.1], [-0.3, 0.1, 0.2]]],
+            dtype=self.dtype,
+            device=self.device,
+            requires_grad=True,
+        )
+        alpha = torch.tensor(0.7, dtype=self.dtype, device=self.device)
+        kernel = _SogLRKernel(lr_kernel="dipole")
+        energy = (
+            kernel(
+                positions,
+                q,
+                amp=torch.zeros(1, dtype=self.dtype, device=self.device),
+                bandwidth=torch.ones(1, dtype=self.dtype, device=self.device),
+                les_alpha=alpha,
+                latent_dipoles=p,
+            ).sum()
+            / E2_PER_ANGSTROM_TO_EV
+        )
+        grad_q, grad_p = torch.autograd.grad(energy, (q, p))
+
+        nloc = positions.shape[1]
+        r_ij = positions.unsqueeze(1) - positions.unsqueeze(2)
+        eye = 1.0 - torch.eye(nloc, dtype=self.dtype, device=self.device).unsqueeze(0)
+        potential, field = _les_potential_and_field(r_ij, eye, q, p, alpha)
+        np.testing.assert_allclose(
+            potential.detach().cpu().numpy(),
+            grad_q.detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            field.detach().cpu().numpy(),
+            grad_p.detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+        )
 
 
 class TestSeZMSOGModel(unittest.TestCase):
@@ -389,6 +439,19 @@ class TestSeZMSOGModel(unittest.TestCase):
             "dipole",
         )
 
+    def test_forward_iterative_les_dipole(self) -> None:
+        self._check_force_virial(
+            {
+                "lr_kernel": "dipole",
+                "use_self_pol": False,
+                "use_charge_constraint": True,
+                "lr_update_steps": 2,
+                "lr_update_neuron": [8, 8],
+                "lr_update_damping": 0.2,
+            },
+            "iterative-dipole",
+        )
+
     def test_force_loss_backward_reaches_lr_params(self) -> None:
         model = get_model(
             self._model_params({"lr_kernel": "dipole", "alpha_pol": [1.0, 0.5]})
@@ -411,6 +474,34 @@ class TestSeZMSOGModel(unittest.TestCase):
             p.grad for p in fitting.filter_layers_lr.parameters() if p.grad is not None
         ]
         self.assertTrue(len(lr_weight_grads) > 0)
+
+    def test_force_loss_backward_reaches_polar_update(self) -> None:
+        model = get_model(
+            self._model_params(
+                {
+                    "lr_kernel": "dipole",
+                    "use_self_pol": False,
+                    "use_charge_constraint": True,
+                    "lr_update_steps": 2,
+                    "lr_update_neuron": [8],
+                }
+            )
+        )
+        self._randomize_params(model)
+        model.train()
+        ret = model.forward(self.coord, self.atype)
+        loss = ret["energy"].sum() + 0.1 * (ret["force"] ** 2).sum()
+        loss.backward()
+        fitting = model.atomic_model.fitting_net
+        assert isinstance(fitting, SOGEnergyFittingNet)
+        assert fitting.polar_update_net is not None
+        update_grads = [
+            param.grad
+            for param in fitting.polar_update_net.parameters()
+            if param.grad is not None
+        ]
+        self.assertTrue(update_grads)
+        self.assertTrue(all(torch.isfinite(grad).all().item() for grad in update_grads))
 
     def test_serialize_deserialize_fitting(self) -> None:
         model = get_model(
@@ -510,6 +601,172 @@ class TestSeZMSOGModel(unittest.TestCase):
             atol=1e-10,
         )
 
+    def test_polar_update_charge_constraint_and_equivariance(self) -> None:
+        fitting = SOGEnergyFittingNet(
+            ntypes=2,
+            dim_descrpt=8,
+            neuron=[8],
+            neuron_lr=[8],
+            use_charge_constraint=True,
+            use_self_pol=False,
+            lr_kernel="dipole",
+            dipole_lmax=1,
+            dipole_channels=2,
+            lr_update_steps=2,
+            lr_update_neuron=[8],
+            precision="float64",
+            seed=3,
+        )
+        assert fitting.polar_update_net is not None
+        with torch.no_grad():
+            for param in fitting.polar_update_net.parameters():
+                param.copy_(0.1 * torch.randn_like(param))
+        nf, nloc = 2, 4
+        descriptor = torch.randn(nf, nloc, 8, dtype=torch.float64, device=self.device)
+        q = torch.randn(nf, nloc, 1, dtype=torch.float64, device=self.device)
+        p = torch.randn(nf, nloc, 3, dtype=torch.float64, device=self.device)
+        p0 = torch.randn_like(p)
+        potential = torch.randn_like(q)
+        field = torch.randn_like(p)
+        mask = torch.ones(nf, nloc, dtype=torch.bool, device=self.device)
+        target = torch.tensor(
+            [[[0.5]], [[-1.0]]], dtype=torch.float64, device=self.device
+        )
+        q1, p1 = fitting.update_polar_state(
+            descriptor, q, p, p0, potential, field, mask, target
+        )
+        np.testing.assert_allclose(
+            q1.sum(dim=1, keepdim=True).detach().cpu().numpy(),
+            target.cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+        )
+
+        rotation = torch.tensor(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+            device=self.device,
+        )
+
+        def rotate(vector: torch.Tensor) -> torch.Tensor:
+            return torch.einsum("ij,fnj->fni", rotation, vector)
+
+        q2, p2 = fitting.update_polar_state(
+            descriptor,
+            q,
+            rotate(p),
+            rotate(p0),
+            potential,
+            rotate(field),
+            mask,
+            target,
+        )
+        np.testing.assert_allclose(
+            q2.detach().cpu().numpy(),
+            q1.detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            p2.detach().cpu().numpy(),
+            rotate(p1).detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+        )
+
+    def test_polar_update_keeps_fitting_precision(self) -> None:
+        fitting = SOGEnergyFittingNet(
+            ntypes=2,
+            dim_descrpt=8,
+            neuron=[8],
+            neuron_lr=[8],
+            use_self_pol=False,
+            lr_kernel="dipole",
+            dipole_lmax=1,
+            dipole_channels=2,
+            lr_update_steps=2,
+            lr_update_neuron=[8],
+            precision="float32",
+            seed=3,
+        )
+        nf, nloc = 1, 4
+        descriptor = torch.randn(nf, nloc, 8, dtype=torch.float64, device=self.device)
+        q = torch.randn(nf, nloc, 1, dtype=torch.float64, device=self.device)
+        p = torch.randn(nf, nloc, 3, dtype=torch.float64, device=self.device)
+        mask = torch.ones(nf, nloc, dtype=torch.bool, device=self.device)
+        q_new, p_new = fitting.update_polar_state(
+            descriptor,
+            q,
+            p,
+            p,
+            torch.randn_like(q),
+            torch.randn_like(p),
+            mask,
+            q.sum(dim=1, keepdim=True),
+        )
+        self.assertEqual(q_new.dtype, torch.float32)
+        self.assertEqual(p_new.dtype, torch.float32)
+
+    def test_polar_update_blockwise_glu_parity(self) -> None:
+        fitting = SOGEnergyFittingNet(
+            ntypes=2,
+            dim_descrpt=8,
+            neuron=[8],
+            neuron_lr=[8],
+            use_self_pol=False,
+            lr_kernel="dipole",
+            dipole_lmax=1,
+            dipole_channels=2,
+            lr_update_steps=2,
+            lr_update_neuron=[8, 8],
+            precision="float64",
+            seed=3,
+        )
+        update_net = fitting.polar_update_net
+        assert update_net is not None
+        with torch.no_grad():
+            for parameter in update_net.parameters():
+                parameter.copy_(0.1 * torch.randn_like(parameter))
+        blocks = [
+            torch.randn(2, 4, 8, dtype=torch.float64, device=self.device),
+            *[
+                torch.randn(2, 4, 1, dtype=torch.float64, device=self.device)
+                for _ in range(5)
+            ],
+        ]
+        expected = update_net(torch.cat(blocks, dim=-1))
+        actual = update_net.forward_from_blocks(blocks)
+        np.testing.assert_allclose(
+            actual.detach().cpu().numpy(),
+            expected.detach().cpu().numpy(),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_serialize_deserialize_iterative_fitting(self) -> None:
+        extra = {
+            "lr_kernel": "dipole",
+            "use_self_pol": False,
+            "use_charge_constraint": True,
+            "lr_update_steps": 2,
+            "lr_update_neuron": [8],
+        }
+        model = get_model(self._model_params(extra))
+        self._randomize_params(model)
+        model.eval()
+        e1 = model.forward(self.coord, self.atype)["energy"]
+        fitting = model.atomic_model.fitting_net
+        assert isinstance(fitting, SOGEnergyFittingNet)
+        fitting2 = SOGEnergyFittingNet.deserialize(fitting.serialize())
+        model.atomic_model.fitting_net = fitting2
+        e2 = model.forward(self.coord, self.atype)["energy"]
+        np.testing.assert_allclose(
+            e1.detach().cpu().numpy(),
+            e2.detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+        )
+
     def test_error_periodic_box(self) -> None:
         model = get_model(self._model_params({"lr_kernel": "les"}))
         box = torch.eye(3, dtype=torch.float64, device=self.device).reshape(1, 9) * 10
@@ -546,6 +803,15 @@ class TestSeZMSOGModel(unittest.TestCase):
                 ntypes=2,
                 dim_descrpt=8,
                 lr_kernel="sog_les",
+            )
+
+    def test_error_polar_update_requires_dipole_kernel(self) -> None:
+        with self.assertRaises(ValueError):
+            SOGEnergyFittingNet(
+                ntypes=2,
+                dim_descrpt=8,
+                lr_kernel="les",
+                lr_update_steps=1,
             )
 
 
@@ -616,7 +882,7 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
         TestSeZMSOGModel._randomize_params(model)
         return model
 
-    def _check_compile_parity(self, extra: dict, tag: str) -> None:
+    def _check_compile_parity(self, extra: dict, tag: str) -> SeZMSOGModel:
         m_eager = self._make_model(extra, False)
         m_comp = self._make_model(extra, True)
 
@@ -666,6 +932,7 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
                 atol=1e-10,
                 err_msg=f"[{tag}] grad of {k}",
             )
+        return m_comp
 
     @unittest.skipIf(_SKIP_OFF_COMPILE_TORCH, _SKIP_OFF_COMPILE_TORCH_REASON)
     def test_compile_eager_parity_les(self) -> None:
@@ -681,6 +948,27 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
             {"lr_kernel": "dipole", "alpha_pol": [1.0, 0.5]},
             "dipole",
         )
+
+    @unittest.skipIf(_SKIP_OFF_COMPILE_TORCH, _SKIP_OFF_COMPILE_TORCH_REASON)
+    def test_compile_eager_parity_iterative_dipole(self) -> None:
+        model = self._check_compile_parity(
+            {
+                "lr_kernel": "dipole",
+                "use_self_pol": False,
+                "use_charge_constraint": True,
+                "lr_update_steps": 2,
+                "lr_update_neuron": [8],
+                "precision": "float32",
+            },
+            "iterative-dipole",
+        )
+        # Reuse the same dynamic compiled graph with a different nloc.  Polar
+        # update views must not retain the first batch's leading strides in the
+        # AOTAutograd force-loss backward.
+        model.zero_grad()
+        ret = model.forward(self.coord[:, :5, :], self.atype[:, :5])
+        loss = ret["energy"].sum() + 0.1 * (ret["force"] ** 2).sum()
+        loss.backward()
 
 
 if __name__ == "__main__":
