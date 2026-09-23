@@ -27,7 +27,7 @@ class EnergyLatentLoss(EnergyStdLoss):
 
     The supervised tensors are the final electrostatic state returned by
     DPA4-LR, after all configured recurrent polar-update steps.  Labels are
-    loaded from ``atomic_charge.npy`` and ``atomic_dipole.npy`` and appear in
+    loaded from ``atom_charge.npy`` and ``atom_dipole.npy`` and appear in
     the training label dictionary as ``atom_charge`` and ``atom_dipole``.
     """
 
@@ -78,12 +78,8 @@ class EnergyLatentLoss(EnergyStdLoss):
             mae=mae,
         )
         coef = learning_rate / self.starter_learning_rate
-        pref_lq = self.limit_pref_lq + (
-            self.start_pref_lq - self.limit_pref_lq
-        ) * coef
-        pref_ld = self.limit_pref_ld + (
-            self.start_pref_ld - self.limit_pref_ld
-        ) * coef
+        pref_lq = self.limit_pref_lq + (self.start_pref_lq - self.limit_pref_lq) * coef
+        pref_ld = self.limit_pref_ld + (self.start_pref_ld - self.limit_pref_ld) * coef
         mask = model_pred.get("mask")
 
         if self.has_lq and "latent_charge" not in model_pred:
@@ -101,8 +97,8 @@ class EnergyLatentLoss(EnergyStdLoss):
         if self.has_lq and "latent_charge" in model_pred and "atom_charge" in label:
             find_lq = label.get("find_atom_charge", 0.0)
             charge_pred = model_pred["latent_charge"].reshape(-1, natoms, 1)
-            charge_label = label["atom_charge"].reshape(-1, natoms, 1).to(
-                charge_pred.dtype
+            charge_label = (
+                label["atom_charge"].reshape(-1, natoms, 1).to(charge_pred.dtype)
             )
             charge_error = torch.square(charge_pred - charge_label)
             if mask is not None:
@@ -120,8 +116,8 @@ class EnergyLatentLoss(EnergyStdLoss):
         if self.has_ld and "latent_dipole" in model_pred and "atom_dipole" in label:
             find_ld = label.get("find_atom_dipole", 0.0)
             dipole_pred = model_pred["latent_dipole"].reshape(-1, natoms, 3)
-            dipole_label = label["atom_dipole"].reshape(-1, natoms, 3).to(
-                dipole_pred.dtype
+            dipole_label = (
+                label["atom_dipole"].reshape(-1, natoms, 3).to(dipole_pred.dtype)
             )
             dipole_error = torch.square(dipole_pred - dipole_label)
             if mask is not None:

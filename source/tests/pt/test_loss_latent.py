@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Tests for DPA4-LR latent charge/dipole supervision."""
+"""Tests for DPA4-LR latent charge/dipole supervision.
+
+NOTE: source/tests/pt/__init__.py sets torch.set_default_device("cuda:9999999")
+to catch tests that forget to specify device.  All tensor creations here
+must pass device="cpu" explicitly.
+"""
 
 import unittest
 
@@ -14,12 +19,13 @@ class _LatentModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.charge = torch.nn.Parameter(
-            torch.tensor([[[1.0], [2.0], [100.0]]], dtype=torch.float64)
+            torch.tensor([[[1.0], [2.0], [100.0]]], dtype=torch.float64, device="cpu")
         )
         self.dipole = torch.nn.Parameter(
             torch.tensor(
                 [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [100.0, 100.0, 100.0]]],
                 dtype=torch.float64,
+                device="cpu",
             )
         )
 
@@ -28,7 +34,7 @@ class _LatentModel(torch.nn.Module):
         return {
             "latent_charge": self.charge,
             "latent_dipole": self.dipole,
-            "mask": torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float64),
+            "mask": torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float64, device="cpu"),
         }
 
 
@@ -43,8 +49,8 @@ class TestEnergyLatentLoss(unittest.TestCase):
             limit_pref_ld=3.0,
         )
         labels = {
-            "atom_charge": torch.zeros(1, 3, 1, dtype=torch.float64),
-            "atom_dipole": torch.zeros(1, 3, 3, dtype=torch.float64),
+            "atom_charge": torch.zeros(1, 3, 1, dtype=torch.float64, device="cpu"),
+            "atom_dipole": torch.zeros(1, 3, 3, dtype=torch.float64, device="cpu"),
             "find_atom_charge": 1.0,
             "find_atom_dipole": 1.0,
         }
@@ -66,13 +72,14 @@ class TestEnergyLatentLoss(unittest.TestCase):
         loss.backward()
         torch.testing.assert_close(
             model.charge.grad,
-            torch.tensor([[[2.0], [4.0], [0.0]]], dtype=torch.float64),
+            torch.tensor([[[2.0], [4.0], [0.0]]], dtype=torch.float64, device="cpu"),
         )
         torch.testing.assert_close(
             model.dipole.grad,
             torch.tensor(
                 [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]]],
                 dtype=torch.float64,
+                device="cpu",
             ),
         )
 

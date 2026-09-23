@@ -5368,13 +5368,14 @@ def loss_ener() -> list[Argument]:
 )
 def loss_ener_latent() -> list[Argument]:
     """Arguments for DPA4-LR latent electrostatic supervision."""
-    return loss_ener() + [
+    return [
+        *loss_ener(),
         Argument(
             "start_pref_lq",
             [float, int],
             optional=True,
             default=0.0,
-            doc=start_pref("latent charge", label="atomic_charge", abbr="lq"),
+            doc=start_pref("latent charge", label="atom_charge", abbr="lq"),
         ),
         Argument(
             "limit_pref_lq",
@@ -5388,7 +5389,7 @@ def loss_ener_latent() -> list[Argument]:
             [float, int],
             optional=True,
             default=0.0,
-            doc=start_pref("latent dipole", label="atomic_dipole", abbr="ld"),
+            doc=start_pref("latent dipole", label="atom_dipole", abbr="ld"),
         ),
         Argument(
             "limit_pref_ld",
