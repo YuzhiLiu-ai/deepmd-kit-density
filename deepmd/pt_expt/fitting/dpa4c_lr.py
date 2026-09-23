@@ -31,12 +31,14 @@ class DPA4CLRFitting(DPA4CLRFittingDP):
         # as non-trainable buffers. Promote only the parameters used by the
         # selected kernel so every registered Parameter participates in loss
         # backpropagation.
-        if self.lr_kernel == "les":
+        if self.lr_kernel in ("les", "dipole"):
             self._promote_to_parameter("les_alpha")
         elif self.lr_kernel == "sog":
             self._promote_to_parameter("amp")
             self._promote_to_parameter("bandwidth")
         self._promote_to_parameter("bias_atom_q")
+        if self.lr_kernel == "dipole":
+            self._promote_to_parameter("alpha_pol")
 
     def _promote_to_parameter(self, name: str) -> None:
         value = getattr(self, name, None)
@@ -63,7 +65,11 @@ class DPA4CLRFitting(DPA4CLRFittingDP):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        if self.lr_kernel == "les":
+        if self.lr_kernel != "dipole" and prefix + "alpha_pol" not in state_dict:
+            # alpha_pol is unused outside dipole mode. Accept older LES/SOG
+            # checkpoints that predate the attribute.
+            state_dict[prefix + "alpha_pol"] = self.alpha_pol.detach().clone()
+        if self.lr_kernel in ("les", "dipole"):
             # A short-lived SOG implementation registered these unused buffers
             # on LES models. Ignore them when reading such a checkpoint, while
             # older LES checkpoints naturally have neither key.

@@ -81,10 +81,12 @@ def _translate_energy_keys(
     if "mask" in model_ret:
         out["mask"] = model_ret["mask"]
     # Preserve auxiliary outputs needed by post-compiled correction steps
-    # (e.g. DPA4C-LR latent charges) so a compiled graph can hand them to
+    # (e.g. DPA4C-LR latent multipoles) so a compiled graph can hand them to
     # an eager post-processing hook.
     if "latent_charge" in model_ret:
         out["latent_charge"] = model_ret["latent_charge"]
+    if "latent_dipole" in model_ret:
+        out["latent_dipole"] = model_ret["latent_dipole"]
     return out
 
 
