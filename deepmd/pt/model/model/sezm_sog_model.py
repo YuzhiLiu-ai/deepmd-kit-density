@@ -536,4 +536,12 @@ class SeZMSOGModel(SeZMModel):
         # runtime on the single-domain path.
         model_ret["lr_force"] = force_lr
         model_ret["lr_virial_atom"] = vir_lr
+        # Expose the final electrostatic state used by the long-range kernel.
+        # In particular, when recurrent polar updates are enabled these are
+        # the updated values rather than the fitting heads' initial guesses.
+        # Keep them attached to the graph so auxiliary charge/dipole losses
+        # train the readout heads and the recurrent update network.
+        model_ret["latent_charge"] = fit_ret["latent_charge"][:, :nloc, :]
+        if "latent_dipole" in fit_ret:
+            model_ret["latent_dipole"] = fit_ret["latent_dipole"][:, :nloc, :]
         return model_ret

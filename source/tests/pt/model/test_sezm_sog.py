@@ -8,6 +8,9 @@ import numpy as np
 import torch
 from packaging.version import parse as parse_version
 
+from deepmd.pt.loss import (
+    EnergyLatentLoss,
+)
 from deepmd.pt.model.model import (
     get_model,
 )
@@ -394,6 +397,11 @@ class TestSeZMSOGModel(unittest.TestCase):
         ret = model.forward(self.coord, self.atype)
         force = ret["force"]
         virial = ret["virial"]
+        self.assertIn("latent_charge", ret)
+        self.assertEqual(ret["latent_charge"].shape, (*self.atype.shape, 1))
+        if "dipole" in tag:
+            self.assertIn("latent_dipole", ret)
+            self.assertEqual(ret["latent_dipole"].shape, (*self.atype.shape, 3))
 
         # Finite-difference force check (covers the dedicated coord-autograd
         # branch of the long-range correction).
@@ -502,6 +510,62 @@ class TestSeZMSOGModel(unittest.TestCase):
         ]
         self.assertTrue(update_grads)
         self.assertTrue(all(torch.isfinite(grad).all().item() for grad in update_grads))
+
+    def test_latent_loss_backward_reaches_electrostatic_heads(self) -> None:
+        model = get_model(
+            self._model_params(
+                {
+                    "lr_kernel": "dipole",
+                    "use_charge_constraint": True,
+                    "lr_update_steps": 2,
+                    "lr_update_neuron": [8],
+                }
+            )
+        )
+        self._randomize_params(model)
+        model.train()
+        loss_fn = EnergyLatentLoss(
+            starter_learning_rate=1.0,
+            start_pref_lq=1.0,
+            limit_pref_lq=1.0,
+            start_pref_ld=1.0,
+            limit_pref_ld=1.0,
+        )
+        labels = {
+            "atom_charge": torch.zeros(
+                (*self.atype.shape, 1), dtype=self.coord.dtype, device=self.device
+            ),
+            "atom_dipole": torch.zeros(
+                (*self.atype.shape, 3), dtype=self.coord.dtype, device=self.device
+            ),
+            "find_atom_charge": 1.0,
+            "find_atom_dipole": 1.0,
+        }
+        _, loss, _ = loss_fn(
+            input_dict={"coord": self.coord, "atype": self.atype},
+            model=model,
+            label=labels,
+            natoms=self.atype.shape[1],
+            learning_rate=1.0,
+        )
+        loss.backward()
+
+        fitting = model.atomic_model.fitting_net
+        assert isinstance(fitting, SOGEnergyFittingNet)
+        assert fitting.dipole_head is not None
+        assert fitting.polar_update_net is not None
+        for module in (
+            fitting.filter_layers_lr,
+            fitting.dipole_head,
+            fitting.polar_update_net,
+        ):
+            grads = [
+                param.grad for param in module.parameters() if param.grad is not None
+            ]
+            self.assertTrue(grads)
+            self.assertTrue(
+                all(torch.isfinite(grad).all().item() for grad in grads)
+            )
 
     def test_serialize_deserialize_fitting(self) -> None:
         model = get_model(

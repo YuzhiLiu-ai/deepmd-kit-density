@@ -5361,6 +5361,45 @@ def loss_ener() -> list[Argument]:
     ]
 
 
+@loss_args_plugin.register(
+    "ener_latent",
+    doc=supported_backends("pt")
+    + "Energy/force loss with atomic latent charge and dipole supervision for DPA4-LR.",
+)
+def loss_ener_latent() -> list[Argument]:
+    """Arguments for DPA4-LR latent electrostatic supervision."""
+    return loss_ener() + [
+        Argument(
+            "start_pref_lq",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=start_pref("latent charge", label="atomic_charge", abbr="lq"),
+        ),
+        Argument(
+            "limit_pref_lq",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=limit_pref("latent charge"),
+        ),
+        Argument(
+            "start_pref_ld",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=start_pref("latent dipole", label="atomic_dipole", abbr="ld"),
+        ),
+        Argument(
+            "limit_pref_ld",
+            [float, int],
+            optional=True,
+            default=0.0,
+            doc=limit_pref("latent dipole"),
+        ),
+    ]
+
+
 @loss_args_plugin.register("dens", doc=supported_backends("pt"))
 def loss_dens() -> list[Argument]:
     doc_start_pref_e = start_pref("energy", abbr="e")
@@ -5839,7 +5878,7 @@ def loss_tensor() -> list[Argument]:
 
 
 def loss_variant_type_args() -> Variant:
-    doc_loss = "The type of the loss. When the fitting type is `ener`, the loss type should be set to `ener`, its legacy alias `ener_hess`, `dens` (Only DPA4/SeZM supported), or left unset. Hessian supervision is configured through `start_pref_h` and `limit_pref_h` on the `ener` loss. When the fitting type is `property`, the loss type should be set to `property`. When the fitting type is `dipole` or `polar`, the loss type should be set to `tensor`."
+    doc_loss = "The type of the loss. When the fitting type is `ener`, the loss type should be set to `ener`, its legacy alias `ener_hess`, `dens` (Only DPA4/SeZM supported), `ener_latent` (DPA4-LR latent charge/dipole supervision), or left unset. Hessian supervision is configured through `start_pref_h` and `limit_pref_h` on the `ener` loss. When the fitting type is `property`, the loss type should be set to `property`. When the fitting type is `dipole` or `polar`, the loss type should be set to `tensor`."
 
     return Variant(
         "type",
@@ -5851,7 +5890,7 @@ def loss_variant_type_args() -> Variant:
 
 
 def loss_args() -> list[Argument]:
-    doc_loss = "The definition of loss function. The loss type should be set to `tensor`, `property`, `ener`, `dens` or left unset. The legacy `ener_hess` type is normalized to `ener`."
+    doc_loss = "The definition of loss function. The loss type should be set to `tensor`, `property`, `ener`, `ener_latent`, `dens` or left unset. The legacy `ener_hess` type is normalized to `ener`."
     ca = Argument(
         "loss", dict, [], [loss_variant_type_args()], optional=True, doc=doc_loss
     )
@@ -6813,7 +6852,7 @@ def validate_full_validation_config(
 
     loss_params = data.get("loss", {})
     loss_type = loss_params.get("type", "ener")
-    if loss_type not in ("ener", "ener_spin"):
+    if loss_type not in ("ener", "ener_latent", "ener_spin"):
         raise ValueError(
             "validating.full_validation only supports single-task energy or "
             f"spin-energy training; got loss.type={loss_type!r}."

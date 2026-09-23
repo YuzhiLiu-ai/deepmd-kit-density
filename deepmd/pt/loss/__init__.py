@@ -12,6 +12,9 @@ from .ener import (
     EnergyHessianStdLoss,
     EnergyStdLoss,
 )
+from .ener_latent import (
+    EnergyLatentLoss,
+)
 from .ener_spin import (
     EnergySpinLoss,
 )
@@ -33,6 +36,7 @@ __all__ = [
     "DeNSLoss",
     "DenoiseLoss",
     "EnergyHessianStdLoss",
+    "EnergyLatentLoss",
     "EnergySpinLoss",
     "EnergyStdLoss",
     "PopulationLoss",

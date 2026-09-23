@@ -888,6 +888,15 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             if "mask" in model_ret:
                 model_predict["mask"] = model_ret["mask"]
 
+            # Optional trainable auxiliary outputs.  DPA4-LR places the final
+            # (post-polar-update) latent electrostatic state in ``model_ret``.
+            # Passing the tensors through unchanged preserves their autograd
+            # graph for charge/dipole supervision during training.
+            if "latent_charge" in model_ret:
+                model_predict["latent_charge"] = model_ret["latent_charge"]
+            if "latent_dipole" in model_ret:
+                model_predict["latent_dipole"] = model_ret["latent_dipole"]
+
         else:
             model_predict = model_ret
             model_predict["updated_coord"] += coord
@@ -3427,6 +3436,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             output_def["atom_virial"] = out_def_data["energy_derv_c"].squeeze(-2)
         if "mask" in out_def_data:
             output_def["mask"] = out_def_data["mask"]
+        if "latent_charge" in out_def_data:
+            output_def["latent_charge"] = out_def_data["latent_charge"]
+        if "latent_dipole" in out_def_data:
+            output_def["latent_dipole"] = out_def_data["latent_dipole"]
 
         return output_def
 

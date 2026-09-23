@@ -45,6 +45,7 @@ from deepmd.pt.loss import (
     DenoiseLoss,
     DeNSLoss,
     DOSLoss,
+    EnergyLatentLoss,
     EnergySpinLoss,
     EnergyStdLoss,
     PopulationLoss,
@@ -2425,7 +2426,7 @@ def prepare_model_for_loss(
     if hasattr(model, "set_active_mode_from_loss"):
         loss_type = loss_params.get("type", "ener")
         model.set_active_mode_from_loss(
-            "ener" if loss_type == "ener_hess" else loss_type
+            "ener" if loss_type in {"ener_hess", "ener_latent"} else loss_type
         )
 
 
@@ -2473,6 +2474,9 @@ def get_loss(
     if loss_type in {"ener", "ener_hess"}:
         loss_params["starter_learning_rate"] = start_lr
         return EnergyStdLoss(**loss_params)
+    elif loss_type == "ener_latent":
+        loss_params["starter_learning_rate"] = start_lr
+        return EnergyLatentLoss(**loss_params)
     elif loss_type == "dens":
         loss_params["starter_learning_rate"] = start_lr
         return DeNSLoss(**loss_params)
