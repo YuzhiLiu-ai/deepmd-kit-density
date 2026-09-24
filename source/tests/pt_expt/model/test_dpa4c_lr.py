@@ -361,7 +361,7 @@ def test_pt_checkpoint_deep_eval_matches_direct_forward(
     actual = dict(
         zip(
             output_names,
-            dp.eval(coord, None, atype, atomic=True),
+            dp.eval(coord, None, atype, atomic=True, mixed_type=True),
             strict=True,
         )
     )
@@ -484,7 +484,14 @@ def test_sog_graph_matches_dense_legacy_path() -> None:
     atype_t = torch.tensor(atype, dtype=torch.long, device=env.DEVICE)
 
     graph = model(coord_t, atype_t)
-    dense = model(coord_t, atype_t, neighbor_graph_method="legacy")
+    # The dense (legacy) route differentiates w.r.t. the input coordinates,
+    # so they must carry requires_grad (same convention as other graph-lower
+    # parity tests).
+    dense = model(
+        coord_t.clone().requires_grad_(True),
+        atype_t,
+        neighbor_graph_method="legacy",
+    )
     for name in ("energy", "force", "virial"):
         torch.testing.assert_close(graph[name], dense[name], rtol=1e-10, atol=1e-10)
 
@@ -498,7 +505,14 @@ def test_dipole_graph_matches_dense_legacy_path() -> None:
     atype_t = torch.tensor(atype, dtype=torch.long, device=env.DEVICE)
 
     graph = model(coord_t, atype_t)
-    dense = model(coord_t, atype_t, neighbor_graph_method="legacy")
+    # The dense (legacy) route differentiates w.r.t. the input coordinates,
+    # so they must carry requires_grad (same convention as other graph-lower
+    # parity tests).
+    dense = model(
+        coord_t.clone().requires_grad_(True),
+        atype_t,
+        neighbor_graph_method="legacy",
+    )
     for name in ("energy", "force", "virial", "latent_charge", "latent_dipole"):
         torch.testing.assert_close(graph[name], dense[name], rtol=1e-10, atol=1e-10)
 

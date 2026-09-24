@@ -38,6 +38,9 @@ import torch.nn as nn
 from deepmd.dpmodel import (
     get_hessian_name,
 )
+from deepmd.dpmodel.common import (
+    get_xp_precision,
+)
 from deepmd.dpmodel.utils.neighbor_graph import (
     NeighborGraph,
     compact_nodes,
@@ -91,9 +94,7 @@ def _les_radial_coefficients(
     erf_t = torch.erf(alpha * r)
 
     k_analytic = erf_t / r
-    a_analytic = (2.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe - erf_t / (
-        r_sq_safe * r
-    )
+    a_analytic = (2.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe - erf_t / (r_sq_safe * r)
     kpp = (
         -(4.0 * alpha**3 / _SQRT_PI) * exp_t
         - (4.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe
@@ -356,6 +357,18 @@ class DPA4CLREnergyModel(EnergyModel):
             check_frequency,
         )
 
+    def _to_public_keys(
+        self,
+        model_ret: dict[str, torch.Tensor],
+        do_atomic_virial: bool,
+    ) -> dict[str, torch.Tensor]:
+        """Carry the latent multipoles through to the public output."""
+        model_predict = super()._to_public_keys(model_ret, do_atomic_virial)
+        for key in ("latent_charge", "latent_dipole"):
+            if key in model_ret:
+                model_predict[key] = model_ret[key]
+        return model_predict
+
     def call_common(
         self,
         coord: torch.Tensor,
@@ -580,14 +593,15 @@ class DPA4CLREnergyModel(EnergyModel):
                     )
                 q_output_dtype = q.dtype
                 p_output_dtype = p.dtype
-                q = q.to(fitting.prec)
-                p = p.to(fitting.prec)
-                local_p = local_p.to(fitting.prec)
-                descriptor = descriptor.to(fitting.prec)
-                update_vec = lr_edge_vec.to(fitting.prec)
-                update_mask = lr_edge_mask.to(fitting.prec)
+                update_dtype = get_xp_precision(torch, fitting.precision)
+                q = q.to(update_dtype)
+                p = p.to(update_dtype)
+                local_p = local_p.to(update_dtype)
+                descriptor = descriptor.to(update_dtype)
+                update_vec = lr_edge_vec.to(update_dtype)
+                update_mask = lr_edge_mask.to(update_dtype)
                 update_r_sq = torch.sum(update_vec * update_vec, dim=-1)
-                update_alpha = les_alpha.to(fitting.prec)
+                update_alpha = les_alpha.to(update_dtype)
                 update_k, update_a, update_c = _les_radial_coefficients(
                     update_r_sq, update_alpha
                 )
@@ -599,9 +613,7 @@ class DPA4CLREnergyModel(EnergyModel):
                         q_src_update * update_k - update_a * p_src_dot_r
                     ) * update_mask
                     field_pair = (
-                        q_src_update.unsqueeze(-1)
-                        * update_a.unsqueeze(-1)
-                        * update_vec
+                        q_src_update.unsqueeze(-1) * update_a.unsqueeze(-1) * update_vec
                         - update_a.unsqueeze(-1) * p_src_update
                         - update_c.unsqueeze(-1)
                         * p_src_dot_r.unsqueeze(-1)
@@ -644,21 +656,18 @@ class DPA4CLREnergyModel(EnergyModel):
         else:
             q_src = q[src]
             q_dst = q[dst]
-            e_edge = (
-                0.5
-                * (q_src * q_dst).sum(-1)
-                * K
-                * lr_edge_mask.to(dtype)
-            )
+            e_edge = 0.5 * (q_src * q_dst).sum(-1) * K * lr_edge_mask.to(dtype)
             atomic_ret["latent_charge"] = q
 
         edge_frame = frame_id[dst]  # (E_lr,) frame of dst
         e_lr_raw = segment_sum(e_edge, edge_frame, nf)
         if self.lr_kernel == "dipole" and fitting.use_self_pol:
             alpha_pol_atom = fitting.alpha_pol[atype].to(dtype).square()
-            self_pol_atom = torch.sum(p.to(dtype) * p.to(dtype), dim=-1) / (
-                2.0 * alpha_pol_atom
-            ) * node_mask.to(dtype)
+            self_pol_atom = (
+                torch.sum(p.to(dtype) * p.to(dtype), dim=-1)
+                / (2.0 * alpha_pol_atom)
+                * node_mask.to(dtype)
+            )
             e_lr_raw = e_lr_raw + segment_sum(self_pol_atom, frame_id, nf)
         e_lr = e_lr_raw * E2_PER_ANGSTROM_TO_EV
 
@@ -970,17 +979,11 @@ class DPA4CLREnergyModel(EnergyModel):
                     raise RuntimeError(
                         "`lr_kernel='dipole'` requires DPA4C degree-one moments."
                     )
-                descriptor = atomic_ret.pop("lr_descriptor", None)
+                descriptor = atomic_ret.get("lr_descriptor")
                 p = p * mask_bool.unsqueeze(-1).to(p.dtype)
                 r_ij = cc.unsqueeze(1) - cc.unsqueeze(2)
-                eye = ~torch.eye(
-                    nloc, dtype=torch.bool, device=cc.device
-                ).unsqueeze(0)
-                pair_mask = (
-                    eye
-                    & mask_bool.unsqueeze(1)
-                    & mask_bool.unsqueeze(2)
-                )
+                eye = ~torch.eye(nloc, dtype=torch.bool, device=cc.device).unsqueeze(0)
+                pair_mask = eye & mask_bool.unsqueeze(1) & mask_bool.unsqueeze(2)
                 local_p = p
                 if fitting.lr_update_steps > 0:
                     if descriptor is None:
@@ -989,18 +992,19 @@ class DPA4CLREnergyModel(EnergyModel):
                         )
                     q_output_dtype = q.dtype
                     p_output_dtype = p.dtype
-                    q = q.to(fitting.prec)
-                    p = p.to(fitting.prec)
-                    local_p = local_p.to(fitting.prec)
-                    descriptor = descriptor.to(fitting.prec)
-                    update_r = r_ij.to(fitting.prec)
+                    update_dtype = get_xp_precision(torch, fitting.precision)
+                    q = q.to(update_dtype)
+                    p = p.to(update_dtype)
+                    local_p = local_p.to(update_dtype)
+                    descriptor = descriptor.to(update_dtype)
+                    update_r = r_ij.to(update_dtype)
                     for _ in range(fitting.lr_update_steps):
                         potential, field = _les_potential_and_field_dense(
                             update_r,
                             pair_mask,
                             q,
                             p,
-                            les_alpha.to(fitting.prec),
+                            les_alpha.to(update_dtype),
                         )
                         q, p = fitting.update_polar_state(
                             descriptor,
@@ -1023,14 +1027,17 @@ class DPA4CLREnergyModel(EnergyModel):
                     if fitting.use_self_pol
                     else None
                 )
-                e_lr = _les_dipole_energy_dense(
-                    r_ij,
-                    pair_mask,
-                    q.to(cc.dtype),
-                    p.to(cc.dtype),
-                    les_alpha,
-                    alpha_pol_atom,
-                ) * E2_PER_ANGSTROM_TO_EV
+                e_lr = (
+                    _les_dipole_energy_dense(
+                        r_ij,
+                        pair_mask,
+                        q.to(cc.dtype),
+                        p.to(cc.dtype),
+                        les_alpha,
+                        alpha_pol_atom,
+                    )
+                    * E2_PER_ANGSTROM_TO_EV
+                )
                 atomic_ret["latent_dipole"] = p
         else:
             e_lr = self.sog_kernel(cc, q, fitting.amp, fitting.bandwidth)
