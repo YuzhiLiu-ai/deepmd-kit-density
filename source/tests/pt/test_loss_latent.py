@@ -101,9 +101,36 @@ class TestEnergyLatentLoss(unittest.TestCase):
         self.assertEqual(restored.start_pref_lq, 1.0)
         self.assertEqual(restored.limit_pref_ld, 1.0)
 
-    def test_requires_latent_prefactor(self) -> None:
-        with self.assertRaisesRegex(ValueError, "non-zero latent"):
-            EnergyLatentLoss(starter_learning_rate=1.0)
+    def test_zero_prefactors_degrade_to_energy_loss(self) -> None:
+        loss_fn = EnergyLatentLoss(starter_learning_rate=1.0)
+        self.assertFalse(loss_fn.has_lq)
+        self.assertFalse(loss_fn.has_ld)
+        requirement_keys = {item.key for item in loss_fn.label_requirement}
+        self.assertNotIn("atom_charge", requirement_keys)
+        self.assertNotIn("atom_dipole", requirement_keys)
+
+        # Latent outputs and labels are ignored: no latent term enters the
+        # loss and no latent metric is reported, exactly like the plain
+        # energy loss used before latent supervision existed.
+        model = _LatentModel()
+        labels = {
+            "atom_charge": torch.zeros(1, 3, 1, dtype=torch.float64, device="cpu"),
+            "atom_dipole": torch.zeros(1, 3, 3, dtype=torch.float64, device="cpu"),
+            "find_atom_charge": 1.0,
+            "find_atom_dipole": 1.0,
+        }
+        _, loss, more_loss = loss_fn(
+            input_dict={},
+            model=model,
+            label=labels,
+            natoms=3,
+            learning_rate=1.0,
+        )
+        self.assertNotIn("rmse_latent_charge", more_loss)
+        self.assertNotIn("rmse_latent_dipole", more_loss)
+        # The parent energy loss finds no energy/force labels here either,
+        # so with every prefactor at zero the total loss is exactly zero.
+        self.assertEqual(loss.item(), 0.0)
 
 
 if __name__ == "__main__":

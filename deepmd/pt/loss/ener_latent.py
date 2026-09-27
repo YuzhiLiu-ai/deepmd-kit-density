@@ -29,6 +29,11 @@ class EnergyLatentLoss(EnergyStdLoss):
     DPA4-LR, after all configured recurrent polar-update steps.  Labels are
     loaded from ``atom_charge.npy`` and ``atom_dipole.npy`` and appear in
     the training label dictionary as ``atom_charge`` and ``atom_dipole``.
+
+    Each supervision branch is enabled only when at least one of its
+    prefactors is non-zero.  With all four prefactors left at zero the loss
+    degenerates to the plain energy/force loss, matching the behavior of
+    DPA4-LR models trained without latent electrostatic supervision.
     """
 
     def __init__(
@@ -54,11 +59,6 @@ class EnergyLatentLoss(EnergyStdLoss):
         self.limit_pref_ld = float(limit_pref_ld)
         self.has_lq = self.start_pref_lq != 0.0 or self.limit_pref_lq != 0.0
         self.has_ld = self.start_pref_ld != 0.0 or self.limit_pref_ld != 0.0
-        if not self.has_lq and not self.has_ld:
-            raise ValueError(
-                "`ener_latent` requires a non-zero latent charge or latent "
-                "dipole prefactor."
-            )
 
     def forward(
         self,
