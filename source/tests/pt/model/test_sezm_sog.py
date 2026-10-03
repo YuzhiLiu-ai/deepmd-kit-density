@@ -563,9 +563,7 @@ class TestSeZMSOGModel(unittest.TestCase):
                 param.grad for param in module.parameters() if param.grad is not None
             ]
             self.assertTrue(grads)
-            self.assertTrue(
-                all(torch.isfinite(grad).all().item() for grad in grads)
-            )
+            self.assertTrue(all(torch.isfinite(grad).all().item() for grad in grads))
 
     def test_serialize_deserialize_fitting(self) -> None:
         model = get_model(
@@ -878,6 +876,35 @@ class TestSeZMSOGModel(unittest.TestCase):
                 lr_update_steps=1,
             )
 
+    def test_default_charge_spin_is_materialized(self) -> None:
+        """The default charge-spin broadcast must not reach compiled graphs.
+
+        Full validation calls the model without ``charge_spin``; the
+        canonicalizer falls back to ``default_chg_spin`` broadcast to
+        ``(nf, 2)``.  The compiled core-compute graphs are cached without
+        stride guards, so the broadcast must be materialized here —
+        otherwise the Inductor artifact fails ``assert_size_stride`` at
+        runtime (observed as ``stride 0==2 at dim=0`` in full validation).
+        """
+        params = self._model_params({"lr_kernel": "les"})
+        params["descriptor"]["add_chg_spin_ebd"] = True
+        params["descriptor"]["default_chg_spin"] = [0.0, 1.0]
+        model = get_model(params)
+        assert isinstance(model, SeZMSOGModel)
+        nf = 4
+        one_d = torch.tensor([0.0, 1.0], dtype=torch.float64, device=self.device)
+        for charge_spin in (None, one_d):
+            cs = model.convert_charge_spin(
+                charge_spin, nf=nf, dtype=torch.float64, device=self.device
+            )
+            self.assertEqual(cs.shape, (nf, 2))
+            self.assertTrue(cs.is_contiguous())
+            self.assertEqual(cs.stride(), (2, 1))
+            np.testing.assert_allclose(
+                cs.detach().cpu().numpy(),
+                np.tile([0.0, 1.0], (nf, 1)),
+            )
+
 
 class TestSeZMSOGModelCompile(unittest.TestCase):
     """Compile-vs-eager parity for the SOG long-range branch.
@@ -1033,6 +1060,59 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
         ret = model.forward(self.coord[:, :5, :], self.atype[:, :5])
         loss = ret["energy"].sum() + 0.1 * (ret["force"] ** 2).sum()
         loss.backward()
+
+    @unittest.skipIf(_SKIP_OFF_COMPILE_TORCH, _SKIP_OFF_COMPILE_TORCH_REASON)
+    def test_compile_eval_default_charge_spin(self) -> None:
+        """Default charge-spin broadcast must not break the compiled eval graph.
+
+        Full validation calls the model without ``charge_spin``, while the
+        validation-loss batch that compiled the eval graph passes a real
+        ``(nf, 2)`` tensor.  The default broadcast used to reach the compiled
+        core compute as a stride-0 expanded view whose layout mismatches the
+        one the Inductor artifact was specialized with, raising
+        ``assert_size_stride`` at runtime.
+        """
+
+        def _params(use_compile: bool) -> dict:
+            params = self._model_params({"lr_kernel": "les"}, use_compile)
+            params["descriptor"]["add_chg_spin_ebd"] = True
+            params["descriptor"]["default_chg_spin"] = [0.0, 1.0]
+            return params
+
+        coord = torch.cat([self.coord, self.coord + 0.3], dim=0)
+        atype = torch.cat([self.atype, self.atype], dim=0)
+        charge_spin = torch.tensor(
+            [[0.0, 1.0], [0.0, 1.0]], dtype=torch.float64, device=self.device
+        )
+        m_eager = get_model(_params(False))
+        assert isinstance(m_eager, SeZMSOGModel)
+        TestSeZMSOGModel._randomize_params(m_eager)
+        m_comp = get_model(_params(True))
+        assert isinstance(m_comp, SeZMSOGModel)
+        TestSeZMSOGModel._randomize_params(m_comp)
+        m_eager.eval()
+        m_comp.eval()
+
+        # The explicit-charge_spin call compiles the eval graph first.
+        r_explicit = m_comp.forward(coord, atype, charge_spin=charge_spin)
+        # The default-charge_spin call exercises the broadcast path.
+        r_default = m_comp.forward(coord, atype)
+        r_eager = m_eager.forward(coord, atype)
+        for key in ("energy", "force"):
+            np.testing.assert_allclose(
+                r_default[key].detach().cpu().numpy(),
+                r_eager[key].detach().cpu().numpy(),
+                rtol=1e-9,
+                atol=1e-11,
+                err_msg=f"[default-cs] eval {key}",
+            )
+            np.testing.assert_allclose(
+                r_explicit[key].detach().cpu().numpy(),
+                r_eager[key].detach().cpu().numpy(),
+                rtol=1e-9,
+                atol=1e-11,
+                err_msg=f"[explicit-cs] eval {key}",
+            )
 
 
 if __name__ == "__main__":
