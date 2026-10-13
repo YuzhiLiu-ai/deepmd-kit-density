@@ -2279,8 +2279,13 @@ class Trainer:
             log_dict["fid"] = batch_data["fid"]
         log_dict["sid"] = batch_data["sid"]
         # models without grid support do not accept a grid keyword in forward;
-        # drop it when the data does not provide grid
-        if input_dict.get("grid") is None:
+        # drop it when the data does not provide grid, or when the task model
+        # has no grid input (multi-task branches may share grid-carrying data)
+        task_model = self.model[task_key] if self.multi_task else self.model
+        model_has_grid = getattr(task_model, "has_grid", False)
+        if callable(model_has_grid):
+            model_has_grid = model_has_grid()
+        if not model_has_grid or input_dict.get("grid") is None:
             input_dict.pop("grid", None)
         return input_dict, label_dict, log_dict
 

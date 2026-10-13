@@ -414,7 +414,25 @@ class DPDensityAtomicModel(DPAtomicModel):
         samples), so the stat-file fast path still applies; when a stat
         file is used, the patched grid-type row is written back to disk so
         that the file and the in-memory statistics agree.
+
+        Descriptors that keep no input statistics at all (e.g. DPA4/SeZM)
+        have no grid-type row to patch; for them the injected pass is
+        skipped entirely instead of failing with a warning.
         """
+        try:
+            self._descriptor_stat_blocks()
+        except KeyError:
+            log.info(
+                "The descriptor keeps no davg/dstd input statistics; "
+                "skipping the grid-type input-stat patch."
+            )
+            super().compute_or_load_stat(
+                sampled_func,
+                stat_file_path,
+                compute_or_load_out_stat=compute_or_load_out_stat,
+                preset_observed_type=preset_observed_type,
+            )
+            return
         sampled = None
         grid_stats = None
         if self._grid_stat_missing(stat_file_path):

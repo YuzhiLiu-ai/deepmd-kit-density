@@ -514,6 +514,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         add_chg_spin_ebd: bool = False,
         default_chg_spin: list[float] | None = None,
         use_spin: list[bool] | None = None,
+        use_compile: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -657,6 +658,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.layer_scale = bool(layer_scale)
         self.use_amp = bool(use_amp)
         self.use_amp_infer = use_amp_infer()
+        self.use_compile = bool(use_compile)
+        # Lazily-created torch.compile wrapper around ``_forward_blocks``.
+        # Kept as a plain attribute (outside the nn.Module subtree) so
+        # DDP/FSDP never sees the duplicated parameters of the compiled
+        # callable (same convention as SeZMModel, sezm_model.py NOTE 8).
+        self._compiled_forward_blocks = None
         self.trainable = bool(trainable)
         self.seed = seed
         self.random_gamma = bool(random_gamma)
@@ -1449,7 +1456,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             if self.blocks:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
-                    x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
+                    x = self._maybe_compiled_blocks(x, edge_cache, rad_feat_per_block)
 
         # === Step 12. Final l=0 output mixing ===
         with nvtx_range("output_ffn"):
@@ -1896,6 +1903,34 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             current_x=x,
         ).to(dtype=self.dtype)
         return x
+
+    def _maybe_compiled_blocks(
+        self,
+        x: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat_per_block: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the interaction blocks, compiling the dense region on demand.
+
+        The edge set entering ``_forward_blocks`` has a data-dependent size
+        (the padded neighbor list is compressed to valid edges eagerly), so
+        only the block stack — dense given the node count N and edge count E
+        — is compiled, with dynamic shapes.  The compiled callable is
+        numerically identical to eager and is created lazily so that merely
+        constructing the descriptor costs nothing.
+        """
+        if not self.use_compile:
+            return self._forward_blocks(x, edge_cache, radial_feat_per_block)
+        if self._compiled_forward_blocks is None:
+            from deepmd.pt.utils.compile_compat import (
+                check_compile_torch_version,
+            )
+
+            check_compile_torch_version()
+            self._compiled_forward_blocks = torch.compile(
+                self._forward_blocks, dynamic=True
+            )
+        return self._compiled_forward_blocks(x, edge_cache, radial_feat_per_block)
 
     def _apply_readout(self, x: torch.Tensor, n_rows: int) -> torch.Tensor:
         """Fold the node tensor into the scalar (``l=0``) descriptor.
@@ -2464,9 +2499,20 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         """Return whether default charge/spin conditions are configured."""
         return self.default_chg_spin is not None
 
-    def get_default_chg_spin(self) -> list[float] | None:
-        """Return default charge/spin conditions."""
-        return self.default_chg_spin
+    def get_default_chg_spin(self) -> torch.Tensor | None:
+        """Return default charge/spin conditions.
+
+        The PT model interface declares ``torch.Tensor | None`` (the trainer
+        calls ``.cpu().numpy()`` on it), so the stored list is converted here
+        rather than passed through, matching the DPA3 descriptor.
+        """
+        if self.default_chg_spin is None:
+            return None
+        return torch.tensor(
+            self.default_chg_spin,
+            dtype=env.GLOBAL_PT_FLOAT_PRECISION,
+            device=env.DEVICE,
+        )
 
     def get_dim_out(self) -> int:
         return self.channels
@@ -2717,6 +2763,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "rcut": self.rcut,
                 "env_exp": self.env_exp,
                 "type_map": self.type_map,
+                "use_compile": self.use_compile,
                 "lmax": self.lmax,
                 "n_blocks": self.n_blocks,
                 "l_schedule": self.l_schedule,

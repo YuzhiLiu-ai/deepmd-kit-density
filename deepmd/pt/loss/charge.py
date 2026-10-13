@@ -137,6 +137,16 @@ class GridDensityLoss(TaskLoss):
             )
         return model_pred, loss, more_loss
 
+    @property
+    def training_metric_names(self) -> tuple[str, ...]:
+        """Return configured density metrics.
+
+        The forward always reports both ``rmse_d`` and ``mae_d`` when the
+        density term is active (the density label is mandatory in training),
+        so the names depend only on ``has_d``.
+        """
+        return ("rmse_d", "mae_d") if self.has_d else ()
+
     def serialize(self) -> dict:
         """Serialize the loss module.
 

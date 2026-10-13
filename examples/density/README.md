@@ -14,6 +14,8 @@ ______________________________________________________________________
 │   └── input.json
 ├── dpa3/                     # DPA-3 descriptor example (recommended)
 │   └── input.json
+├── dpa4/                     # DPA-4 (SeZM) descriptor example
+│   └── input.json
 ├── dataset/
 │   └── qm9/
 │       ├── C7H15NO_train/    # Training data (deepmd/npy format)
@@ -40,7 +42,7 @@ The training/validation data follows the standard **`deepmd/npy`** format, with 
 >
 > - `grid.npy` and `density.npy` are required for the density model. The number of grid points (`ngrid`) must match between `grid.npy` and `density.npy`, and is allowed to differ from `natoms`.
 > - The **last entry of `type_map` is reserved as a virtual "grid point type"** (e.g. `X` in the example): internally, grid points are assigned this type when building the grid-to-atom neighbor list. Make sure your `type_map` contains one more entry than the real element types. For descriptors with a per-type `sel` list (e.g. `se_e2_a`), set its **last entry to 0** (grid points are only centers, never neighbors); scalar `sel` descriptors such as DPA-2/DPA-3 need no change. The descriptor input statistics for the grid type are computed from the actual `grid.npy` data during training initialization.
-> - **Always set a positive `env_protection`** in the descriptor configuration (e.g. `"env_protection": 0.1`, as in `dpa3/input.json`). Grid points may legitimately coincide with atoms, and the default `env_protection = 0.0` would let the `1/r` terms in the environment matrix produce `NaN` densities and poison the training gradients at such points.
+> - **Always set a positive `env_protection`** in the descriptor configuration (e.g. `"env_protection": 0.1`, as in `dpa3/input.json`). Grid points may legitimately coincide with atoms, and the default `env_protection = 0.0` would let the `1/r` terms in the environment matrix produce `NaN` densities and poison the training gradients at such points. (The DPA-4/SeZM descriptor has no `env_protection`; it guards divisions with `eps`, which must stay positive for the same reason.)
 
 ______________________________________________________________________
 
@@ -52,6 +54,7 @@ Two example configurations are provided:
 
 - **`dpa2/input.json`** — Uses the DPA-2 descriptor.
 - **`dpa3/input.json`** — Uses the DPA-3 descriptor (recommended).
+- **`dpa4/input.json`** — Uses the DPA-4 (SeZM) descriptor. The density pipeline is descriptor-agnostic: grid points are appended as pseudo-atoms of the reserved type and go through the descriptor together with the real atoms. Note that SeZM keeps no input statistics (`compute_input_stats` is a no-op), so no `stat_file` is needed, and its numerical protection parameter is `eps` (guarded automatically: an `eps: 0` would be lifted to `1e-6` for a density model). `random_gamma` and `use_amp` are disabled in the example to keep `dp test` reproducible and CPU-friendly. The descriptor-level `"use_compile": true` compiles the SeZM interaction blocks with `torch.compile` (the data-dependent edge construction stays eager); the first training step pays a one-off compilation cost, and under DDP the trainer pre-compiles before the first collective. This spelling differs from the DPA-4 energy examples' `model.use_compile`, which belongs to the `SeZMModel`-specific compile machinery that the standard density path does not use.
 
 Key settings in `input.json`:
 
@@ -205,5 +208,5 @@ ______________________________________________________________________
 
 - **Backend:** PyTorch only (`--pt`). Make sure DeePMD-kit is installed with PyTorch support.
 - **Deployment scope:** Python inference only (`dp test`, `DeepEval`/`DeepDensity`, and the standalone script). C++/LAMMPS inference is not supported yet (`forward_lower` is not implemented for density models).
-- **Stat file:** `input.json` specifies `"stat_file": "./qm9_charge_density.hdf5"` for caching descriptor statistics; it is generated automatically on the first run.
+- **Stat file:** `dpa2`/`dpa3` specify `"stat_file"` in `input.json` for caching descriptor statistics; it is generated automatically on the first run. `dpa4` (SeZM) needs none — the descriptor keeps no input statistics.
 - **Checkpoint vs. frozen model:** evaluation requires a frozen model (`.pth`). Freeze a checkpoint first with `dp --pt freeze`.

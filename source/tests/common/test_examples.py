@@ -79,6 +79,7 @@ input_files = (
     p_examples / "lmdb_downsample_data" / "input_lmdb.json",
     p_examples / "density" / "dpa2" / "input.json",
     p_examples / "density" / "dpa3" / "input.json",
+    p_examples / "density" / "dpa4" / "input.json",
 )
 
 input_files_multi = (

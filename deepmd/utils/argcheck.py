@@ -1293,6 +1293,17 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=supported_backends("pt", "jax", "pt_expt") + doc_eps,
         ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
+        Argument(
+            "use_compile",
+            bool,
+            optional=True,
+            default=False,
+            doc=supported_backends("pt")
+            + "Compile the interaction-block stack with torch.compile (dynamic "
+            "shapes) while keeping the data-dependent edge construction eager. "
+            "Applies to training and inference; the first call pays a "
+            "compilation overhead.",
+        ),
         Argument("seed", [int, None], optional=True, default=None, doc=doc_seed),
     ]
 
@@ -6688,6 +6699,12 @@ def validate_no_multitask_lora(data: dict[str, Any], multi_task: bool = False) -
             )
 
 
+# descriptors that use ``eps`` for numerical protection instead of
+# ``env_protection`` (no 1/r environment matrix, but coincident grid points
+# still hit the epsilon-guarded divisions)
+_DENSITY_EPS_DESCRIPTORS = ("dpa4", "dpa4c", "sezm")
+
+
 def _apply_density_env_protection_default(data: dict[str, Any]) -> None:
     """Default env_protection to 1e-6 for density models.
 
@@ -6700,6 +6717,10 @@ def _apply_density_env_protection_default(data: dict[str, Any]) -> None:
     still set any positive value (e.g. 0.1) explicitly. An explicit
     ``env_protection: 0.0`` cannot be distinguished from the schema default
     (which normalizes to 0.0) and receives the same override with a warning.
+
+    Descriptors such as DPA4/SeZM carry ``eps`` instead of
+    ``env_protection``; for them the same coincidence hazard is guarded by
+    ensuring ``eps`` stays positive.
     """
 
     def _fix(model: dict[str, Any]) -> None:
@@ -6713,6 +6734,15 @@ def _apply_density_env_protection_default(data: dict[str, Any]) -> None:
         else:
             sub_descriptors = [descriptor]
         for sub in sub_descriptors:
+            if str(sub.get("type", "")).lower() in _DENSITY_EPS_DESCRIPTORS:
+                if sub.get("eps", 1e-7) == 0.0:
+                    log.warning(
+                        "eps is 0.0 for a density model; grid points "
+                        "coincident with atoms would produce NaN densities. "
+                        "Setting eps to 1e-6."
+                    )
+                    sub["eps"] = 1e-6
+                continue
             if sub.get("env_protection", 0.0) == 0.0:
                 log.warning(
                     "env_protection is 0.0 for a density model; grid points "

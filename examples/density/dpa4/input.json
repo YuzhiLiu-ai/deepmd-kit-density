@@ -1,0 +1,91 @@
+{
+  "_comment": "DPA4 (SeZM) grid-density training on the QM9-derived dataset.",
+  "model": {
+    "type_map": [
+      "Li",
+      "Ni",
+      "Co",
+      "Mn",
+      "O",
+      "C",
+      "H",
+      "N",
+      "F",
+      "X"
+    ],
+    "descriptor": {
+      "type": "dpa4",
+      "rcut": 6.0,
+      "sel": 60,
+      "channels": 32,
+      "n_radial": 16,
+      "n_blocks": 2,
+      "mixing_layers": 3,
+      "lmax": 2,
+      "mmax": 1,
+      "use_env_seed": true,
+      "edge_norm": false,
+      "random_gamma": false,
+      "use_amp": false,
+      "use_compile": true,
+      "precision": "float32",
+      "seed": 42
+    },
+    "fitting_net": {
+      "type": "density",
+      "neuron": [
+        240,
+        240,
+        240
+      ],
+      "resnet_dt": true,
+      "seed": 1,
+      "precision": "float32",
+      "activation_function": "silu",
+      "_comment": " that's all"
+    },
+    "_comment": " that's all"
+  },
+  "learning_rate": {
+    "type": "exp",
+    "decay_steps": 5000,
+    "start_lr": 0.001,
+    "stop_lr": 1e-05,
+    "_comment": "that's all"
+  },
+  "loss": {
+    "type": "grid_density",
+    "start_pref_d": 1,
+    "limit_pref_d": 1,
+    "_comment": " that's all"
+  },
+  "training": {
+    "_comment": "SeZM keeps no input statistics (EquivariantRMSNorm), so no stat_file is needed.",
+    "training_data": {
+      "systems": [
+        "../dataset/qm9/C7H15NO_train"
+      ],
+      "batch_size": "auto:128",
+      "_comment": "that's all"
+    },
+    "validation_data": {
+      "systems": [
+        "../dataset/qm9/C7H15NO_val"
+      ],
+      "batch_size": 1,
+      "numb_btch": 3,
+      "_comment": "that's all"
+    },
+    "numb_steps": 100,
+    "gradient_max_norm": 5.0,
+    "seed": 10,
+    "max_ckpt_keep": 100,
+    "disp_file": "lcurve.out",
+    "disp_freq": 100,
+    "save_freq": 10000,
+    "_comment": "that's all"
+  },
+  "optimizer": {
+    "type": "AdamW"
+  }
+}

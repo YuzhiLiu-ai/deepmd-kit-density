@@ -17,7 +17,7 @@ A complete example can be found in
 $deepmd_source_dir/examples/density/
 ```
 
-with DPA-2 and DPA-3 configurations, a small QM9 dataset, and a README describing the data format in detail. Note that **the data provided along with the examples are of limited amount, and should not be used to train a production model.**
+with DPA-2, DPA-3, and DPA-4 (SeZM) configurations, a small QM9 dataset, and a README describing the data format in detail. Note that **the data provided along with the examples are of limited amount, and should not be used to train a production model.**
 
 ## Data format
 
@@ -28,7 +28,7 @@ The training/validation data follows the standard `deepmd/npy` format, with two 
 
 The number of grid points `ngrid` may differ from the number of atoms. The last entry of `type_map` is reserved as a virtual "grid point type": internally, grid points are assigned this type when building the grid-to-atom neighbor list, so `type_map` must contain one more entry than the real element types. For descriptors with a per-type `sel` list (e.g. `se_e2_a`), set its last entry to 0, since grid points are only centers, never neighbors.
 
-It is recommended to set a positive `env_protection` in the descriptor configuration (e.g. `"env_protection": 0.1`). Grid points may legitimately coincide with atoms, and the default `env_protection = 0.0` would let the `1/r` terms in the environment matrix produce `NaN` densities. If `env_protection` is not set for a density model, it is automatically set to `1e-6` with a warning.
+It is recommended to set a positive `env_protection` in the descriptor configuration (e.g. `"env_protection": 0.1`). Grid points may legitimately coincide with atoms, and the default `env_protection = 0.0` would let the `1/r` terms in the environment matrix produce `NaN` densities. If `env_protection` is not set for a density model, it is automatically set to `1e-6` with a warning. The DPA-4/SeZM descriptor instead guards divisions with `eps`; if `eps` is `0.0` for a density model, it is automatically set to `1e-6` with a warning.
 
 ## The fitting network
 
