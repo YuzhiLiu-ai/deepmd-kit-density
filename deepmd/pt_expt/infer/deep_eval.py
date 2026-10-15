@@ -2418,12 +2418,18 @@ class DeepEval(DeepEvalBackend):
 
         coord_input = coords.reshape(nframes, natoms, 3)
         box_input = cells.reshape(nframes, 9) if cells is not None else None
+        # An all-zero cell marks a non-periodic frame. Normalize it to None
+        # before any graph is built: the fused-cell path would otherwise hand
+        # the singular lattice to the native periodic neighbor search, which
+        # rejects it.
+        if box_input is not None and not np.any(box_input != 0):
+            box_input = None
         # Build the carry-all graph at its exact edge count; the exported edge
         # axis is dynamic.
         graph = self._build_eval_graph(coord_input, atom_types, box_input, DEVICE)
         lr_graph = None
         if self.metadata.get("needs_long_range_edges", False):
-            if box_input is not None and bool(np.any(box_input != 0)):
+            if box_input is not None:
                 raise NotImplementedError(
                     "DPA4C-LR supports only non-periodic systems (box=None)."
                 )
@@ -2599,7 +2605,10 @@ class DeepEval(DeepEvalBackend):
     ) -> "NeighborGraph":
         """Build the carry-all NeighborGraph for graph-lower inference.
 
-        Dispatches on ``self._neighbor_graph_method``: ``auto`` is resolved
+        ``long_range=True`` bypasses the cutoff-based builders entirely and
+        returns the ragged-native unordered all-pairs graph used by models
+        with a non-periodic long-range term.  Otherwise dispatches on
+        ``self._neighbor_graph_method``: ``auto`` is resolved
         call-time via
         :func:`~deepmd.pt_expt.utils.graph_builder.resolve_auto_graph_builder`
         using the batch frame count (vesin only when ``nf == 1``);
@@ -2609,11 +2618,24 @@ class DeepEval(DeepEvalBackend):
         and results are unchanged. The result is canonicalized to the
         destination-major graph-form ``.pt2`` ABI after construction.
         """
-        # The LR graph is all-pairs by definition.  Do not send its artificial
-        # 1e6 cutoff through the spatial NV/vesin builders: their capacity/cell
-        # estimates are intended for finite local cutoffs and can explode for
-        # this sentinel radius.
-        method = "dense" if long_range else self._neighbor_graph_method
+        # The LR graph is all-pairs by definition: build it ragged-native and
+        # unordered straight from the frame sizes -- no cutoff search, no
+        # padding to a common width, and no dependence on the short-range
+        # builder policy (the 1e6 sentinel cutoff used to explode the NV
+        # capacity estimate).
+        if long_range:
+            from deepmd.pt_expt.utils.graph_builder import (
+                build_all_pairs_unordered_graph,
+            )
+
+            coord_arr = np.asarray(coord_input)
+            nf, natoms = coord_arr.shape[0], coord_arr.shape[1]
+            coord_t = torch.as_tensor(
+                coord_arr.reshape(-1, 3), dtype=torch.float64, device=device
+            )
+            n_node_t = torch.full((nf,), natoms, dtype=torch.int64, device=device)
+            return build_all_pairs_unordered_graph(coord_t, n_node_t)
+        method = self._neighbor_graph_method
         if method == "auto":
             coord_arr = np.asarray(coord_input)
             nf = int(coord_arr.shape[0]) if coord_arr.ndim >= 2 else 1
@@ -2622,8 +2644,8 @@ class DeepEval(DeepEvalBackend):
         # (decision #18): apply it here so the exported ``.pt2`` lower consumes a
         # pre-excluded ``edge_mask`` and never re-applies it (mirrors the C++
         # ``applyPairExclusion`` and the eager dpmodel/pt_expt build path).
-        pair_excl = None if long_range else self._model_pair_excl()
-        rcut = 1.0e6 if long_range else self._rcut
+        pair_excl = self._model_pair_excl()
+        rcut = self._rcut
         if method == "dense":
             from deepmd.dpmodel.utils.neighbor_graph import (
                 build_neighbor_graph,
