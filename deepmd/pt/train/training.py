@@ -1688,9 +1688,12 @@ class Trainer:
                             self.train_loss_accu[item] = 0.0
                     else:
                         for task_key in self.model_keys:
+                            # Clear the dict instead of zeroing values: a task
+                            # not sampled within the display interval must have
+                            # an empty accumulator, so that log_loss_train
+                            # skips it instead of dividing by a zero count.
                             if task_key in self.train_loss_accu:
-                                for item in self.train_loss_accu[task_key]:
-                                    self.train_loss_accu[task_key][item] = 0.0
+                                self.train_loss_accu[task_key] = {}
                             if task_key in self.step_count_per_task:
                                 self.step_count_per_task[task_key] = 0
                     self.step_count_in_interval = 0
