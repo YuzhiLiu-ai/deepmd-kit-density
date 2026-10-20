@@ -1189,6 +1189,12 @@ class TestSeZMSOGFinetune(unittest.TestCase):
                 "start_pref_v": 0.0,
                 "limit_pref_v": 0.0,
             },
+            "optimizer": {
+                "type": "Adam",
+                "adam_beta1": 0.9,
+                "adam_beta2": 0.999,
+                "weight_decay": 0.0,
+            },
             "training": {
                 "training_data": {"systems": ["data/sys"], "batch_size": 1},
                 "numb_steps": 1,
@@ -1223,7 +1229,7 @@ class TestSeZMSOGFinetune(unittest.TestCase):
             },
         }
         lr_model_params, finetune_links = get_finetune_rules(
-            finetune_model, lr_model_params
+            finetune_model, lr_model_params, change_model_params=False
         )
         trainer_lr = get_trainer(
             self._config(lr_model_params),
@@ -1237,9 +1243,10 @@ class TestSeZMSOGFinetune(unittest.TestCase):
         # The long-range branch exists only in the new model.
         self.assertTrue(any("filter_layers_lr" in k for k in lr_only_keys))
         # Every shared entry is inherited from the pretrained checkpoint,
-        # except the out bias, which may be re-adjusted by statistic.
+        # except the out bias/std, which gain an extra row for the
+        # latent-charge output and are re-adjusted by statistic.
         for key, value in lr_state.items():
-            if key not in sr_state or "out_bias" in key:
+            if key not in sr_state or "out_bias" in key or "out_std" in key:
                 continue
             torch.testing.assert_close(value, sr_state[key])
 
