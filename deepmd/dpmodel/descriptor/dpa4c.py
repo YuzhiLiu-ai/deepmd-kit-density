@@ -419,7 +419,7 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         comm_dict: dict | None = None,
         spin: Array | None = None,
         charge_spin: Array | None = None,
-    ) -> tuple[Array, None]:
+    ) -> tuple[Array, Array]:
         """Evaluate DPA4C on a flat neighbor graph.
 
         Parameters
@@ -456,7 +456,7 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
             Rotation- and permutation-invariant node features with shape
             ``(N, get_dim_out())`` and the same floating dtype as ``edge_vec``.
         rot_mat
-            ``None``. DPA4C does not expose an equivariant fitting input.
+            Degree-one equivariant moments with shape ``(N, C1, 3)``.
 
         Raises
         ------
@@ -478,7 +478,7 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
             )
 
         # === Step 2. Evaluate the graph-native equations ===
-        descriptor, _ = self.evaluate_graph(
+        descriptor, _, l1_moments = self.evaluate_graph(
             graph,
             atype,
             type_embedding,
@@ -491,7 +491,9 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         # === Step 3. Restore the graph input dtype ===
         if descriptor.dtype != in_dtype:
             descriptor = xp.astype(descriptor, in_dtype)
-        return descriptor, None
+        if l1_moments.dtype != in_dtype:
+            l1_moments = xp.astype(l1_moments, in_dtype)
+        return descriptor, l1_moments
 
     def require_spin(self, spin: Array | None) -> Array:
         """Return the per-node moment a spin-conditioned descriptor must receive.
@@ -570,7 +572,7 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         fparam: Array | None = None,
         comm_dict: dict | None = None,
         charge_spin: Array | None = None,
-    ) -> tuple[Array, None, None, None, Array]:
+    ) -> tuple[Array, Array, None, None, Array]:
         """Adapt a bounded dense neighbor list to the graph-native equations.
 
         This method exists for the common descriptor ABI and numerical
@@ -606,7 +608,8 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
             Invariant features with shape
             ``(F, N_local, get_dim_out())``.
         rot_mat
-            ``None``.
+            Degree-one equivariant moments with shape
+            ``(F, N_local, C1, 3)``.
         g2
             ``None``.
         h2
@@ -632,7 +635,7 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         )
 
         # === Step 2. Evaluate the same graph-native equations ===
-        descriptor, envelope = self.evaluate_graph(
+        descriptor, envelope, l1_moments = self.evaluate_graph(
             graph,
             atype_local,
             self.type_embedding.call(),
@@ -645,8 +648,12 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
             descriptor,
             (nf, nloc, descriptor.shape[-1]),
         )
+        l1_moments = xp.reshape(
+            l1_moments,
+            (nf, nloc, l1_moments.shape[-2], 3),
+        )
         envelope = xp.reshape(envelope, (nf, nloc, nnei, 1))
-        return descriptor, None, None, None, envelope
+        return descriptor, l1_moments, None, None, envelope
 
     def evaluate_graph(
         self,
@@ -655,7 +662,7 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         type_embedding: Array,
         spin: Array | None = None,
         charge_spin: Array | None = None,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Array, Array, Array]:
         """Evaluate the graph-native descriptor equations.
 
         The pipeline is edge amplitudes, one destination reduction into
@@ -682,6 +689,8 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
             Invariant node features with shape ``(N, get_dim_out())``.
         envelope
             Masked per-edge C³ envelope with shape ``(E, 1)``.
+        l1_moments
+            Degree-one equivariant moments with shape ``(N, C1, 3)``.
 
         Raises
         ------
@@ -764,14 +773,26 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         )
 
         # === Step 6. Build calibrated invariant features ===
-        return (
-            self.build_invariant_descriptor(
-                moments,
-                center_type_embedding,
-                divisors,
-            ),
-            envelope[:, None],
+        descriptor = self.build_invariant_descriptor(
+            moments,
+            center_type_embedding,
+            divisors,
         )
+        l1_moments = self.extract_l1_moments(moments)
+        return descriptor, envelope[:, None], l1_moments
+
+    def extract_l1_moments(self, moments: Array) -> Array:
+        """Return the Cartesian degree-one block as ``(N, C1, 3)``.
+
+        The flat moment payload is component-major: all channels of x are
+        followed by all channels of y and then z.  Reshape to ``(N, 3, C1)``
+        first, then move the Cartesian axis last for the common fitting ABI.
+        """
+        xp = array_api_compat.array_namespace(moments)
+        channels_l1 = self.degree_channels[1]
+        l1 = moments[:, self.degree_offsets[1] : self.degree_offsets[2]]
+        l1 = xp.reshape(l1, (moments.shape[0], 3, channels_l1))
+        return xp.permute_dims(l1, (0, 2, 1))
 
     def build_center_type_features(
         self,
@@ -1963,8 +1984,8 @@ class DescrptDPA4C(NativeOP, BaseDescriptor):
         return self.readout.get_dim_out() + spin_dim + self.channels + 2
 
     def get_dim_emb(self) -> int:
-        """Return zero because fitting receives no equivariant channels."""
-        return 0
+        """Return the number of exposed degree-one moment channels."""
+        return self.degree_channels[1]
 
     def mixed_types(self) -> bool:
         """Return whether the descriptor consumes a mixed-type neighbor list."""

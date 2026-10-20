@@ -52,7 +52,7 @@ def get_model_components(
     fitting_data["ntypes"] = descriptor.get_ntypes()
     fitting_data["type_map"] = copy.deepcopy(type_map)
     fitting_data["mixed_types"] = descriptor.mixed_types()
-    if fitting_type in {"dipole", "polar"}:
+    if fitting_type in {"dipole", "polar", "dpa4c_lr"}:
         fitting_data["embedding_width"] = descriptor.get_dim_emb()
     fitting_data["dim_descrpt"] = descriptor.get_dim_out()
     if "direct" in fitting_type:

@@ -335,6 +335,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
         neighbor_list: NeighborList | None = None,
+        neighbor_graph_method: str | None = None,
     ) -> dict[str, torch.Tensor]:
         """Evaluate the energy model.
 
@@ -363,6 +364,11 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             reproducing the historical behavior; an alternative strategy (e.g.
             the ``vesin`` O(N) cell list) may be injected to accelerate
             neighbor-list construction without changing the model outputs.
+        neighbor_graph_method
+            Selects the lower the model routes through, forwarded to
+            :meth:`call_common`.  ``None`` keeps the default route;
+            ``"legacy"`` forces the dense nlist path, ``"dense"``/``"ase"``
+            select a carry-all neighbor-graph builder.
         """
         model_ret = self.call_common(
             coord,
@@ -373,6 +379,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             charge_spin=charge_spin,
             do_atomic_virial=do_atomic_virial,
             neighbor_list=neighbor_list,
+            neighbor_graph_method=neighbor_graph_method,
         )
         return self._translate_eager_call(
             model_ret,

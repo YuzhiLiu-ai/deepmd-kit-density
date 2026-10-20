@@ -3187,12 +3187,12 @@ def fitting_sog_energy() -> list[Argument]:
 @fitting_args_plugin.register(
     "dpa4c_lr",
     doc=supported_backends("pt_expt")
-    + "Fit a DPA4C latent-charge energy model (SR + non-periodic LES/SOG).",
+    + "Fit a DPA4C latent multipole model (SR + non-periodic LES/SOG/dipole).",
 )
 def fitting_dpa4c_lr() -> list[Argument]:
     doc_dim_out_lr = (
         "The output dimension of the long-range (latent charge) fitting branch. "
-        "Must be 1 for the LES kernel; SOG supports multiple channels."
+        "Must be 1 for LES/dipole; SOG supports multiple channels."
     )
     doc_neuron_lr = (
         "The number of neurons in each hidden layer of the latent-charge fitting net."
@@ -3216,8 +3216,16 @@ def fitting_dpa4c_lr() -> list[Argument]:
     doc_lr_kernel = (
         "Long-range kernel used for non-periodic systems. "
         "'les' (default) applies only the LES erf(alpha*r)/r charge-charge kernel. "
+        "'dipole' exposes DPA4C degree-one moments and adds charge-dipole, "
+        "dipole-dipole, and optional self-polarization terms. "
         "'sog' applies a trainable sum-of-Gaussians kernel over distinct atom "
-        "pairs (i != j) and supports multi-channel latent charges."
+        "pairs (i != j) and supports multi-channel latent charges. Compression "
+        "is unavailable for the dipole mode."
+    )
+    doc_alpha_pol = (
+        "Base polarizability per element. It is squared in the dipole "
+        "self-polarization denominator to keep the effective value positive. "
+        "A scalar is broadcast to all elements."
     )
     doc_use_charge_constraint = (
         "Whether to enforce the sum of latent charges equals the target total "
@@ -3295,11 +3303,50 @@ def fitting_dpa4c_lr() -> list[Argument]:
             doc=supported_backends("pt_expt") + doc_lr_kernel,
         ),
         Argument(
+            "alpha_pol",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc=supported_backends("pt_expt") + doc_alpha_pol,
+        ),
+        Argument(
             "use_charge_constraint",
             bool,
             optional=True,
             default=False,
             doc=supported_backends("pt_expt") + doc_use_charge_constraint,
+        ),
+        Argument(
+            "use_self_pol",
+            bool,
+            optional=True,
+            default=True,
+            doc=supported_backends("pt_expt")
+            + "Include the dipole self-polarization energy.",
+        ),
+        Argument(
+            "lr_update_steps",
+            int,
+            optional=True,
+            default=0,
+            doc=supported_backends("pt_expt")
+            + "Number of shared long-range charge/dipole update steps.",
+        ),
+        Argument(
+            "lr_update_neuron",
+            list[int],
+            optional=True,
+            default=[64, 64],
+            doc=supported_backends("pt_expt")
+            + "Hidden widths of the shared charge/dipole update network.",
+        ),
+        Argument(
+            "lr_update_damping",
+            float,
+            optional=True,
+            default=0.2,
+            doc=supported_backends("pt_expt")
+            + "Residual damping applied at every charge/dipole update.",
         ),
         Argument(
             "charge_bound",
@@ -4182,7 +4229,7 @@ def sezm_sog_model_args() -> Argument:
     doc_fitting = (
         "Fitting network configuration. DPA4-LR requires the `sog_energy` "
         "fitting, which augments the `dpa4_ener` GLU energy fitting with a "
-        "long-range latent-charge branch."
+        "long-range latent charge and optional dipole branches."
     )
     doc_enable_tf32 = (
         "If True, enable TF32 matmul precision for CUDA training forwards. "
@@ -4273,7 +4320,7 @@ def dpa4c_lr_model_args() -> Argument:
     )
     doc_model = (
         "DPA4C-LR model scaffold: the compact DPA4C descriptor plus a "
-        "non-periodic LES or SOG term evaluated from the latent charges "
+        "non-periodic LES, SOG, or dipole term evaluated from latent multipoles "
         "produced by the `dpa4c_lr` fitting. Only the pt_expt backend and "
         "non-periodic systems (no box) are supported."
     )

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Tests for the DPA4C-LR non-periodic latent-charge model."""
+"""Tests for the DPA4C-LR non-periodic latent-multipole model."""
 
 import copy
 
@@ -74,6 +74,16 @@ def _config(lr_kernel: str = "les") -> dict:
                 "lr_kernel": "sog",
                 "amp": [0.7, -0.2, 0.1],
                 "bandwidth": [0.8, 1.7, 3.2],
+            }
+        )
+    elif lr_kernel == "dipole":
+        config["fitting_net"].update(
+            {
+                "lr_kernel": "dipole",
+                "alpha_pol": [0.8, 1.1],
+                "lr_update_steps": 2,
+                "lr_update_neuron": [8, 8],
+                "lr_update_damping": 0.1,
             }
         )
     return config
@@ -197,7 +207,7 @@ def test_frames_do_not_interact_across_batch() -> None:
         )
 
 
-@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+@pytest.mark.parametrize("lr_kernel", ["les", "sog", "dipole"])
 def test_force_matches_finite_difference(lr_kernel: str) -> None:
     """The public model force agrees with a central finite-difference stencil."""
     torch.manual_seed(1234)
@@ -235,7 +245,7 @@ def test_force_matches_finite_difference(lr_kernel: str) -> None:
     np.testing.assert_allclose(force, force_fd, atol=1e-6, rtol=1e-6)
 
 
-@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+@pytest.mark.parametrize("lr_kernel", ["les", "sog", "dipole"])
 def test_atom_virial_sums_to_total_virial(lr_kernel: str) -> None:
     """Per-atom virials include the explicit LR geometry contribution."""
     torch.manual_seed(1234)
@@ -258,7 +268,7 @@ def test_atom_virial_sums_to_total_virial(lr_kernel: str) -> None:
     )
 
 
-@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+@pytest.mark.parametrize("lr_kernel", ["les", "sog", "dipole"])
 def test_ragged_matches_padded(lr_kernel: str) -> None:
     """Ragged and padded layouts must describe the same batch."""
     torch.manual_seed(1234)
@@ -337,7 +347,7 @@ def test_periodic_box_is_rejected() -> None:
         model(coord, atype, box=box)
 
 
-@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+@pytest.mark.parametrize("lr_kernel", ["les", "sog", "dipole"])
 def test_pt_checkpoint_deep_eval_matches_direct_forward(
     tmp_path, lr_kernel: str
 ) -> None:
@@ -372,7 +382,7 @@ def test_pt_checkpoint_deep_eval_matches_direct_forward(
         )
 
 
-@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+@pytest.mark.parametrize("lr_kernel", ["les", "sog", "dipole"])
 def test_graph_training_gradient_reaches_lr_parameters(lr_kernel: str) -> None:
     """Backprop through the graph lower reaches descriptor and LR fitting params."""
     torch.manual_seed(1234)
@@ -436,6 +446,42 @@ def test_les_checkpoint_does_not_require_sog_parameters() -> None:
     restored.load_state_dict(transitional_state, strict=True)
 
 
+def test_dipole_parameters_serialize_and_compression_is_rejected() -> None:
+    """Dipole/update parameters survive serialization; compression is explicit."""
+    model = _build_model(lr_kernel="dipole")
+    fitting = model.get_fitting_net()
+    restored = DPA4CLRFitting.deserialize(fitting.serialize()).to(env.DEVICE)
+    assert restored.lr_kernel == "dipole"
+    assert restored.lr_update_steps == 2
+    assert restored.dipole_weight_net is not None
+    assert restored.polar_update_net is not None
+    torch.testing.assert_close(restored.alpha_pol, fitting.alpha_pol)
+    with pytest.raises(NotImplementedError, match="degree-one moments"):
+        model.enable_compression()
+
+
+def test_dipole_output_is_rotation_equivariant() -> None:
+    """Exposed l=1 moments produce a vector dipole and scalar LR energy."""
+    torch.manual_seed(1234)
+    model = _build_model(lr_kernel="dipole")
+    coord, atype = _make_batch((5,), seed=43)
+    coord_t = torch.tensor(coord, dtype=torch.float64, device=env.DEVICE)
+    atype_t = torch.tensor(atype, dtype=torch.long, device=env.DEVICE)
+    rotation = torch.tensor(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=torch.float64,
+        device=env.DEVICE,
+    )
+
+    upright = model(coord_t, atype_t)
+    rotated = model(coord_t @ rotation.T, atype_t)
+    torch.testing.assert_close(rotated["energy"], upright["energy"])
+    torch.testing.assert_close(
+        rotated["latent_dipole"], upright["latent_dipole"] @ rotation.T
+    )
+    torch.testing.assert_close(rotated["force"], upright["force"] @ rotation.T)
+
+
 @pytest.mark.xfail(
     reason="the dense legacy fallback for dpa4c_lr is broken on this branch "
     "base (autograd chain broken in fit_output_to_model_output; fixed "
@@ -456,8 +502,35 @@ def test_sog_graph_matches_dense_legacy_path() -> None:
         torch.testing.assert_close(graph[name], dense[name], rtol=1e-10, atol=1e-10)
 
 
+@pytest.mark.xfail(
+    reason="the dense legacy fallback for dpa4c_lr is broken on this branch "
+    "base (autograd chain broken in fit_output_to_model_output; fixed "
+    "upstream) -- the carry-all graph path is the primary route",
+    strict=False,
+)
+def test_dipole_graph_matches_dense_legacy_path() -> None:
+    """Dipole updates and multipole energy agree across graph and dense paths."""
+    torch.manual_seed(1234)
+    model = _build_model(lr_kernel="dipole")
+    coord, atype = _make_batch((5, 5), seed=41)
+    coord_t = torch.tensor(coord, dtype=torch.float64, device=env.DEVICE)
+    atype_t = torch.tensor(atype, dtype=torch.long, device=env.DEVICE)
+
+    graph = model(coord_t, atype_t)
+    # The dense (legacy) route differentiates w.r.t. the input coordinates,
+    # so they must carry requires_grad (same convention as other graph-lower
+    # parity tests).
+    dense = model(
+        coord_t.clone().requires_grad_(True),
+        atype_t,
+        neighbor_graph_method="legacy",
+    )
+    for name in ("energy", "force", "virial", "latent_charge", "latent_dipole"):
+        torch.testing.assert_close(graph[name], dense[name], rtol=1e-10, atol=1e-10)
+
+
 @REQUIRES_SUPPORTED_COMPILE
-@pytest.mark.parametrize("lr_kernel", ["les", "sog"])
+@pytest.mark.parametrize("lr_kernel", ["les", "sog", "dipole"])
 def test_compiled_lower_matches_eager(lr_kernel: str) -> None:
     """The compiled graph lower must reproduce the eager energy and force."""
     from deepmd.pt_expt.train.training import (

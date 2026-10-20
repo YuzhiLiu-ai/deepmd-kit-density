@@ -135,7 +135,7 @@ class DescrptDPA4C(DescrptDPA4CDP):
         comm_dict: dict | None = None,
         spin: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Evaluate the graph descriptor with compressed CUDA dispatch.
 
         Parameters
@@ -162,7 +162,9 @@ class DescrptDPA4C(DescrptDPA4CDP):
         descriptor
             Invariant descriptor with shape ``(N, get_dim_out())``.
         rot_mat
-            ``None``.
+            Degree-one moments with shape ``(N, C1, 3)`` in the uncompressed
+            path. Compression returns ``None`` and is therefore unavailable
+            to DPA4C-LR dipole models.
         """
         if (
             self.compress
