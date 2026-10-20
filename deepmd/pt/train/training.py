@@ -899,6 +899,26 @@ class Trainer:
                                 _new_state_dict[item_key] = (
                                     _random_state_dict[item_key].clone().detach()
                                 )
+                            elif (
+                                _origin_state_dict[new_key].shape
+                                != _random_state_dict[item_key].shape
+                            ):
+                                # Shape mismatch (e.g. out_bias/out_std gain an
+                                # extra row for the latent-charge output of
+                                # dpa4_lr): keep random initialization; the
+                                # statistic-based bias adjustment below
+                                # recomputes them.
+                                log.warning(
+                                    "Key %s shape mismatch between pretrained "
+                                    "model %s and current model %s, keep random "
+                                    "initialization.",
+                                    new_key,
+                                    tuple(_origin_state_dict[new_key].shape),
+                                    tuple(_random_state_dict[item_key].shape),
+                                )
+                                _new_state_dict[item_key] = (
+                                    _random_state_dict[item_key].clone().detach()
+                                )
                             else:
                                 # print(f'Replace {item_key} with {new_key} in pretrained_model!')
                                 _new_state_dict[item_key] = (
