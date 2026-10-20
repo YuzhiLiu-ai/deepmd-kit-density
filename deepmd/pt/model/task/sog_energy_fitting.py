@@ -556,33 +556,9 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
                 f"which is not consistent with {self.dim_descrpt}."
             )
 
-        if self.numb_fparam > 0:
-            assert fparam is not None
-            assert self.fparam_avg is not None
-            assert self.fparam_inv_std is not None
-            fparam = fparam.view([nf, self.numb_fparam])
-            nb, _ = fparam.shape
-            t_fparam_avg = self._extend_f_avg_std(self.fparam_avg, nb)
-            t_fparam_inv_std = self._extend_f_avg_std(self.fparam_inv_std, nb)
-            fparam = (fparam - t_fparam_avg) * t_fparam_inv_std
-            fparam = torch.tile(fparam.reshape([nf, 1, -1]), [1, nloc, 1])
-            xx = torch.cat([xx, fparam], dim=-1)
-
-        if self.numb_aparam > 0 and not self.use_aparam_as_mask:
-            assert aparam is not None
-            assert self.aparam_avg is not None
-            assert self.aparam_inv_std is not None
-            aparam = aparam.view([nf, -1, self.numb_aparam])
-            nb, nloc, _ = aparam.shape
-            t_aparam_avg = self._extend_a_avg_std(self.aparam_avg, nb, nloc)
-            t_aparam_inv_std = self._extend_a_avg_std(self.aparam_inv_std, nb, nloc)
-            aparam = (aparam - t_aparam_avg) * t_aparam_inv_std
-            xx = torch.cat([xx, aparam], dim=-1)
-
-        if self.dim_case_embd > 0:
-            assert self.case_embd is not None
-            case_embd = torch.tile(self.case_embd.reshape([1, 1, -1]), [nf, nloc, 1])
-            xx = torch.cat([xx, case_embd], dim=-1)
+        cond = self.conditioning_columns(nf, nloc, fparam, aparam, self.case_embd)
+        if cond is not None:
+            xx = torch.cat([xx, cond], dim=-1)
 
         nf, nloc, _ = xx.shape
         lr_out = torch.zeros(
@@ -734,7 +710,9 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         h2: torch.Tensor | None = None,
         fparam: torch.Tensor | None = None,
         aparam: torch.Tensor | None = None,
+        vacuum_descriptor: torch.Tensor | None = None,
         return_atomic_feature: bool = False,
+        node_gate: torch.Tensor | None = None,
         latent: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -746,7 +724,9 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             h2,
             fparam,
             aparam,
+            vacuum_descriptor=vacuum_descriptor,
             return_atomic_feature=return_atomic_feature,
+            node_gate=node_gate,
         )
         result = {
             self.var_name: out[self.var_name].to(env.GLOBAL_PT_FLOAT_PRECISION),

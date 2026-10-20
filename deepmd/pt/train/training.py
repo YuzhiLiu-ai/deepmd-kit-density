@@ -2,6 +2,7 @@
 import functools
 import json
 import logging
+import time
 from collections.abc import (
     Callable,
     Generator,
@@ -28,6 +29,7 @@ from deepmd.dpmodel.train import (
     DEFAULT_TASK_KEY,
     CheckpointStore,
     ShardingPolicy,
+    TrainingMetricAccumulator,
     TrainingTimer,
     build_checkpoint_stores,
     change_model_out_bias,
@@ -36,13 +38,15 @@ from deepmd.dpmodel.train import (
 from deepmd.dpmodel.utils import (
     compute_total_numb_batch,
 )
+from deepmd.loggers import (
+    is_node_main_process,
+)
 from deepmd.loggers.training import (
     format_training_message,
     format_training_message_per_task,
     log_parameter_counts,
 )
 from deepmd.pt.loss import (
-    DenoiseLoss,
     DeNSLoss,
     DOSLoss,
     EnergyLatentLoss,
@@ -71,6 +75,9 @@ from deepmd.pt.optimizer import (
     KFOptimizerWrapper,
     LKFOptimizer,
 )
+from deepmd.pt.optimizer.hybrid_muon import (
+    adam_route_patterns,
+)
 from deepmd.pt.train.wrapper import (
     ModelWrapper,
 )
@@ -97,7 +104,8 @@ from deepmd.pt.utils.lmdb_dataset import (
 )
 from deepmd.pt.utils.stat import (
     make_stat_input,
-    min_pair_dist_frame_mask,
+    pair_margin_frame_mask,
+    scan_redu_stats,
     select_batch_frames,
 )
 from deepmd.pt.utils.utils import (
@@ -125,9 +133,13 @@ from deepmd.pt_expt.train.validation import (
 from deepmd.utils.data import (
     DataRequirementItem,
     has_data_requirement,
+    min_pair_dist_requirement,
 )
 from deepmd.utils.finetune import (
     warn_configuration_mismatch_during_finetune,
+)
+from deepmd.utils.out_stat import (
+    ReduStatScanner,
 )
 
 if torch.__version__.startswith("2"):
@@ -223,6 +235,7 @@ class Trainer:
         self.disp_file = training_params.get("disp_file", "lcurve.out")
         self.disp_freq = training_params.get("disp_freq", 1000)
         self.disp_avg = training_params.get("disp_avg", False)
+        self.metric_accumulator: TrainingMetricAccumulator | None = None
         self.save_ckpt = training_params.get("save_ckpt", "model.ckpt")
         self.save_freq = training_params.get("save_freq", 1000)
         self.enable_ema = bool(training_params.get("enable_ema", False))
@@ -395,6 +408,7 @@ class Trainer:
             _training_data: DpLoaderSet,
             _stat_file_spec: StatFileSpec,
             _min_pair_dist: float = 0.0,
+            _data_stat_full: bool = False,
             finetune_has_new_type: bool = False,
             preset_observed_type: list[str] | None = None,
         ) -> Callable[[], Any]:
@@ -407,6 +421,19 @@ class Trainer:
                     min_pair_dist=_min_pair_dist,
                 )
                 return sampled
+
+            if _data_stat_full:
+                # sampling a few batches per system can miss rare elements
+                # entirely; scan every frame for the output statistics instead
+                get_sample.redu_stat_scanner = ReduStatScanner(
+                    lambda ntypes, keys, intensive: scan_redu_stats(
+                        _training_data.dataloaders,
+                        ntypes,
+                        keys,
+                        intensive=intensive,
+                        min_pair_dist=_min_pair_dist,
+                    )
+                )
 
             if not has_initial_state or finetune_has_new_type:
 
@@ -494,25 +521,22 @@ class Trainer:
         )
 
         # Data
+        # Radius of the pair-clearance filter, per task.
+        self.min_pair_dist_by_task: dict[str, float] = {}
         if not self.multi_task:
             # add data requirement for labels
             data_requirement = self.loss.label_requirement
             data_requirement += get_additional_data_requirement(self.model)
-            min_pair_dist = float(
-                training_params.get("training_data", {}).get("min_pair_dist", 0.0)
+            pair_filter = min_pair_dist_requirement(
+                model_params,
+                float(
+                    training_params.get("training_data", {}).get("min_pair_dist", 0.0)
+                ),
             )
-            if min_pair_dist > 0.0:
-                data_requirement.append(
-                    DataRequirementItem(
-                        "min_pair_dist",
-                        ndof=1,
-                        atomic=False,
-                        must=False,
-                        high_prec=False,
-                        default=min_pair_dist,
-                        source_policy="derived",
-                    )
-                )
+            min_pair_dist = 0.0 if pair_filter is None else float(pair_filter.default)
+            self.min_pair_dist_by_task["Default"] = min_pair_dist
+            if pair_filter is not None:
+                data_requirement.append(pair_filter)
             training_data.add_data_requirement(data_requirement)
             if validation_data is not None:
                 validation_data.add_data_requirement(
@@ -529,6 +553,7 @@ class Trainer:
                 training_data,
                 self.stat_file_specs["Default"],
                 _min_pair_dist=min_pair_dist,
+                _data_stat_full=model_params.get("data_stat_full", False),
                 finetune_has_new_type=self.finetune_links["Default"].get_has_new_type()
                 if self.finetune_links is not None
                 else False,
@@ -575,23 +600,20 @@ class Trainer:
                 data_requirement += get_additional_data_requirement(
                     self.model[model_key]
                 )
-                min_pair_dist = float(
-                    training_params["data_dict"][model_key]
-                    .get("training_data", {})
-                    .get("min_pair_dist", 0.0)
+                pair_filter = min_pair_dist_requirement(
+                    model_params["model_dict"][model_key],
+                    float(
+                        training_params["data_dict"][model_key]
+                        .get("training_data", {})
+                        .get("min_pair_dist", 0.0)
+                    ),
                 )
-                if min_pair_dist > 0.0:
-                    data_requirement.append(
-                        DataRequirementItem(
-                            "min_pair_dist",
-                            ndof=1,
-                            atomic=False,
-                            must=False,
-                            high_prec=False,
-                            default=min_pair_dist,
-                            source_policy="derived",
-                        )
-                    )
+                min_pair_dist = (
+                    0.0 if pair_filter is None else float(pair_filter.default)
+                )
+                self.min_pair_dist_by_task[model_key] = min_pair_dist
+                if pair_filter is not None:
+                    data_requirement.append(pair_filter)
                 training_data[model_key].add_data_requirement(data_requirement)
                 if validation_data[model_key] is not None:
                     validation_data[model_key].add_data_requirement(
@@ -613,6 +635,9 @@ class Trainer:
                     training_data[model_key],
                     self.stat_file_specs[model_key],
                     _min_pair_dist=min_pair_dist,
+                    _data_stat_full=model_params["model_dict"][model_key].get(
+                        "data_stat_full", False
+                    ),
                     finetune_has_new_type=self.finetune_links[
                         model_key
                     ].get_has_new_type()
@@ -709,24 +734,12 @@ class Trainer:
         self.nonfinite_grad_guard = NonFiniteGradGuard()
         self.lr_schedule = get_lr(config["learning_rate"])
 
-        # Minimum pairwise distance for filtering unphysical frames during training.
-        if self.multi_task:
-            self.min_pair_dist: float | dict[str, float] = {
-                model_key: float(
-                    training_params["data_dict"][model_key]
-                    .get("training_data", {})
-                    .get("min_pair_dist", 0.0)
-                )
-                for model_key in self.model_keys
-            }
-        else:
-            self.min_pair_dist = float(
-                training_params.get("training_data", {}).get("min_pair_dist", 0.0)
-            )
-        self.has_min_pair_filter = (
-            any(value > 0.0 for value in self.min_pair_dist.values())
-            if isinstance(self.min_pair_dist, dict)
-            else self.min_pair_dist > 0.0
+        # Radius the pair-clearance filter was registered with. The
+        # filter reads it as an enable flag, the frames carrying a margin that
+        # is already measured against that radius. It is resolved once with the
+        # data requirement, so the two cannot disagree.
+        self.has_min_pair_filter = any(
+            value > 0.0 for value in self.min_pair_dist_by_task.values()
         )
         if self.has_min_pair_filter:
             if self.multi_task:
@@ -949,10 +962,9 @@ class Trainer:
                 for model_key in self.model_keys:
                     finetune_rule = self.finetune_links[model_key]
                     if self.multi_task and finetune_rule.get_resuming():
-                        if self.rank == 0:
-                            log.info("Model branch %s will resume training.", model_key)
+                        log.info("Model branch %s will resume training.", model_key)
                         continue
-                    if self.multi_task and self.rank == 0:
+                    if self.multi_task:
                         log.info(
                             "Model branch %s will be fine-tuned. "
                             "This may take a long time...",
@@ -1074,10 +1086,22 @@ class Trainer:
                 self.wrapper = fully_shard(self.wrapper, reshard_after_forward=reshard)
             else:
                 # zero_stage=0 or 1: standard DDP (ZeRO-1 will wrap the optimizer)
+                #
+                # ``find_unused_parameters`` makes the reducer traverse the
+                # autograd graph on every iteration to find parameters that
+                # produced no gradient bucket, which it would otherwise wait
+                # for forever. Multi-task needs it, because a step uses one
+                # fitting net and leaves the others out of the graph. A
+                # single-task step reaches every parameter (an all-zero
+                # gradient still produces a bucket), so the traversal is pure
+                # overhead there. A configuration that did leave a parameter
+                # out of the graph would hang the reducer rather than fail, so
+                # an optional branch added later has to be checked against
+                # this assumption before it ships.
                 self.wrapper = DDP(
                     self.wrapper,
                     device_ids=[LOCAL_RANK],
-                    find_unused_parameters=True,
+                    find_unused_parameters=self.multi_task,
                     output_device=LOCAL_RANK,
                 )
 
@@ -1121,6 +1145,9 @@ class Trainer:
                     "enable_gram": bool(self.opt_param.get("enable_gram")),
                     "flash_muon": bool(self.opt_param.get("flash_muon")),
                     "magma_muon": bool(self.opt_param.get("magma_muon")),
+                    "adam_patterns": adam_route_patterns(
+                        self._get_inner_module().model.values()
+                    ),
                     # FSDP2 shards parameters as DTensor; several torch._foreach_*
                     # ops lack DTensor sharding propagation on older PyTorch, so
                     # fall back to the per-tensor path under zero_stage >= 2.
@@ -1156,7 +1183,7 @@ class Trainer:
                 state=ema_state_dict,
             )
 
-        if self.sharding.enabled and self.rank == 0:
+        if self.sharding.enabled:
             log.info(self.sharding.describe())
 
         # Tensorboard
@@ -1172,7 +1199,7 @@ class Trainer:
         )
 
         # Log model parameter count
-        if self.rank == 0:
+        if is_node_main_process(self.rank):
             self._log_parameter_count()
 
     def _run_stat_on_chief(
@@ -1346,12 +1373,83 @@ class Trainer:
         else:
             self.optimizer.load_state_dict(optimizer_state_dict)
 
+    def _precompile_outside_collectives(self) -> None:
+        """Trigger every training-graph compilation before the first collective.
+
+        The first optimization step both compiles the model and joins the
+        first gradient all-reduce. Compilation of the larger configurations
+        runs for tens of minutes with unbounded variance across ranks (GEMM
+        autotuning benchmarks on each rank's own device), so a rank still
+        compiling while its peers sit in that all-reduce trips the NCCL
+        watchdog and aborts the job. One forward and backward per task on the
+        *inner* module therefore runs first: the compiled artifacts are keyed
+        by the module and its input shapes, so warming them there is what the
+        optimization step reuses. ``torch.autograd.grad`` compiles the same
+        backward without accumulating parameter gradients; the reducer hooks
+        attached to ``AccumulateGrad`` therefore remain dormant. A rendezvous
+        store barrier (which has no watchdog) then aligns the ranks before the
+        first real step.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if not isinstance(self.wrapper, DDP):
+            return
+        if self.opt_type not in ("Adam", "AdamW", "AdaMuon", "HybridMuon"):
+            return
+        inner = self._get_inner_module()
+        if not any(getattr(module, "use_compile", False) for module in inner.modules()):
+            return
+        log.info(
+            "Compiling training graphs before the first collective.",
+            extra={"rank_scope": "all"},
+        )
+        start = time.time()
+        trainable_parameters = tuple(
+            parameter for parameter in inner.parameters() if parameter.requires_grad
+        )
+        for task_key in self.model_keys if self.multi_task else ["Default"]:
+            input_dict, label_dict, _ = self._next_training_batch(task_key)
+            _, loss, _ = inner(
+                **input_dict,
+                cur_lr=self.lr_schedule.value(0),
+                label=label_dict,
+                task_key=task_key,
+            )
+            torch.autograd.grad(loss, trainable_parameters, allow_unused=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        log.info(
+            "Training graphs ready in %.1f s; waiting for the other ranks.",
+            time.time() - start,
+            extra={"rank_scope": "all"},
+        )
+        store = dist.distributed_c10d._get_default_store()
+        key = "deepmd/precompile_ready"
+        world_size = dist.get_world_size()
+        ready = int(store.add(key, 1))
+        while ready < world_size:
+            time.sleep(2)
+            ready = int(store.add(key, 0))
+        log.info("All %d ranks compiled; entering the optimization loop.", world_size)
+
     def run(self) -> None:
         """Run training and release asynchronous data pipelines."""
         try:
             self._run()
         finally:
             self._close_lmdb_loaders()
+
+    def _training_results(
+        self, more_loss: dict[str, Any], task_key: str = "Default"
+    ) -> dict[str, Any]:
+        """Return interval averages or the current step's display metrics."""
+        if self.metric_accumulator is not None:
+            return self.metric_accumulator.average(task_key)
+        return {
+            name: value
+            for name, value in sorted(more_loss.items())
+            if "l2_" not in name
+        }
 
     def _run(self) -> None:
         """Execute the PyTorch optimization loop."""
@@ -1368,8 +1466,7 @@ class Trainer:
             record_file = f"Sample_rank_{self.rank}.txt"
             fout1 = open(record_file, mode="w", buffering=1)
         log.info("Start to train %d steps.", self.num_steps)
-        if dist.is_available() and dist.is_initialized():
-            log.info(f"Rank: {dist.get_rank()}/{dist.get_world_size()}")
+        self._precompile_outside_collectives()
         if self.enable_tensorboard:
             from torch.utils.tensorboard import (
                 SummaryWriter,
@@ -1486,112 +1583,27 @@ class Trainer:
                         int(input_dict["atype"].shape[-1]),
                         learning_rate=pref_lr,
                     )
-                elif isinstance(self.loss, DenoiseLoss):
-                    KFOptWrapper = KFOptimizerWrapper(
-                        self.wrapper,
-                        self.optimizer,
-                        24,
-                        6,
-                        dist.is_available() and dist.is_initialized(),
-                    )
-                    module = (
-                        self.wrapper.module
-                        if dist.is_available() and dist.is_initialized()
-                        else self.wrapper
-                    )
-                    model_pred = KFOptWrapper.update_denoise_coord(
-                        input_dict,
-                        label_dict["clean_coord"],
-                        1,
-                        module.loss[task_key].mask_loss_coord,
-                        label_dict["coord_mask"],
-                    )
-                    loss, more_loss = module.loss[task_key](
-                        model_pred,
-                        label_dict,
-                        input_dict["natoms"],
-                        learning_rate=pref_lr,
-                    )
             else:
                 raise ValueError(f"Not supported optimizer type '{self.opt_type}'")
 
             if self.model_ema is not None:
                 self.model_ema.update(self.model)
 
-            if self.disp_avg:
-                # Accumulate loss for averaging over display interval
-                self.step_count_in_interval += 1
-                if not self.multi_task:
-                    # Accumulate loss for single task
-                    if not self.train_loss_accu:
-                        # Initialize accumulator with current loss structure
-                        for item in more_loss:
-                            if "l2_" not in item:
-                                self.train_loss_accu[item] = 0.0
-                    for item in more_loss:
-                        if "l2_" not in item:
-                            if item not in self.train_loss_accu:
-                                self.train_loss_accu[item] = 0.0
-                            self.train_loss_accu[item] += more_loss[item]
-                else:
-                    # Accumulate loss for multi-task
-                    if task_key not in self.train_loss_accu:
-                        self.train_loss_accu[task_key] = {}
-                    if task_key not in self.step_count_per_task:
-                        self.step_count_per_task[task_key] = 0
-                    self.step_count_per_task[task_key] += 1
-
-                    for item in more_loss:
-                        if "l2_" not in item:
-                            if item not in self.train_loss_accu[task_key]:
-                                self.train_loss_accu[task_key][item] = 0.0
-                            self.train_loss_accu[task_key][item] += more_loss[item]
+            if self.metric_accumulator is not None:
+                self.metric_accumulator.add(
+                    task_key,
+                    {
+                        name: value.detach() if torch.is_tensor(value) else value
+                        for name, value in more_loss.items()
+                        if "l2_" not in name
+                    },
+                )
 
             # Log and persist
             if self.display_in_training and (
                 display_step_id % self.disp_freq == 0 or display_step_id == 1
             ):
                 self.wrapper.eval()  # Will set to train mode before fininshing validation
-
-                if self.disp_avg:
-
-                    def log_loss_train(
-                        _loss: Any, _more_loss: Any, _task_key: str = "Default"
-                    ) -> dict:
-                        results = {}
-                        if not self.multi_task:
-                            # Use accumulated average loss for single task
-                            for item in self.train_loss_accu:
-                                results[item] = (
-                                    self.train_loss_accu[item]
-                                    / self.step_count_in_interval
-                                )
-                        else:
-                            # Use accumulated average loss for multi-task
-                            if (
-                                _task_key in self.train_loss_accu
-                                and _task_key in self.step_count_per_task
-                            ):
-                                for item in self.train_loss_accu[_task_key]:
-                                    results[item] = (
-                                        self.train_loss_accu[_task_key][item]
-                                        / self.step_count_per_task[_task_key]
-                                    )
-                        return results
-                else:
-
-                    def log_loss_train(
-                        _loss: Any, _more_loss: Any, _task_key: str = "Default"
-                    ) -> dict:
-                        results = {}
-                        rmse_val = {
-                            item: _more_loss[item]
-                            for item in _more_loss
-                            if "l2_" not in item
-                        }
-                        for item in sorted(rmse_val.keys()):
-                            results[item] = rmse_val[item]
-                        return results
 
                 def log_loss_valid(_task_key: str = "Default") -> dict:
                     single_results = {}
@@ -1608,7 +1620,16 @@ class Trainer:
                         if input_dict == {}:
                             # no validation data
                             return {}
-                        _, loss, more_loss = self.wrapper(
+                        # Validation runs the inner module, not the DDP
+                        # wrapper. A DDP forward under grad mode arms the
+                        # reducer for an all-reduce that this loop never
+                        # triggers, because it computes metrics and never
+                        # calls backward; the next real forward then aborts
+                        # with "expected to have finished reduction in the
+                        # prior iteration". Grad mode itself cannot be
+                        # dropped -- the force metrics differentiate the
+                        # energy with respect to the coordinates.
+                        _, loss, more_loss = self._get_inner_module()(
                             **input_dict,
                             cur_lr=pref_lr,
                             label=label_dict,
@@ -1630,7 +1651,7 @@ class Trainer:
                     return results
 
                 if not self.multi_task:
-                    train_results = log_loss_train(loss, more_loss)
+                    train_results = self._training_results(more_loss)
                     valid_results = log_loss_valid()
                     if self.rank == 0:
                         log.info(
@@ -1653,15 +1674,14 @@ class Trainer:
                 else:
                     train_results = {_key: {} for _key in self.model_keys}
                     valid_results = {_key: {} for _key in self.model_keys}
-                    if self.disp_avg:
-                        # For multi-task, use accumulated average loss for all tasks
+                    if self.metric_accumulator is not None:
                         for _key in self.model_keys:
-                            train_results[_key] = log_loss_train(
-                                loss, more_loss, _task_key=_key
+                            train_results[_key] = self._training_results(
+                                more_loss, task_key=_key
                             )
                     else:
-                        train_results[task_key] = log_loss_train(
-                            loss, more_loss, _task_key=task_key
+                        train_results[task_key] = self._training_results(
+                            more_loss, task_key=task_key
                         )
                         for _key in self.model_keys:
                             if _key != task_key:
@@ -1679,52 +1699,42 @@ class Trainer:
                                         label=label_dict,
                                         task_key=_key,
                                     )
-                                    train_results[_key] = log_loss_train(
-                                        loss, more_loss, _task_key=_key
+                                    train_results[_key] = self._training_results(
+                                        more_loss, task_key=_key
                                     )
-                            valid_results[_key] = log_loss_valid(_task_key=_key)
-                            if not train_results[_key] and valid_results[_key]:
-                                train_results[_key] = dict.fromkeys(
-                                    valid_results[_key],
-                                    float("nan"),
+                    for _key in self.model_keys:
+                        valid_results[_key] = log_loss_valid(_task_key=_key)
+                        if not train_results[_key] and valid_results[_key]:
+                            train_results[_key] = dict.fromkeys(
+                                valid_results[_key],
+                                float("nan"),
+                            )
+                        if self.rank == 0:
+                            log.info(
+                                format_training_message_per_task(
+                                    batch=display_step_id,
+                                    task_name=_key + "_trn",
+                                    rmse=train_results[_key],
+                                    learning_rate=cur_lr,
+                                    check_total_rmse_nan=not (
+                                        self.metric_accumulator is not None
+                                        and self.metric_accumulator.count(_key) == 0
+                                    ),
                                 )
-                            if self.rank == 0:
+                            )
+                            if valid_results[_key]:
                                 log.info(
                                     format_training_message_per_task(
                                         batch=display_step_id,
-                                        task_name=_key + "_trn",
-                                        rmse=train_results[_key],
-                                        learning_rate=cur_lr,
+                                        task_name=_key + "_val",
+                                        rmse=valid_results[_key],
+                                        learning_rate=None,
                                     )
                                 )
-                                if valid_results[_key]:
-                                    log.info(
-                                        format_training_message_per_task(
-                                            batch=display_step_id,
-                                            task_name=_key + "_val",
-                                            rmse=valid_results[_key],
-                                            learning_rate=None,
-                                        )
-                                    )
                 self.wrapper.train()
 
-                if self.disp_avg:
-                    # Reset loss accumulators after display
-                    if not self.multi_task:
-                        for item in self.train_loss_accu:
-                            self.train_loss_accu[item] = 0.0
-                    else:
-                        for task_key in self.model_keys:
-                            # Clear the dict instead of zeroing values: a task
-                            # not sampled within the display interval must have
-                            # an empty accumulator, so that log_loss_train
-                            # skips it instead of dividing by a zero count.
-                            if task_key in self.train_loss_accu:
-                                self.train_loss_accu[task_key] = {}
-                            if task_key in self.step_count_per_task:
-                                self.step_count_per_task[task_key] = 0
-                    self.step_count_in_interval = 0
-                    self.last_display_step = display_step_id
+                if self.metric_accumulator is not None:
+                    self.metric_accumulator.reset()
 
                 interval = self.step_timer.record(display_step_id)
                 if self.rank == 0 and self.timing_in_training:
@@ -1841,15 +1851,14 @@ class Trainer:
         )
         self._discarded_training_batches = 0
 
-        if self.disp_avg:
-            # Initialize loss accumulators
-            if not self.multi_task:
-                self.train_loss_accu = {}
-            else:
-                self.train_loss_accu = {key: {} for key in self.model_keys}
-                self.step_count_per_task = dict.fromkeys(self.model_keys, 0)
-            self.step_count_in_interval = 0
-            self.last_display_step = 0
+        losses = self.loss if self.multi_task else {"Default": self.loss}
+        self.metric_accumulator = (
+            TrainingMetricAccumulator(
+                {key: loss.training_metric_names for key, loss in losses.items()}
+            )
+            if self.disp_avg
+            else None
+        )
 
         for step_id in range(self.start_step, self.num_steps):
             step(step_id)
@@ -2163,12 +2172,6 @@ class Trainer:
             use_ema_weights=True,
         )
 
-    def _get_min_pair_dist(self, task_key: str) -> float:
-        """Return the minimum pair distance configured for one task."""
-        if isinstance(self.min_pair_dist, dict):
-            return self.min_pair_dist[task_key]
-        return self.min_pair_dist
-
     def _next_training_batch(
         self,
         task_key: str,
@@ -2209,8 +2212,12 @@ class Trainer:
 
         raise RuntimeError(
             "Unable to collect a globally valid training batch for task "
-            f"{task_key!r} after {max_attempts} attempts with "
-            f"min_pair_dist={self._get_min_pair_dist(task_key)}."
+            f"{task_key!r} after {max_attempts} attempts: no frame keeps every "
+            "atom pair beyond the frame-filter radius. A bridged model filters at "
+            "the midpoint of its bridging window, so lower "
+            "`bridging_fraction_inner` or `bridging_fraction_outer` there, or "
+            "`training_data.min_pair_dist` on any other model, or clean the "
+            "dataset."
         )
 
     def get_data(
@@ -2226,10 +2233,8 @@ class Trainer:
             return {}, {}, {}
         batch_data = next(iterator)
         # === Filter frames with atoms too close (training only) ===
-        min_pair_dist = self._get_min_pair_dist(task_key)
-        valid_mask = (
-            min_pair_dist_frame_mask(batch_data, min_pair_dist) if is_train else None
-        )
+        filter_enabled = is_train and self.min_pair_dist_by_task[task_key] > 0.0
+        valid_mask = pair_margin_frame_mask(batch_data, filter_enabled)
         local_has_valid = valid_mask is None or bool(torch.any(valid_mask))
         if not local_has_valid:
             return {}, {}, {}
@@ -2351,9 +2356,35 @@ class Trainer:
         fout.flush()
 
 
+#: The world a validity group was drawn from, paired with that group. The flag
+#: is a host value and its answer gates host control flow, so reducing it over a
+#: CPU backend keeps it off the accelerator and out of its execution stream,
+#: where reading it back would drain the pipeline once per step.
+_VALIDITY_GROUP: tuple[Any, Any] | None = None
+
+
+def _validity_group() -> Any:
+    """Return the CPU process group used for the frame-validity agreement.
+
+    The group belongs to the world it was drawn from, so it is retained under
+    that world and rebuilt when a process enters a new one.
+    """
+    global _VALIDITY_GROUP
+    world = dist.group.WORLD
+    if _VALIDITY_GROUP is None or _VALIDITY_GROUP[0] is not world:
+        group = (
+            world if dist.get_backend() == "gloo" else dist.new_group(backend="gloo")
+        )
+        _VALIDITY_GROUP = (world, group)
+    return _VALIDITY_GROUP[1]
+
+
 def all_ranks_have_valid_frames(local_has_valid: bool) -> bool:
     """
     Return whether every distributed rank has a valid training frame.
+
+    The agreement travels over the CPU process group of :func:`_validity_group`,
+    so the flag it reduces lives on the host whatever device the model trains on.
 
     Parameters
     ----------
@@ -2366,11 +2397,9 @@ def all_ranks_have_valid_frames(local_has_valid: bool) -> bool:
         ``True`` only when every rank reports a valid frame.
     """
     all_ranks_have_valid = torch.tensor(
-        int(local_has_valid),
-        dtype=torch.int32,
-        device=DEVICE,
+        int(local_has_valid), dtype=torch.int32, device="cpu"
     )
-    dist.all_reduce(all_ranks_have_valid, op=dist.ReduceOp.MIN)
+    dist.all_reduce(all_ranks_have_valid, op=dist.ReduceOp.MIN, group=_validity_group())
     return bool(all_ranks_have_valid.item())
 
 
@@ -2517,9 +2546,6 @@ def get_loss(
     elif loss_type == "ener_spin":
         loss_params["starter_learning_rate"] = start_lr
         return EnergySpinLoss(**loss_params)
-    elif loss_type == "denoise":
-        loss_params["ntypes"] = _ntypes
-        return DenoiseLoss(**loss_params)
     elif loss_type == "tensor":
         model_output_type = _model.model_output_type()
         if "mask" in model_output_type:

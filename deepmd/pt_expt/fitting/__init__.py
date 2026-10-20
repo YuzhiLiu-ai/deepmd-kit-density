@@ -26,6 +26,9 @@ from .polarizability_fitting import (
 from .property_fitting import (
     PropertyFittingNet,
 )
+from .unimol_pretrain import (
+    UniMolPretrainFitting,
+)
 
 __all__ = [
     "BaseFitting",
@@ -37,4 +40,5 @@ __all__ = [
     "PolarFitting",
     "PropertyFittingNet",
     "SeZMEnergyFittingNet",
+    "UniMolPretrainFitting",
 ]
