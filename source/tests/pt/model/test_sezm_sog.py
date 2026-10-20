@@ -2,12 +2,21 @@
 """Tests for the SeZM/DPA4 SOG-LES long-range model (non-periodic)."""
 
 import math
+import os
+import shutil
+import tempfile
 import unittest
+from pathlib import (
+    Path,
+)
 
 import numpy as np
 import torch
 from packaging.version import parse as parse_version
 
+from deepmd.pt.entrypoints.main import (
+    get_trainer,
+)
 from deepmd.pt.loss import (
     EnergyLatentLoss,
 )
@@ -29,6 +38,9 @@ from deepmd.pt.utils import (
 )
 from deepmd.pt.utils.compile_compat import (
     SUPPORTED_COMPILE_TORCH,
+)
+from deepmd.pt.utils.finetune import (
+    get_finetune_rules,
 )
 
 _SQRT_PI = math.sqrt(math.pi)
@@ -1113,6 +1125,123 @@ class TestSeZMSOGModelCompile(unittest.TestCase):
                 atol=1e-11,
                 err_msg=f"[explicit-cs] eval {key}",
             )
+
+
+class TestSeZMSOGFinetune(unittest.TestCase):
+    """Finetuning a short-range DPA4 checkpoint into a ``dpa4_lr`` model.
+
+    The descriptor and short-range ener-fitting weights must be inherited
+    from the pretrained checkpoint, while the long-range-only parameters
+    (absent from the checkpoint) keep their random initialization.
+    """
+
+    def setUp(self) -> None:
+        self.cwd = os.getcwd()
+        self.tmpdir = tempfile.mkdtemp()
+        os.chdir(self.tmpdir)
+        rng = np.random.default_rng(2024)
+        nf, natom = 4, 6
+        sys_dir = Path("data/sys")
+        (sys_dir / "set.000").mkdir(parents=True)
+        (sys_dir / "nopbc").touch()
+        np.savetxt(sys_dir / "type.raw", np.array([0, 0, 0, 1, 1, 1]), fmt="%d")
+        np.save(sys_dir / "set.000/coord.npy", rng.random((nf, natom * 3)) * 3.0)
+        np.save(sys_dir / "set.000/energy.npy", rng.random(nf))
+        np.save(sys_dir / "set.000/force.npy", rng.random((nf, natom * 3)))
+
+    def tearDown(self) -> None:
+        os.chdir(self.cwd)
+        shutil.rmtree(self.tmpdir)
+
+    @staticmethod
+    def _descriptor_params() -> dict:
+        return {
+            "type": "dpa4",
+            "sel": 6,
+            "rcut": 4.0,
+            "channels": 8,
+            "n_radial": 4,
+            "lmax": 2,
+            "mmax": 1,
+            "n_blocks": 2,
+            "so2_layers": 1,
+            "n_atten_head": 1,
+            "use_amp": False,
+            "seed": 7,
+        }
+
+    @staticmethod
+    def _config(model_params: dict) -> dict:
+        return {
+            "model": model_params,
+            "learning_rate": {
+                "type": "exp",
+                "decay_steps": 100,
+                "start_lr": 1e-3,
+                "stop_lr": 1e-4,
+            },
+            "loss": {
+                "type": "ener",
+                "start_pref_e": 1.0,
+                "limit_pref_e": 1.0,
+                "start_pref_f": 1.0,
+                "limit_pref_f": 1.0,
+                "start_pref_v": 0.0,
+                "limit_pref_v": 0.0,
+            },
+            "training": {
+                "training_data": {"systems": ["data/sys"], "batch_size": 1},
+                "numb_steps": 1,
+                "seed": 10,
+                "save_freq": 1,
+                "disp_freq": 1,
+                "save_ckpt": "model",
+            },
+        }
+
+    def test_finetune_from_short_range_dpa4(self) -> None:
+        sr_model_params = {
+            "type": "dpa4",
+            "type_map": ["A", "B"],
+            "descriptor": self._descriptor_params(),
+            "fitting_net": {"type": "dpa4_ener", "neuron": [16], "seed": 7},
+        }
+        trainer_sr = get_trainer(self._config(sr_model_params))
+        trainer_sr.run()
+        finetune_model = "model.pt"  # training.save_ckpt + ".pt"
+
+        lr_model_params = {
+            "type": "dpa4_lr",
+            "type_map": ["A", "B"],
+            "descriptor": self._descriptor_params(),
+            "fitting_net": {
+                "type": "sog_energy",
+                "neuron": [16],
+                "neuron_lr": [8],
+                "lr_kernel": "les",
+                "seed": 7,
+            },
+        }
+        lr_model_params, finetune_links = get_finetune_rules(
+            finetune_model, lr_model_params
+        )
+        trainer_lr = get_trainer(
+            self._config(lr_model_params),
+            finetune_model=finetune_model,
+            finetune_links=finetune_links,
+        )
+
+        sr_state = trainer_sr.model.state_dict()
+        lr_state = trainer_lr.model.state_dict()
+        lr_only_keys = [k for k in lr_state if k not in sr_state]
+        # The long-range branch exists only in the new model.
+        self.assertTrue(any("filter_layers_lr" in k for k in lr_only_keys))
+        # Every shared entry is inherited from the pretrained checkpoint,
+        # except the out bias, which may be re-adjusted by statistic.
+        for key, value in lr_state.items():
+            if key not in sr_state or "out_bias" in key:
+                continue
+            torch.testing.assert_close(value, sr_state[key])
 
 
 if __name__ == "__main__":

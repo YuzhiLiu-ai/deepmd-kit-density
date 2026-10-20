@@ -884,9 +884,16 @@ class Trainer:
                                 elif ".models.1." in new_key:
                                     use_random_initialization = True
                                 else:
-                                    raise KeyError(
-                                        f"Key {new_key} not found in pretrained model."
+                                    # Parameters that only exist in the new
+                                    # model (e.g. the long-range branch of
+                                    # dpa4_lr finetuned from a short-range
+                                    # model) keep their random initialization.
+                                    log.warning(
+                                        "Key %s not found in pretrained model, "
+                                        "keep random initialization.",
+                                        new_key,
                                     )
+                                    use_random_initialization = True
                             if use_random_initialization:
                                 # print(f'Keep {item_key} in old model!')
                                 _new_state_dict[item_key] = (
