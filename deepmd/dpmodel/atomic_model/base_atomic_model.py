@@ -221,6 +221,44 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
         """
         return None
 
+    def has_long_range(self) -> bool:
+        """Whether this atomic model carries a long-range plugin."""
+        return False
+
+    def required_topologies(self) -> tuple[str, ...]:
+        """Names of topologies required beside the short-range neighbor graph."""
+        return ()
+
+    def topology_params(self) -> dict[str, dict[str, Any]]:
+        """Build parameters for :meth:`required_topologies`, by name."""
+        return {}
+
+    def build_topologies(
+        self,
+        coord: Any,
+        n_node: Any,
+        box: Any,
+        *,
+        atype: Any,
+        node_mask: Any = None,
+        pair_excl: Any = None,
+    ) -> dict[str, Any]:
+        """Build the declared topologies outside the compiled graph."""
+        from deepmd.dpmodel.utils.neighbor_graph import (
+            build_topologies,
+        )
+
+        return build_topologies(
+            self.required_topologies(),
+            coord,
+            n_node,
+            box,
+            node_mask,
+            atype=atype,
+            pair_excl=pair_excl,
+            topology_params=self.topology_params(),
+        )
+
     def supports_native_spin(self) -> bool:
         """Returns whether this atomic model consumes a per-atom spin input.
 

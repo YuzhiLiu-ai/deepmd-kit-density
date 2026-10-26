@@ -24,6 +24,9 @@ from deepmd.dpmodel.descriptor.base_descriptor import (
 from deepmd.dpmodel.fitting.base_fitting import (
     BaseFitting,
 )
+from deepmd.dpmodel.long_range import (
+    BaseLongRange,
+)
 from deepmd.dpmodel.output_def import (
     FittingOutputDef,
 )
@@ -121,12 +124,14 @@ class DPAtomicModel(BaseAtomicModel):
         descriptor: BaseDescriptor,
         fitting: BaseFitting,
         type_map: list[str],
+        long_range: BaseLongRange | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(type_map, **kwargs)
         self.descriptor = descriptor
         self.fitting_net = fitting
         self.fitting_net.reinit_exclude(self.atom_exclude_types)
+        self.long_range = long_range
         self.type_map = type_map
         self.add_chg_spin_ebd: bool = self.descriptor.has_chg_spin_ebd()
         # Structural capability: only descriptors with a native spin
@@ -216,6 +221,22 @@ class DPAtomicModel(BaseAtomicModel):
     def fused_decomposition(self) -> "tuple[DPAtomicModel, None]":
         """A descriptor-fitting model is its own learned part."""
         return self, None
+
+    def has_long_range(self) -> bool:
+        """Whether a long-range plugin is attached to this atomic model."""
+        return self.long_range is not None
+
+    def required_topologies(self) -> tuple[str, ...]:
+        """Topologies declared by the optional long-range plugin."""
+        if self.long_range is None:
+            return ()
+        return self.long_range.required_topologies()
+
+    def topology_params(self) -> dict[str, dict[str, Any]]:
+        """Build parameters declared by the optional long-range plugin."""
+        if self.long_range is None:
+            return {}
+        return self.long_range.topology_params()
 
     def has_message_passing_across_ranks(self) -> bool:
         """Delegates to this model's own descriptor."""
@@ -358,6 +379,10 @@ class DPAtomicModel(BaseAtomicModel):
             the result dict, defined by the `FittingOutputDef`.
 
         """
+        if self.long_range is not None:
+            raise NotImplementedError(
+                "the long-range plugin skeleton does not implement forward evaluation"
+            )
         nframes, nloc, nnei = nlist.shape
         atype = xp_take_first_n(extended_atype, 1, nloc)
 
@@ -611,6 +636,10 @@ class DPAtomicModel(BaseAtomicModel):
             the result dict on the flat node axis, defined by the `FittingOutputDef`.
 
         """
+        if self.long_range is not None:
+            raise NotImplementedError(
+                "the long-range plugin skeleton does not implement forward evaluation"
+            )
         from deepmd.dpmodel.utils.neighbor_graph import (
             frame_id_from_n_node,
         )
@@ -785,6 +814,9 @@ class DPAtomicModel(BaseAtomicModel):
                 "fitting": self.fitting_net.serialize(),
             }
         )
+        if self.long_range is not None:
+            dd["@version"] = 3
+            dd["long_range"] = self.long_range.serialize()
         return dd
 
     # for subclass overridden
@@ -792,17 +824,27 @@ class DPAtomicModel(BaseAtomicModel):
     """The base descriptor class."""
     base_fitting_cls = BaseFitting
     """The base fitting class."""
+    base_long_range_cls: type | None = BaseLongRange
+    """The backend long-range registry; ``None`` when unsupported."""
 
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> "DPAtomicModel":
         data = data.copy()
-        check_version_compatibility(data.pop("@version", 1), 2, 2)
+        check_version_compatibility(data.pop("@version", 1), 3, 2)
         data.pop("@class")
         data.pop("type")
         descriptor_obj = cls.base_descriptor_cls.deserialize(data.pop("descriptor"))
         fitting_obj = cls.base_fitting_cls.deserialize(data.pop("fitting"))
         data["descriptor"] = descriptor_obj
         data["fitting"] = fitting_obj
+        long_range = data.pop("long_range", None)
+        if long_range is not None:
+            if cls.base_long_range_cls is None:
+                raise NotImplementedError(
+                    "this backend cannot evaluate the long-range module of the "
+                    "model record"
+                )
+            data["long_range"] = cls.base_long_range_cls.deserialize(long_range)
         obj = super().deserialize(data)
         return obj
 

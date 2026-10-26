@@ -5,6 +5,8 @@ torch-only. The pure-array scatter (edge_force_virial) is shared with dpmodel;
 this module supplies the single backward pass that produces g_e = dE/d(edge_vec).
 """
 
+import dataclasses
+
 import torch
 
 from deepmd.dpmodel import (
@@ -19,7 +21,10 @@ from deepmd.dpmodel.output_def import (
     get_deriv_name_mag,
 )
 from deepmd.dpmodel.utils.neighbor_graph import (
+    KGrid,
+    MeshGrid,
     NeighborGraph,
+    PairGraph,
     edge_force_virial,
     frame_id_from_n_node,
     segment_sum,
@@ -42,6 +47,26 @@ from deepmd.pt_expt.kernels.utils import (
     triton_infer_level,
     use_cutile_infer,
 )
+
+
+def releaf_topologies(
+    topologies: dict[str, PairGraph | KGrid | MeshGrid],
+) -> dict[str, PairGraph | KGrid | MeshGrid]:
+    """Make declared topology geometry fields independent autograd leaves.
+
+    Callers should invoke this at the graph-input boundary, before tracing.
+    The helper is intentionally not wired into the existing short-range lower.
+    """
+    return {
+        name: dataclasses.replace(
+            topology,
+            **{
+                leaf: getattr(topology, leaf).detach().requires_grad_(True)
+                for leaf in topology.LEAVES
+            },
+        )
+        for name, topology in topologies.items()
+    }
 
 
 def edge_energy_deriv(

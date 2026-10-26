@@ -65,6 +65,32 @@ def get_model_components(
     return descriptor, fitting, fitting_type
 
 
+def get_long_range(
+    data: dict,
+    descriptor: Any,
+    fitting: Any,
+    *,
+    long_range_base: type | None,
+    backend_name: str,
+) -> Any | None:
+    """Construct the optional long-range plugin through the backend registry."""
+    config = data.get("long_range")
+    if config is None:
+        return None
+    if long_range_base is None:
+        raise NotImplementedError(
+            f"long-range modules are not supported in the {backend_name} backend"
+        )
+    config = copy.deepcopy(config)
+    long_range_cls = long_range_base.get_class_by_type(config.pop("type"))
+    return long_range_cls.from_config(
+        config,
+        descriptor,
+        fitting,
+        fitting_seed=data.get("fitting_net", {}).get("seed"),
+    )
+
+
 def get_standard_model(
     data: dict,
     *,
@@ -72,6 +98,7 @@ def get_standard_model(
     fitting_base: type,
     model_base: type,
     backend_name: str,
+    long_range_base: type | None = None,
 ) -> Any:
     """Construct a standard model through backend registries."""
     descriptor, fitting, fitting_type = get_model_components(
@@ -82,6 +109,13 @@ def get_standard_model(
     )
     model_type = "ener" if fitting_type == "direct_force_ener" else fitting_type
     model_cls = model_base.get_class_by_type(model_type)
+    long_range = get_long_range(
+        data,
+        descriptor,
+        fitting,
+        long_range_base=long_range_base,
+        backend_name=backend_name,
+    )
     return model_cls(
         descriptor=descriptor,
         fitting=fitting,
@@ -89,6 +123,7 @@ def get_standard_model(
         atom_exclude_types=data.get("atom_exclude_types", []),
         pair_exclude_types=data.get("pair_exclude_types", []),
         preset_out_bias=data.get("preset_out_bias"),
+        **({} if long_range is None else {"long_range": long_range}),
     )
 
 
@@ -467,6 +502,7 @@ class BackendModelFactory:
         pairtab_model: type | None = None,
         zbl_model: type | None = None,
         linear_atomic_model: type | None = None,
+        long_range_base: type | None = None,
     ) -> None:
         """Store backend-native classes used by all model construction paths."""
         self.descriptor_base = descriptor_base
@@ -477,6 +513,7 @@ class BackendModelFactory:
         self.pairtab_model = pairtab_model
         self.zbl_model = zbl_model
         self.linear_atomic_model = linear_atomic_model
+        self.long_range_base = long_range_base
 
     def get_model_components(self, data: dict) -> tuple[Any, Any, str]:
         """Construct descriptor and fitting objects for this backend."""
@@ -484,6 +521,16 @@ class BackendModelFactory:
             data,
             descriptor_base=self.descriptor_base,
             fitting_base=self.fitting_base,
+            backend_name=self.backend_name,
+        )
+
+    def get_long_range(self, data: dict, descriptor: Any, fitting: Any) -> Any | None:
+        """Construct an optional long-range plugin for this backend."""
+        return get_long_range(
+            data,
+            descriptor,
+            fitting,
+            long_range_base=self.long_range_base,
             backend_name=self.backend_name,
         )
 
@@ -495,6 +542,7 @@ class BackendModelFactory:
             fitting_base=self.fitting_base,
             model_base=self.model_base,
             backend_name=self.backend_name,
+            long_range_base=self.long_range_base,
         )
 
     def get_linear_atomic_model(
