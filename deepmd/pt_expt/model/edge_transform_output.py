@@ -6,6 +6,9 @@ this module supplies the single backward pass that produces g_e = dE/d(edge_vec)
 """
 
 import dataclasses
+from collections.abc import (
+    Sequence,
+)
 
 import torch
 
@@ -27,6 +30,7 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     PairGraph,
     edge_force_virial,
     frame_id_from_n_node,
+    pair_force_virial,
     segment_sum,
 )
 from deepmd.pt.utils import (
@@ -85,6 +89,7 @@ def edge_energy_deriv(
     do_atomic_virial: bool = False,
     create_graph: bool = False,
     force_precision: torch.dtype | None = None,
+    topologies: Sequence[PairGraph] = (),
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Return (force, atom_virial_or_None, virial) from a graph energy.
 
@@ -144,9 +149,10 @@ def edge_energy_deriv(
     virial
         (nf, 3, 3) per-frame virial (always computed).
     """
-    (g_e,) = torch.autograd.grad(
+    pair_leaves = [topology.vec for topology in topologies]
+    g_e, *g_pairs = torch.autograd.grad(
         energy.sum() if energy.dim() else energy,
-        edge_vec,
+        (edge_vec, *pair_leaves),
         create_graph=create_graph,
         retain_graph=True,
     )
@@ -222,6 +228,19 @@ def edge_energy_deriv(
         force, atom_virial, virial = edge_force_virial(
             g_e, edge_vec, edge_index, edge_mask, n_node, node_capacity=node_capacity
         )
+    for topology, g_pair in zip(topologies, g_pairs, strict=True):
+        pair_force, pair_atom_virial, pair_virial = pair_force_virial(
+            g_pair,
+            topology.vec,
+            topology.index,
+            topology.mask,
+            n_node,
+            node_capacity=force.shape[0],
+        )
+        force = force + pair_force.to(force.dtype)
+        virial = virial + pair_virial.to(virial.dtype)
+        if do_atomic_virial:
+            atom_virial = atom_virial + pair_atom_virial.to(atom_virial.dtype)
     return force, (atom_virial if do_atomic_virial else None), virial
 
 
@@ -236,6 +255,7 @@ def fit_output_to_model_output_graph(
     n_local: torch.Tensor | None = None,
     force_precision: torch.dtype | None = None,
     spin_leaf: torch.Tensor | None = None,
+    topologies: dict[str, PairGraph] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Graph analogue of the dense pt_expt ``fit_output_to_model_output``.
 
@@ -418,6 +438,7 @@ def fit_output_to_model_output_graph(
                 do_atomic_virial=(vdef.c_differentiable and do_atomic_virial),
                 create_graph=create_graph,
                 force_precision=force_precision if not create_graph else None,
+                topologies=() if topologies is None else tuple(topologies.values()),
             )
             # force (N, 3) -> (N, 1, 3)  [flat; caller unravels at I/O boundary]
             ff_list.append(force.reshape(N, 1, 3))

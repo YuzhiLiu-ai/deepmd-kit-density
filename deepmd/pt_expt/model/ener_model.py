@@ -89,6 +89,13 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         for key in ("mask", "n_node"):
             if key in model_ret:
                 model_predict[key] = model_ret[key]
+        for key, definition in self.atomic_output_def().get_data().items():
+            if (
+                not definition.reducible
+                and key not in model_predict
+                and key in model_ret
+            ):
+                model_predict[key] = model_ret[key]
         if self.atomic_output_def()["energy"].r_hessian:
             model_predict["hessian"] = model_ret["energy_derv_r_derv_r"].squeeze(-3)
         return model_predict

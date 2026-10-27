@@ -118,3 +118,37 @@ def edge_force_virial(
     node_frame = frame_id_from_n_node(n_node, n_total=n_out)  # (N,) frame per node
     virial = segment_sum(atom_virial, node_frame, nf)  # (nf, 3, 3)
     return force, atom_virial, virial
+
+
+def pair_force_virial(
+    g_p: Array,
+    pair_vec: Array,
+    pair_index: Array,
+    pair_mask: Array,
+    n_node: Array,
+    node_capacity: int | None = None,
+) -> tuple[Array, Array, Array]:
+    """Assemble force and virial of an unordered ``i < j`` pair topology.
+
+    Each pair force acts on both endpoints.  Its virial is split evenly so the
+    atomic attribution does not depend on the arbitrary endpoint ordering.
+    """
+    xp = array_api_compat.array_namespace(g_p)
+    n_out = node_capacity if node_capacity is not None else int(xp.sum(n_node))
+    nf = n_node.shape[0]
+    if isinstance(n_out, int) and n_out == 0:
+        device = array_api_compat.device(g_p)
+        return (
+            xp.zeros((0, 3), dtype=g_p.dtype, device=device),
+            xp.zeros((0, 3, 3), dtype=g_p.dtype, device=device),
+            xp.zeros((nf, 3, 3), dtype=g_p.dtype, device=device),
+        )
+    g = g_p * xp.astype(pair_mask[:, None], g_p.dtype)
+    src = pair_index[0] % n_out
+    dst = pair_index[1] % n_out
+    force = segment_sum(g, dst, n_out) - segment_sum(g, src, n_out)
+    w_half = -0.5 * (g[:, :, None] * pair_vec[:, None, :])
+    atom_virial = segment_sum(w_half, src, n_out) + segment_sum(w_half, dst, n_out)
+    node_frame = frame_id_from_n_node(n_node, n_total=n_out)
+    virial = segment_sum(atom_virial, node_frame, nf)
+    return force, atom_virial, virial

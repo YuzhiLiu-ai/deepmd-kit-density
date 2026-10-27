@@ -16,6 +16,7 @@ from deepmd.dpmodel.long_range import (
     SOGKernel,
 )
 from deepmd.dpmodel.model.model import get_standard_model
+from deepmd.dpmodel.output_def import FittingOutputDef, OutputVariableDef
 from deepmd.dpmodel.utils.neighbor_graph import (
     ALL_PAIRS,
     K_GRID,
@@ -46,6 +47,19 @@ class SkeletonLongRange(BaseLongRange):
     def uses_charge_spin(self) -> bool:
         return False
 
+    def output_def(self) -> FittingOutputDef:
+        return FittingOutputDef(
+            [
+                OutputVariableDef(
+                    "latent_charge",
+                    [1],
+                    reducible=False,
+                    r_differentiable=False,
+                    c_differentiable=False,
+                )
+            ]
+        )
+
     def call_graph(
         self,
         descriptor,
@@ -57,7 +71,10 @@ class SkeletonLongRange(BaseLongRange):
         aparam=None,
         charge_spin=None,
     ):
-        return np.zeros((atype.shape[0], 1))
+        return {
+            "energy": np.zeros((atype.shape[0], 1)),
+            "latent_charge": np.zeros((atype.shape[0], 1)),
+        }
 
     def serialize(self) -> dict:
         return {

@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Non-periodic direct interaction of descriptor-predicted latent charges."""
+
+from collections.abc import (
+    Callable,
+)
+from typing import (
+    Any,
+)
+
+import array_api_compat
+
+from deepmd.dpmodel.array_api import (
+    Array,
+)
+from deepmd.dpmodel.common import (
+    NativeOP,
+)
+from deepmd.dpmodel.fitting.latent_charge import (
+    LatentChargeFitting,
+)
+from deepmd.dpmodel.output_def import (
+    FittingOutputDef,
+)
+from deepmd.dpmodel.utils.neighbor_graph import (
+    ALL_PAIRS,
+    frame_id_from_n_node,
+    segment_sum,
+)
+from deepmd.dpmodel.utils.seed import (
+    child_seed,
+)
+from deepmd.utils.path import (
+    DPPath,
+)
+from deepmd.utils.version import (
+    check_version_compatibility,
+)
+
+from .base_long_range import (
+    BaseLongRange,
+    check_long_range_support,
+)
+from .kernel import (
+    COULOMB_CONSTANT,
+    BaseInteractionKernel,
+)
+
+CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
+CHARGE_NET_NEURON = [64, 64]
+CHARGE_NET_SEED_INDEX = 10_000
+
+
+@BaseLongRange.register("latent_charge")
+class LatentChargeLongRange(NativeOP, BaseLongRange):
+    """Direct latent-charge energy over unordered intra-frame ``i < j`` pairs.
+
+    The total interaction of each frame is shared evenly by its real atoms,
+    matching the attribution of the existing DPA4C-LR implementation.  Periodic
+    cells and reciprocal-space kernels are deliberately outside this stage.
+    """
+
+    def __init__(
+        self,
+        charge_net: LatentChargeFitting,
+        kernel: BaseInteractionKernel,
+        charge_constraint: dict | None = None,
+    ) -> None:
+        if charge_net.vacuum_ref:
+            raise ValueError("a latent-charge readout cannot use `vacuum_ref`")
+        self.charge_net = charge_net
+        self.kernel = kernel
+        self.charge_constraint = self._normalize_constraint(
+            charge_constraint, charge_net
+        )
+
+    @staticmethod
+    def _normalize_constraint(
+        constraint: dict | None, charge_net: LatentChargeFitting
+    ) -> dict | None:
+        if constraint is None:
+            return None
+        source = str(constraint.get("source", "neutral"))
+        channel = int(constraint.get("channel", 0))
+        fparam_index = int(constraint.get("fparam_index", 0))
+        if source not in CHARGE_TARGET_SOURCES:
+            raise ValueError(
+                f"charge constraint source must be one of {CHARGE_TARGET_SOURCES}, "
+                f"got {source!r}"
+            )
+        if not 0 <= channel < charge_net.dim_out:
+            raise ValueError(f"constrained channel {channel} is out of range")
+        if source == "fparam" and not 0 <= fparam_index < charge_net.numb_fparam:
+            raise ValueError(f"`fparam_index` {fparam_index} is out of range")
+        return {"source": source, "channel": channel, "fparam_index": fparam_index}
+
+    @classmethod
+    def from_config(
+        cls,
+        config: dict,
+        descriptor: Any,
+        fitting: Any,
+        fitting_seed: int | list[int] | None = None,
+    ) -> "LatentChargeLongRange":
+        check_long_range_support(descriptor)
+        if not descriptor.uses_graph_lower():
+            raise NotImplementedError(
+                "LatentChargeLongRange requires the NeighborGraph lower"
+            )
+        if config.get("periodic", False):
+            raise NotImplementedError(
+                "LatentChargeLongRange currently supports non-periodic direct "
+                "evaluation only; periodic k-grid/PME is not implemented"
+            )
+        charge_net_config = {
+            "neuron": CHARGE_NET_NEURON,
+            "activation_function": fitting.activation_function,
+            "resnet_dt": fitting.resnet_dt,
+            "precision": fitting.precision,
+            "seed": child_seed(fitting_seed, CHARGE_NET_SEED_INDEX),
+            **config.get("charge_net", {}),
+        }
+        kernel_config = {
+            "precision": charge_net_config["precision"],
+            **config["kernel"],
+        }
+        kernel_cls = BaseInteractionKernel.get_class_by_type(kernel_config.pop("type"))
+        charge_net = LatentChargeFitting(
+            var_name="latent_charge",
+            ntypes=descriptor.get_ntypes(),
+            dim_descrpt=descriptor.get_dim_out(),
+            dim_out=int(config.get("channels", 1)),
+            numb_fparam=fitting.get_dim_fparam(),
+            numb_aparam=fitting.get_dim_aparam(),
+            dim_case_embd=fitting.dim_case_embd,
+            default_fparam=fitting.get_default_fparam(),
+            use_aparam_as_mask=fitting.use_aparam_as_mask,
+            mixed_types=descriptor.mixed_types(),
+            type_map=fitting.get_type_map(),
+            **charge_net_config,
+        )
+        return cls(
+            charge_net, kernel_cls(**kernel_config), config.get("charge_constraint")
+        )
+
+    def output_def(self) -> FittingOutputDef:
+        return self.charge_net.output_def()
+
+    def required_topologies(self) -> tuple[str, ...]:
+        return (ALL_PAIRS,)
+
+    def uses_charge_spin(self) -> bool:
+        return (
+            self.charge_constraint is not None
+            and self.charge_constraint["source"] == "charge_spin"
+        )
+
+    def call(self, *args: Any, **kwargs: Any) -> dict[str, Array]:
+        return self.call_graph(*args, **kwargs)
+
+    def call_graph(
+        self,
+        descriptor: Array,
+        atype: Array,
+        node_mask: Array,
+        n_node: Array,
+        topologies: dict[str, Any],
+        fparam: Array | None = None,
+        aparam: Array | None = None,
+        charge_spin: Array | None = None,
+        descriptor_context: dict[str, Array] | None = None,
+    ) -> dict[str, Array]:
+        xp = array_api_compat.array_namespace(descriptor)
+        n = descriptor.shape[0]
+        pairs = topologies[ALL_PAIRS]
+        frame_id = frame_id_from_n_node(n_node, n_total=n)
+        fparam_node = None if fparam is None else xp.take(fparam, frame_id, axis=0)
+        charge = self.charge_net.call_graph(
+            descriptor, atype, fparam=fparam_node, aparam=aparam
+        )["latent_charge"]
+        charge = xp.astype(charge, pairs.vec.dtype)
+        charge = xp.where(node_mask[:, None], charge, xp.zeros_like(charge))
+        if self.charge_constraint is not None:
+            charge = self._constrain(
+                charge, node_mask, frame_id, n_node, fparam, charge_spin
+            )
+
+        src, dst = pairs.index
+        pair_charge = xp.sum(
+            xp.take(charge, src, axis=0) * xp.take(charge, dst, axis=0), axis=-1
+        )
+        r_sq = xp.sum(pairs.vec * pairs.vec, axis=-1)
+        pair_energy = pair_charge * self._pair_kernel(r_sq, src, n)
+        pair_energy = COULOMB_CONSTANT * xp.where(
+            pairs.mask, pair_energy, xp.zeros_like(pair_energy)
+        )
+        pair_frame = xp.take(frame_id, dst, axis=0)
+        frame_energy = segment_sum(pair_energy, pair_frame, n_node.shape[0])
+        count = xp.astype(n_node, frame_energy.dtype)
+        count = xp.maximum(count, xp.ones_like(count))
+        energy = xp.take(frame_energy / count, frame_id, axis=0)
+        return {
+            "energy": xp.reshape(energy, (n, 1)),
+            "latent_charge": charge,
+        }
+
+    def _pair_kernel(self, r_sq: Array, src: Array, n: int) -> Array:
+        return self.kernel(r_sq)
+
+    def _constrain(
+        self,
+        charge: Array,
+        node_mask: Array,
+        frame_id: Array,
+        n_node: Array,
+        fparam: Array | None,
+        charge_spin: Array | None,
+    ) -> Array:
+        xp = array_api_compat.array_namespace(charge)
+        nf = n_node.shape[0]
+        channel = self.charge_constraint["channel"]
+        target = self._total_charge(nf, charge, fparam, charge_spin)
+        weight = xp.astype(node_mask, charge.dtype)
+        count = segment_sum(weight, frame_id, nf)
+        total = segment_sum(charge[:, channel], frame_id, nf)
+        shift = (total - target) / xp.maximum(count, xp.ones_like(count))
+        constrained = charge[:, channel] - xp.take(shift, frame_id, axis=0) * weight
+        return xp.concat(
+            [charge[:, :channel], constrained[:, None], charge[:, channel + 1 :]],
+            axis=-1,
+        )
+
+    def _total_charge(
+        self,
+        nf: int,
+        like: Array,
+        fparam: Array | None,
+        charge_spin: Array | None,
+    ) -> Array:
+        xp = array_api_compat.array_namespace(like)
+        device = array_api_compat.device(like)
+        source = self.charge_constraint["source"]
+        if source == "charge_spin":
+            if charge_spin is None:
+                raise ValueError(
+                    "the charge constraint reads `charge_spin`, which was not given"
+                )
+            target = charge_spin[:, 0]
+        elif source == "fparam":
+            if fparam is None:
+                raise ValueError(
+                    "the charge constraint reads `fparam`, which was not given"
+                )
+            target = fparam[:, self.charge_constraint["fparam_index"]]
+        else:
+            target = xp.zeros((nf,), dtype=like.dtype, device=device)
+        return xp.astype(target, like.dtype)
+
+    def compute_input_stats(
+        self,
+        merged: Callable[[], list[dict]] | list[dict],
+        protection: float = 1e-2,
+        stat_file_path: DPPath | None = None,
+    ) -> None:
+        self.charge_net.compute_input_stats(
+            merged, protection=protection, stat_file_path=stat_file_path
+        )
+
+    def change_type_map(self, type_map: list[str]) -> None:
+        self.charge_net.change_type_map(type_map=type_map)
+
+    def set_case_embd(self, case_idx: int) -> None:
+        self.charge_net.set_case_embd(case_idx)
+
+    def serialize(self) -> dict:
+        return {
+            "@class": "LongRange",
+            "type": "latent_charge",
+            "@version": 1,
+            "charge_net": self.charge_net.serialize(),
+            "kernel": self.kernel.serialize(),
+            "charge_constraint": self.charge_constraint,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "LatentChargeLongRange":
+        data = data.copy()
+        check_version_compatibility(data.pop("@version"), 1, 1)
+        return cls(
+            LatentChargeFitting.deserialize(data["charge_net"]),
+            BaseInteractionKernel.deserialize(data["kernel"]),
+            data["charge_constraint"],
+        )

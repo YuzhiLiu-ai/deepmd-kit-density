@@ -72,6 +72,10 @@ from deepmd.dpmodel.utils.dist_check import (
 from deepmd.dpmodel.utils.learning_rate import (
     make_learning_rate_schedule,
 )
+from deepmd.dpmodel.utils.neighbor_graph import (
+    flatten_topologies,
+    unflatten_topologies,
+)
 from deepmd.dpmodel.utils.training_utils import (
     compute_total_numb_batch,
 )
@@ -111,6 +115,9 @@ from deepmd.pt_expt.loss import (
 )
 from deepmd.pt_expt.model import (
     get_model,
+)
+from deepmd.pt_expt.model.edge_transform_output import (
+    releaf_topologies,
 )
 from deepmd.pt_expt.model.graph_lower import (
     model_uses_graph_lower,
@@ -322,7 +329,17 @@ def _get_model_structure_key(model: torch.nn.Module) -> tuple[int, ...]:
             break
     except AttributeError:
         pass
-    return (int(model.has_spin()), descriptor_id, fitting_id, *vacuum_state)
+    long_range_id = 0
+    long_range = getattr(getattr(model, "atomic_model", None), "long_range", None)
+    if long_range is not None:
+        long_range_id = next((id(p) for p in long_range.parameters()), id(long_range))
+    return (
+        int(model.has_spin()),
+        descriptor_id,
+        fitting_id,
+        *vacuum_state,
+        long_range_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +934,15 @@ def _trace_and_compile_graph(
     )
 
     s_lr_graph = build_all_pairs_unordered_graph(s_lr_coord, s_n_node)
+    s_topologies = model.atomic_model.build_topologies(
+        s_lr_coord,
+        s_n_node,
+        None,
+        atype=torch.zeros(trace_N, dtype=torch.int64, device=_trace_device),
+    )
+    topology_names = tuple(s_topologies)
+    s_topology_vals = flatten_topologies(s_topologies)
+    n_topology_vals = len(s_topology_vals)
 
     def fn(
         atype: torch.Tensor,
@@ -936,8 +962,10 @@ def _trace_and_compile_graph(
         lr_edge_index: torch.Tensor,
         lr_edge_vec: torch.Tensor,
         lr_edge_mask: torch.Tensor,
-        *task_buf_vals: torch.Tensor,
+        *extra_vals: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        topologies = unflatten_topologies(topology_names, extra_vals[:n_topology_vals])
+        task_buf_vals = extra_vals[n_topology_vals:]
         # Patch task-specific buffers with the proxy tensors so make_fx records
         # them as FX placeholders (mirrors the dense ``_trace_and_compile``).
         originals: dict[str, torch.Tensor | None] = {}
@@ -955,6 +983,15 @@ def _trace_and_compile_graph(
         try:
             # forward_common_lower_graph makes edge_vec and, when present,
             # spin the autograd leaves internally.
+            legacy_lr_kwargs = (
+                {
+                    "lr_edge_index": lr_edge_index,
+                    "lr_edge_vec": lr_edge_vec,
+                    "lr_edge_mask": lr_edge_mask,
+                }
+                if getattr(model, "_needs_long_range_edges", False)
+                else {}
+            )
             model_ret = model.forward_common_lower_graph(
                 atype,
                 n_node,
@@ -971,9 +1008,8 @@ def _trace_and_compile_graph(
                 aparam=aparam,
                 charge_spin=charge_spin,
                 spin=spin,
-                lr_edge_index=lr_edge_index,
-                lr_edge_vec=lr_edge_vec,
-                lr_edge_mask=lr_edge_mask,
+                topologies=topologies,
+                **legacy_lr_kwargs,
             )
             if spin is None:
                 return _translate_energy_keys(
@@ -1023,6 +1059,7 @@ def _trace_and_compile_graph(
         s_lr_graph.edge_index,
         s_lr_graph.edge_vec,
         s_lr_graph.edge_mask,
+        *s_topology_vals,
         *task_buf_vals_trace,
     )
 
@@ -1699,6 +1736,14 @@ class _CompiledModel(torch.nn.Module):
             lr_edge_vec = torch.empty((0, 3), dtype=_dt, device=_dev)
             lr_edge_mask = torch.empty((0,), dtype=torch.bool, device=_dev)
 
+        topologies = _model.atomic_model.build_topologies(
+            coord_3d if ragged else coord_3d.reshape(n_padded, 3)[node_index],
+            ng.n_node,
+            box_flat,
+            atype=atype_flat,
+            pair_excl=pair_excl,
+        )
+
         # Lazy compile of the GRAPH lower (cached per structure key and mode).
         compiled_lower = self._compiled_lower_by_mode.get(self.training)
         if compiled_lower is None:
@@ -1725,6 +1770,7 @@ class _CompiledModel(torch.nn.Module):
         edge_vec = ng.edge_vec.detach().requires_grad_(True)
         if spin is not None:
             spin = spin.detach().requires_grad_(True)
+        topology_vals = flatten_topologies(releaf_topologies(topologies))
 
         if self._task_buf_order:
             try:
@@ -1769,6 +1815,7 @@ class _CompiledModel(torch.nn.Module):
                 lr_edge_index,
                 lr_edge_vec,
                 lr_edge_mask,
+                *topology_vals,
                 *task_buf_vals,
             )
         self._report_pending_compile()

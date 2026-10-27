@@ -20,6 +20,12 @@ from .ener_fitting import (
 from .invar_fitting import (
     InvarFitting,
 )
+from .latent_charge import (
+    LatentChargeFitting,
+)
+from .latent_multipole import (
+    LatentMultipoleFitting,
+)
 from .polarizability_fitting import (
     PolarFitting,
 )
@@ -37,6 +43,8 @@ __all__ = [
     "DipoleFitting",
     "EnergyFittingNet",
     "InvarFitting",
+    "LatentChargeFitting",
+    "LatentMultipoleFitting",
     "PolarFitting",
     "PropertyFittingNet",
     "SeZMEnergyFittingNet",

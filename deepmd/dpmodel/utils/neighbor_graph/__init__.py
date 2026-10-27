@@ -33,6 +33,7 @@ from .csr import (
 )
 from .derivatives import (
     edge_force_virial,
+    pair_force_virial,
 )
 from .env import (
     edge_env_mat,
@@ -149,6 +150,7 @@ __all__ = [
     "node_validity_mask",
     "pad_and_guard_angles",
     "pad_and_guard_edges",
+    "pair_force_virial",
     "segment_max",
     "segment_mean",
     "segment_softmax",

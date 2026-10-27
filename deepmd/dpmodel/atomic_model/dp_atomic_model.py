@@ -153,12 +153,31 @@ class DPAtomicModel(BaseAtomicModel):
         self.add_spin_ebd: bool = (
             self._supports_native_spin and self.descriptor.use_spin is not None
         )
+        if self.long_range is not None:
+            self._check_long_range()
         super().init_out_stat()
         # === Reference of the isolated atoms ===
         # The fitting references its output only when the preset fixes the
         # bias of that output; the conditions of the reference atoms follow.
         resolve_vacuum_ref(self.fitting_net, self.preset_out_bias)
         self.init_vacuum_conditions()
+
+    def _check_long_range(self) -> None:
+        """Validate the currently supported plugin composition."""
+        if "energy" not in self.fitting_net.output_def().keys():
+            raise ValueError("a long-range module requires an energy fitting")
+        if self.atom_exclude_types:
+            raise NotImplementedError(
+                "`atom_exclude_types` is not supported with a long-range module"
+            )
+        if self.long_range.uses_charge_spin() and not self.add_chg_spin_ebd:
+            raise ValueError("a charge_spin constraint requires `add_chg_spin_ebd`")
+        if self.long_range.uses_descriptor_context() and getattr(
+            self.descriptor, "compress", False
+        ):
+            raise NotImplementedError(
+                "a compressed descriptor cannot supply latent-multipole context"
+            )
 
     def init_vacuum_conditions(self) -> None:
         """Build the conditioning inputs of the reference atoms for the type map.
@@ -271,8 +290,11 @@ class DPAtomicModel(BaseAtomicModel):
         return self._supports_native_spin
 
     def fitting_output_def(self) -> FittingOutputDef:
-        """Get the output def of the fitting net."""
-        return self.fitting_net.output_def()
+        """Get fitting outputs merged with long-range auxiliary fields."""
+        outputs = list(self.fitting_net.output_def().get_data().values())
+        if self.long_range is not None:
+            outputs.extend(self.long_range.output_def().get_data().values())
+        return FittingOutputDef(outputs)
 
     def get_rcut(self) -> float:
         """Get the cut-off radius."""
@@ -288,6 +310,8 @@ class DPAtomicModel(BaseAtomicModel):
         typically concatenated with the output of the descriptor and fed into the fitting net.
         """
         self.fitting_net.set_case_embd(case_idx)
+        if self.long_range is not None:
+            self.long_range.set_case_embd(case_idx)
 
     def mixed_types(self) -> bool:
         """If true, the model
@@ -332,6 +356,11 @@ class DPAtomicModel(BaseAtomicModel):
         check_frequency
             The overflow check frequency
         """
+        if self.long_range is not None and self.long_range.uses_descriptor_context():
+            raise NotImplementedError(
+                "DPA4C compression does not expose the degree-one moments required "
+                "by latent multipoles"
+            )
         self.descriptor.enable_compression(
             min_nbor_dist,
             table_extrapolate,
@@ -597,6 +626,8 @@ class DPAtomicModel(BaseAtomicModel):
         charge_spin: Array | None = None,
         spin: Array | None = None,
         comm_dict: dict | None = None,
+        topologies: dict[str, Any] | None = None,
+        node_mask: Array | None = None,
     ) -> dict[str, Array]:
         """Graph analogue of :meth:`forward_atomic` on the flat node axis.
 
@@ -636,10 +667,6 @@ class DPAtomicModel(BaseAtomicModel):
             the result dict on the flat node axis, defined by the `FittingOutputDef`.
 
         """
-        if self.long_range is not None:
-            raise NotImplementedError(
-                "the long-range plugin skeleton does not implement forward evaluation"
-            )
         from deepmd.dpmodel.utils.neighbor_graph import (
             frame_id_from_n_node,
         )
@@ -656,6 +683,12 @@ class DPAtomicModel(BaseAtomicModel):
             # compiled-training paths when ``numb_fparam > 0``.
             frame_id = frame_id_from_n_node(graph.n_node, n_total=atype.shape[0])
             fparam_node = xp.take(fparam, frame_id, axis=0)  # (N, ndf)
+        n_node = graph.n_node
+        charge_spin_frame = charge_spin
+        if self.long_range is not None:
+            fparam, charge_spin_frame = self._frame_conditions(
+                fparam, charge_spin, n_node.shape[0], graph.edge_vec
+            )
         aparam_node = aparam
         if aparam is not None and graph.n_local is not None and aparam.ndim == 3:
             aparam_node = _extend_graph_aparam(
@@ -712,7 +745,7 @@ class DPAtomicModel(BaseAtomicModel):
         # its type, so along the closing of a pair the learned energy follows
         # the switch linearly while the analytical pair term takes over.
         gate_kwargs = {} if node_gate is None else {"node_gate": node_gate}
-        return self.fitting_net.call_graph(
+        ret = self.fitting_net.call_graph(
             gg,
             atype,
             gr=rot_mat,
@@ -723,6 +756,62 @@ class DPAtomicModel(BaseAtomicModel):
             **vacuum_kwargs,
             **gate_kwargs,
         )
+        if self.long_range is not None:
+            if topologies is None or node_mask is None:
+                raise ValueError(
+                    "the long-range module requires its topologies and node mask"
+                )
+            context_kwargs = (
+                {"descriptor_context": {"gr": rot_mat}}
+                if self.long_range.uses_descriptor_context()
+                else {}
+            )
+            if self.long_range.uses_descriptor_context() and rot_mat is None:
+                raise NotImplementedError(
+                    "the descriptor does not expose the degree-one moments required "
+                    "by latent multipoles"
+                )
+            long_range_ret = self.long_range.call_graph(
+                gg,
+                atype,
+                node_mask,
+                n_node,
+                topologies,
+                fparam=fparam,
+                aparam=aparam_node,
+                charge_spin=charge_spin_frame,
+                **context_kwargs,
+            )
+            ret["energy"] = ret["energy"] + long_range_ret["energy"]
+            ret.update(
+                {key: value for key, value in long_range_ret.items() if key != "energy"}
+            )
+        return ret
+
+    def _frame_conditions(
+        self,
+        fparam: Array | None,
+        charge_spin: Array | None,
+        nf: int,
+        reference: Array,
+    ) -> tuple[Array | None, Array | None]:
+        """Resolve frame-level defaults for long-range readout and constraints."""
+        xp = array_api_compat.array_namespace(reference)
+        device = array_api_compat.device(reference)
+        if fparam is None and self.has_default_fparam():
+            default = xp.asarray(
+                self.get_default_fparam(), dtype=reference.dtype, device=device
+            )
+            fparam = xp.tile(xp.reshape(default, (1, -1)), (nf, 1))
+        if not self.add_chg_spin_ebd:
+            return fparam, None
+        if charge_spin is None:
+            default = self.descriptor.get_default_chg_spin()
+            if default is None:
+                return fparam, None
+            charge_spin = xp.asarray(default, dtype=reference.dtype, device=device)
+        charge_spin = xp.broadcast_to(xp.reshape(charge_spin, (-1, 2)), (nf, 2))
+        return fparam, charge_spin
 
     def compute_or_load_stat(
         self,
@@ -753,6 +842,10 @@ class DPAtomicModel(BaseAtomicModel):
         self.fitting_net.compute_input_stats(
             wrapped_sampler, stat_file_path=stat_file_path
         )
+        if self.long_range is not None:
+            self.long_range.compute_input_stats(
+                wrapped_sampler, stat_file_path=stat_file_path
+            )
         self._collect_and_set_observed_type(
             wrapped_sampler, stat_file_path, preset_observed_type
         )
@@ -776,6 +869,8 @@ class DPAtomicModel(BaseAtomicModel):
             else None,
         )
         self.fitting_net.change_type_map(type_map=type_map)
+        if self.long_range is not None:
+            self.long_range.change_type_map(type_map=type_map)
         self.init_vacuum_conditions()
 
     def compute_fitting_input_stat(
@@ -801,6 +896,12 @@ class DPAtomicModel(BaseAtomicModel):
             protection=self.data_stat_protect,
             stat_file_path=stat_file_path,
         )
+        if self.long_range is not None:
+            self.long_range.compute_input_stats(
+                sample_merged,
+                protection=self.data_stat_protect,
+                stat_file_path=stat_file_path,
+            )
 
     def serialize(self) -> dict:
         dd = super().serialize()

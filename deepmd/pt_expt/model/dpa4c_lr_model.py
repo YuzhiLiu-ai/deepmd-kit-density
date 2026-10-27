@@ -481,6 +481,7 @@ class DPA4CLREnergyModel(EnergyModel):
         lr_edge_index: torch.Tensor | None = None,
         lr_edge_vec: torch.Tensor | None = None,
         lr_edge_mask: torch.Tensor | None = None,
+        topologies: dict[str, Any] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Graph lower with the long-range correction.
 

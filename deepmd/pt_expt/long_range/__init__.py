@@ -8,9 +8,17 @@ from .kernel import (
     LESKernel,
     SOGKernel,
 )
+from .latent_charge import (
+    LatentChargeLongRange,
+)
+from .latent_multipole import (
+    LatentMultipoleLongRange,
+)
 
 __all__ = [
     "BaseLongRange",
     "LESKernel",
+    "LatentChargeLongRange",
+    "LatentMultipoleLongRange",
     "SOGKernel",
 ]

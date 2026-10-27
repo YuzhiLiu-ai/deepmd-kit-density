@@ -531,6 +531,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
         charge_spin: Array | None = None,
         spin: Array | None = None,
         comm_dict: dict | None = None,
+        topologies: dict[str, Any] | None = None,
     ) -> dict:
         """Graph analogue of :meth:`forward_common_atomic` on the flat node axis.
 
@@ -575,6 +576,11 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
 
         """
         graph, atype_clamped, output_mask = self._prepare_graph_inputs(graph, atype)
+        long_range_kwargs = (
+            {"topologies": topologies, "node_mask": output_mask}
+            if self.has_long_range()
+            else {}
+        )
         ret_dict = self.forward_atomic_graph(
             graph,
             atype_clamped,
@@ -583,6 +589,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
             charge_spin=charge_spin,
             spin=spin,
             comm_dict=comm_dict,
+            **long_range_kwargs,
         )
         return self._finalize_atomic_ret(ret_dict, output_mask, atype)
 

@@ -12,6 +12,9 @@ from typing import (
 
 import numpy as np
 
+from deepmd.dpmodel.output_def import (
+    FittingOutputDef,
+)
 from deepmd.utils.path import (
     DPPath,
 )
@@ -86,6 +89,14 @@ def make_base_long_range(t_tensor: Any) -> type:
         def uses_charge_spin(self) -> bool:
             """Whether the module reads the frame-level charge/spin condition."""
 
+        def uses_descriptor_context(self) -> bool:
+            """Whether :meth:`call_graph` requires descriptor equivariant context."""
+            return False
+
+        @abstractmethod
+        def output_def(self) -> FittingOutputDef:
+            """Definitions of the auxiliary fields returned by :meth:`call_graph`."""
+
         @abstractmethod
         def call_graph(
             self,
@@ -97,8 +108,9 @@ def make_base_long_range(t_tensor: Any) -> type:
             fparam: t_tensor | None = None,
             aparam: t_tensor | None = None,
             charge_spin: t_tensor | None = None,
-        ) -> t_tensor:
-            """Evaluate the atomic energy of the module on the flat node axis.
+            descriptor_context: dict[str, t_tensor] | None = None,
+        ) -> dict[str, t_tensor]:
+            """Evaluate energy and connected auxiliary fields on the flat node axis.
 
             Parameters
             ----------
@@ -125,8 +137,9 @@ def make_base_long_range(t_tensor: Any) -> type:
 
             Returns
             -------
-            t_tensor
-                The atomic energy with shape ``(N, 1)``, in eV.
+            dict[str, t_tensor]
+                ``energy`` with shape ``(N, 1)`` in eV and the final auxiliary
+                fields declared by :meth:`output_def`, with autograd intact.
             """
 
         def compute_input_stats(

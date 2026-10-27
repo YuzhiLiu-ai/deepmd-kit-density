@@ -3951,6 +3951,156 @@ def fitting_variant_type_args() -> Variant:
     )
 
 
+#  --- Long-range module configurations: --- #
+long_range_args_plugin = ArgsPlugin()
+interaction_kernel_args_plugin = ArgsPlugin()
+
+
+@interaction_kernel_args_plugin.register("les")
+def interaction_kernel_les() -> list[Argument]:
+    return [
+        Argument("alpha", float, optional=True, default=1.0),
+        Argument("trainable", bool, optional=True, default=True),
+    ]
+
+
+@interaction_kernel_args_plugin.register("sog")
+def interaction_kernel_sog() -> list[Argument]:
+    return [
+        Argument(
+            "amplitude",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+        ),
+        Argument("width", [list[float], type(None)], optional=True, default=None),
+        Argument("n_gaussian", int, optional=True, default=12),
+        Argument("base_width", float, optional=True, default=2.180230445405648),
+        Argument("width_ratio", float, optional=True, default=1.6297670882677647),
+        Argument("trainable", bool, optional=True, default=True),
+    ]
+
+
+def latent_charge_net_args() -> list[Argument]:
+    return [
+        Argument("neuron", list[int], optional=True, default=[64, 64]),
+        Argument("activation_function", str, optional=True),
+        Argument("resnet_dt", bool, optional=True),
+        Argument("precision", str, optional=True),
+        Argument("trainable", [list[bool], bool], optional=True, default=True),
+        Argument("seed", [int, None], optional=True),
+    ]
+
+
+@long_range_args_plugin.register(
+    "latent_charge",
+    doc="Non-periodic direct interaction of latent charges predicted by DPA4C.",
+)
+def long_range_latent_charge() -> list[Argument]:
+    return [
+        Argument("channels", int, optional=True, default=1),
+        Argument("charge_net", dict, latent_charge_net_args(), optional=True),
+        Argument(
+            "kernel",
+            dict,
+            [],
+            [Variant("type", interaction_kernel_args_plugin.get_all_argument())],
+        ),
+        Argument(
+            "charge_constraint",
+            dict,
+            [
+                Argument(
+                    "source",
+                    str,
+                    optional=True,
+                    default="neutral",
+                    extra_check=lambda x: x in ("neutral", "charge_spin", "fparam"),
+                ),
+                Argument("fparam_index", int, optional=True, default=0),
+                Argument("channel", int, optional=True, default=0),
+            ],
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "periodic",
+            bool,
+            optional=True,
+            default=False,
+            doc="Periodic evaluation is reserved for a later migration stage.",
+        ),
+    ]
+
+
+@long_range_args_plugin.register(
+    "latent_multipole",
+    doc="Non-periodic direct LES interaction of DPA4C latent charges and dipoles.",
+)
+def long_range_latent_multipole() -> list[Argument]:
+    return [
+        Argument("channels", int, optional=True, default=1),
+        Argument(
+            "charge_net",
+            dict,
+            [
+                *latent_charge_net_args(),
+                Argument(
+                    "charge_bound", [float, type(None)], optional=True, default=None
+                ),
+                Argument("use_glu", bool, optional=True, default=True),
+            ],
+            optional=True,
+        ),
+        Argument(
+            "kernel",
+            dict,
+            [],
+            [Variant("type", interaction_kernel_args_plugin.get_all_argument())],
+        ),
+        Argument(
+            "charge_constraint",
+            dict,
+            [
+                Argument(
+                    "source",
+                    str,
+                    optional=True,
+                    default="neutral",
+                    extra_check=lambda x: x in ("neutral", "charge_spin", "fparam"),
+                ),
+                Argument("fparam_index", int, optional=True, default=0),
+                Argument("channel", int, optional=True, default=0),
+            ],
+            optional=True,
+            default=None,
+        ),
+        Argument("embedding_width", int, optional=True, default=0),
+        Argument(
+            "alpha_pol", [float, list[float], type(None)], optional=True, default=None
+        ),
+        Argument("use_self_pol", bool, optional=True, default=True),
+        Argument("lr_update_steps", int, optional=True, default=0),
+        Argument(
+            "lr_update_neuron", [list[int], type(None)], optional=True, default=None
+        ),
+        Argument("lr_update_damping", float, optional=True, default=0.2),
+        Argument("periodic", bool, optional=True, default=False),
+    ]
+
+
+def long_range_args() -> Argument:
+    return Argument(
+        "long_range",
+        dict,
+        [],
+        [Variant("type", long_range_args_plugin.get_all_argument())],
+        optional=True,
+        doc=supported_backends("pt_expt")
+        + "Long-range plugin added to a standard DPA4C energy model.",
+    )
+
+
 #  --- Modifier configurations: --- #
 modifier_args_plugin = ArgsPlugin()
 
@@ -4248,6 +4398,7 @@ def standard_model_args() -> Argument:
                 default={},
                 doc=supported_backends("pt", "jax", "pd", "pt_expt", "tf2") + doc_info,
             ),
+            long_range_args(),
             *_bridging_method_args(),
         ],
         doc=supported_backends("tf", "pt", "jax", "pd", "pt_expt", "tf2")
