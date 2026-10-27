@@ -171,10 +171,18 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             update_descriptor = xp.astype(descriptor, update_dtype)
             update_vec = xp.astype(pairs.vec, update_dtype)
             update_mask = xp.astype(pairs.mask, update_dtype)
-            update_r_sq = xp.sum(update_vec * update_vec, axis=-1)
-            update_k, update_a, update_c = self._radial_coefficients(
-                update_r_sq, src, n
-            )
+            if update_dtype == r_sq.dtype:
+                # The pair geometry is invariant under the polar updates, so
+                # the radial coefficients (erf/exp of every pair) are shared
+                # with the final energy instead of recomputed per precision.
+                update_k = xp.astype(kernel, update_dtype)
+                update_a = xp.astype(a_coeff, update_dtype)
+                update_c = xp.astype(c_coeff, update_dtype)
+            else:
+                update_r_sq = xp.sum(update_vec * update_vec, axis=-1)
+                update_k, update_a, update_c = self._radial_coefficients(
+                    update_r_sq, src, n
+                )
             mask_q = xp.astype(node_mask[:, None], update_dtype)
             for _ in range(self.charge_net.lr_update_steps):
                 q_src = q[src, 0]

@@ -3989,6 +3989,10 @@ def latent_charge_net_args() -> list[Argument]:
         Argument("precision", str, optional=True),
         Argument("trainable", [list[bool], bool], optional=True, default=True),
         Argument("seed", [int, None], optional=True),
+        Argument("bias_atom", [list[float], type(None)], optional=True, default=None),
+        Argument("use_glu", bool, optional=True, default=False),
+        Argument("charge_bound", [float, type(None)], optional=True, default=None),
+        Argument("bias_out", bool, optional=True, default=False),
     ]
 
 
@@ -4045,10 +4049,6 @@ def long_range_latent_multipole() -> list[Argument]:
             dict,
             [
                 *latent_charge_net_args(),
-                Argument(
-                    "charge_bound", [float, type(None)], optional=True, default=None
-                ),
-                Argument("use_glu", bool, optional=True, default=True),
             ],
             optional=True,
         ),

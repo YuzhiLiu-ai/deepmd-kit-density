@@ -1,19 +1,36 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Charge/dipole readout and recurrent updates owned by a long-range plugin."""
 
-from typing import Any
+from typing import (
+    Any,
+)
 
 import numpy as np
 
-from deepmd.dpmodel.array_api import array_api_compat, xp_asarray_nodetach
-from deepmd.dpmodel.common import get_xp_precision, to_numpy_array
-from deepmd.dpmodel.output_def import FittingOutputDef, OutputVariableDef
-from deepmd.dpmodel.utils.network import FittingNet
-from deepmd.dpmodel.utils.seed import child_seed
-from deepmd.utils.version import check_version_compatibility
+from deepmd.dpmodel.array_api import (
+    array_api_compat,
+)
+from deepmd.dpmodel.common import (
+    get_xp_precision,
+    to_numpy_array,
+)
+from deepmd.dpmodel.output_def import (
+    FittingOutputDef,
+    OutputVariableDef,
+)
+from deepmd.dpmodel.utils.network import (
+    FittingNet,
+)
+from deepmd.dpmodel.utils.seed import (
+    child_seed,
+)
 
-from .dpa4_ener import GLUFittingNet, SeZMNetworkCollection
-from .latent_charge import LatentChargeFitting
+from .dpa4_ener import (
+    GLUFittingNet,
+)
+from .latent_charge import (
+    LatentChargeFitting,
+)
 
 
 class LatentMultipoleFitting(LatentChargeFitting):
@@ -27,7 +44,6 @@ class LatentMultipoleFitting(LatentChargeFitting):
     def __init__(
         self,
         *args: Any,
-        charge_bound: float | None = None,
         use_glu: bool = True,
         embedding_width: int = 0,
         alpha_pol: float | list[float] | None = None,
@@ -36,10 +52,6 @@ class LatentMultipoleFitting(LatentChargeFitting):
         lr_update_damping: float = 0.2,
         **kwargs: Any,
     ) -> None:
-        self.charge_bound = None if charge_bound is None else float(charge_bound)
-        if self.charge_bound is not None and self.charge_bound <= 0.0:
-            raise ValueError("`charge_bound` must be positive")
-        self.use_glu = bool(use_glu)
         self.embedding_width = int(embedding_width)
         if self.embedding_width < 1:
             raise ValueError("`embedding_width` must be positive")
@@ -53,43 +65,13 @@ class LatentMultipoleFitting(LatentChargeFitting):
         if not 0.0 < self.lr_update_damping <= 1.0:
             raise ValueError("`lr_update_damping` must be in (0, 1]")
         seed = kwargs.get("seed")
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, use_glu=use_glu, **kwargs)
         if self.dim_out != 1:
             raise ValueError("latent multipole interactions require one charge channel")
 
         trainable = (
             all(self.trainable) if isinstance(self.trainable, list) else self.trainable
         )
-        if self.use_glu:
-            in_dim = (
-                self.dim_descrpt
-                + self.numb_fparam
-                + (0 if self.use_aparam_as_mask else self.numb_aparam)
-                + self.dim_case_embd
-            )
-            n_networks = 1 if self.mixed_types else self.ntypes
-            self.nets = SeZMNetworkCollection(
-                0 if self.mixed_types else 1,
-                self.ntypes,
-                network_type="sezm_fitting_network",
-                networks=[
-                    GLUFittingNet(
-                        in_dim,
-                        1,
-                        self.neuron,
-                        activation_function=self.activation_function,
-                        resnet_dt=self.resnet_dt,
-                        precision=self.precision,
-                        bias_out=True,
-                        seed=child_seed(seed, 10_000 + idx),
-                        trainable=self.trainable,
-                        descriptor_dim=self.dim_descrpt,
-                        dim_case_embd=self.dim_case_embd,
-                        case_film_embd=False,
-                    )
-                    for idx in range(n_networks)
-                ],
-            )
         self.dipole_weight_net = FittingNet(
             self.dim_descrpt,
             self.embedding_width,
@@ -135,6 +117,10 @@ class LatentMultipoleFitting(LatentChargeFitting):
 
     def _parameter_array(self, name: str, like: Any) -> Any:
         """Return a parameter in the input namespace without detaching autograd."""
+        from deepmd.dpmodel.array_api import (
+            xp_asarray_nodetach,
+        )
+
         xp = array_api_compat.array_namespace(like)
         return xp_asarray_nodetach(
             xp,
@@ -160,46 +146,6 @@ class LatentMultipoleFitting(LatentChargeFitting):
     def charge_output_def(self) -> FittingOutputDef:
         return super().output_def()
 
-    def _charge_readout(
-        self, descriptor: Any, atype: Any, fparam: Any | None, aparam: Any | None
-    ) -> Any:
-        """Reproduce DPA4CLRFitting._forward_lr on the flat node axis."""
-        xp = array_api_compat.array_namespace(descriptor, atype)
-        n = descriptor.shape[0]
-        d1 = xp.reshape(descriptor, (n, 1, self.dim_descrpt))
-        a1 = xp.reshape(atype, (n, 1))
-        ap1 = None if aparam is None else xp.reshape(aparam, (n, 1, -1))
-        xx = d1
-        cond = self.conditioning_columns(d1, fparam, ap1)
-        if cond is not None:
-            xx = xp.concat([xx, cond], axis=-1)
-        net_dtype = get_xp_precision(xp, self.precision)
-        xx = xp.astype(xx, net_dtype)
-        if self.mixed_types:
-            charge = self.nets[()](xx)
-        else:
-            charge = xp.zeros(
-                (n, 1, 1), dtype=net_dtype, device=array_api_compat.device(descriptor)
-            )
-            for type_i in range(self.ntypes):
-                value = self.nets[(type_i,)](xx)
-                charge = charge + xp.where(
-                    (a1 == type_i)[..., None], value, xp.zeros_like(value)
-                )
-        bias = xp_asarray_nodetach(
-            xp,
-            self.bias_atom_e,
-            dtype=net_dtype,
-            device=array_api_compat.device(descriptor),
-        )
-        bias = xp.take(bias, xp.reshape(atype, (-1,)), axis=0)
-        charge = charge[:, 0, :] + 3.0 * xp.tanh(bias / 3.0)
-        exclude = xp.astype(self.emask.build_type_exclude_mask(atype), xp.bool)
-        charge = xp.where(exclude[:, None], charge, xp.zeros_like(charge))
-        if self.charge_bound is not None:
-            charge = self.charge_bound * xp.tanh(charge / self.charge_bound)
-        return charge
-
     def call_graph(
         self,
         descriptor: Any,
@@ -211,8 +157,9 @@ class LatentMultipoleFitting(LatentChargeFitting):
         aparam: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Return the latent charge and dipole of every node."""
         del g2, h2, kwargs
-        charge = self._charge_readout(descriptor, atype, fparam, aparam)
+        charge = self.readout(descriptor, atype, fparam, aparam)
         if gr is None:
             raise RuntimeError("latent multipoles require DPA4C degree-one moments")
         if gr.shape[-2] != self.embedding_width:
@@ -272,7 +219,9 @@ class LatentMultipoleFitting(LatentChargeFitting):
     def change_type_map(
         self, type_map: list[str], model_with_new_type_stat: Any = None
     ) -> None:
-        from deepmd.utils.finetune import get_index_between_two_maps
+        from deepmd.utils.finetune import (
+            get_index_between_two_maps,
+        )
 
         assert self.type_map is not None
         remap_index, has_new_type = get_index_between_two_maps(self.type_map, type_map)
@@ -293,8 +242,6 @@ class LatentMultipoleFitting(LatentChargeFitting):
         data["type"] = "latent_multipole"
         data.update(
             {
-                "charge_bound": self.charge_bound,
-                "use_glu": self.use_glu,
                 "embedding_width": self.embedding_width,
                 "lr_update_steps": self.lr_update_steps,
                 "lr_update_neuron": self.lr_update_neuron,
@@ -313,25 +260,14 @@ class LatentMultipoleFitting(LatentChargeFitting):
     @classmethod
     def deserialize(cls, data: dict) -> "LatentMultipoleFitting":
         data = data.copy()
-        variables = data.pop("@variables").copy()
+        variables = data["@variables"].copy()
         alpha_pol = variables.pop("alpha_pol", None)
+        data["@variables"] = variables
         if alpha_pol is not None:
             data["alpha_pol"] = np.asarray(alpha_pol).reshape(-1).tolist()
-        nets = data.pop("nets")
         dipole_weight_net = data.pop("dipole_weight_net")
         polar_update_net = data.pop("polar_update_net")
-        data.pop("@class")
-        data.pop("type")
-        check_version_compatibility(data.pop("@version", 1), 5, 1)
-        obj = cls(**data)
-        for key, value in variables.items():
-            obj[key] = value
-        if obj.use_glu:
-            obj.nets = SeZMNetworkCollection.deserialize(nets)
-        else:
-            from deepmd.dpmodel.utils.network import NetworkCollection
-
-            obj.nets = NetworkCollection.deserialize(nets)
+        obj = super().deserialize(data)
         obj.dipole_weight_net = FittingNet.deserialize(dipole_weight_net)
         if polar_update_net is not None:
             obj.polar_update_net = GLUFittingNet.deserialize(polar_update_net)
