@@ -934,11 +934,24 @@ def _trace_and_compile_graph(
     )
 
     s_lr_graph = build_all_pairs_unordered_graph(s_lr_coord, s_n_node)
-    s_topologies = model.atomic_model.build_topologies(
-        s_lr_coord,
-        s_n_node,
-        None,
-        atype=torch.zeros(trace_N, dtype=torch.int64, device=_trace_device),
+    # The dynamic axes of the topologies take sample lengths distinct from
+    # the other dynamic axes: a compiled graph would otherwise identify two
+    # axes that happen to share a length and split at their reductions.
+    from deepmd.pt_expt.utils.serialization import (
+        build_synthetic_topologies,
+    )
+
+    s_topologies = build_synthetic_topologies(
+        model,
+        trace_N,
+        _next_safe_prime(
+            int(s_lr_graph.edge_index.shape[1]) + 2,
+            _forbidden | {trace_nf, trace_N, trace_N + 1},
+        ),
+        dtype=GLOBAL_PT_FLOAT_PRECISION,
+        device=_trace_device,
+        nframes=trace_nf,
+        forbidden=_forbidden,
     )
     topology_names = tuple(s_topologies)
     s_topology_vals = flatten_topologies(s_topologies)

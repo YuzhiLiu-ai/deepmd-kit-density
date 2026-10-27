@@ -30,6 +30,7 @@ from deepmd.dpmodel.utils.neighbor_graph import (
     PairGraph,
     edge_force_virial,
     frame_id_from_n_node,
+    node_validity_mask,
     pair_force_virial,
     segment_sum,
 )
@@ -73,6 +74,45 @@ def releaf_topologies(
     }
 
 
+def _cell_force_virial(
+    g_coord: torch.Tensor,
+    g_strain: torch.Tensor,
+    coord: torch.Tensor,
+    n_node: torch.Tensor,
+    n_local: torch.Tensor | None,
+    do_atomic_virial: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Force and virial of a reciprocal-space energy from its geometry leaves.
+
+    The gradient with respect to the node positions is the negative force,
+    and that with respect to the zero strain of every frame the negative
+    virial. The atomic virial takes ``F_i (x) r_i`` at every node, the force
+    index first as for the edge virial, and shares the rest of the virial of
+    the frame, the part of the cell, evenly over its owned nodes, so that the
+    nodes of a frame sum to its virial; the halo nodes, images that carry no
+    charge, take no share.
+    """
+    force = -g_coord
+    virial = -g_strain
+    if not do_atomic_virial:
+        return force, None, virial
+    n_total = force.shape[0]
+    frame_id = frame_id_from_n_node(n_node, n_total)
+    atom_virial = force[:, :, None] * coord.to(force.dtype)[:, None, :]
+    remainder = virial - segment_sum(atom_virial, frame_id, n_node.shape[0])
+    if n_local is None:
+        owned = node_validity_mask(n_node, n_total)
+        count = n_node
+    else:
+        owned = node_ownership_mask(n_node, n_local, n_total)
+        count = n_local
+    share = owned.to(force.dtype) / torch.clamp(
+        count.to(force.dtype)[frame_id], min=1.0
+    )
+    atom_virial = atom_virial + remainder[frame_id] * share[:, None, None]
+    return force, atom_virial, virial
+
+
 def edge_energy_deriv(
     energy: torch.Tensor,
     edge_vec: torch.Tensor,
@@ -89,7 +129,8 @@ def edge_energy_deriv(
     do_atomic_virial: bool = False,
     create_graph: bool = False,
     force_precision: torch.dtype | None = None,
-    topologies: Sequence[PairGraph] = (),
+    topologies: Sequence[PairGraph | KGrid | MeshGrid] = (),
+    n_local: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Return (force, atom_virial_or_None, virial) from a graph energy.
 
@@ -140,6 +181,17 @@ def edge_energy_deriv(
     create_graph
         whether the backward retains a graph (training, for second-order grad).
 
+    topologies
+        Topologies on the same node axis whose ``LEAVES`` are further
+        autograd leaves of ``energy``: the pair vectors of a pair topology,
+        pulled back by ``pair_force_virial``; the node positions and zero
+        strain of a reciprocal-space topology, whose gradients are its force
+        and negative virial (see :func:`_cell_force_virial`).
+    n_local
+        (nf,) per-frame owned node counts, or ``None`` when every node is
+        owned; the owned nodes share the cell part of the virial of a
+        reciprocal-space topology.
+
     Returns
     -------
     force
@@ -149,10 +201,12 @@ def edge_energy_deriv(
     virial
         (nf, 3, 3) per-frame virial (always computed).
     """
-    pair_leaves = [topology.vec for topology in topologies]
-    g_e, *g_pairs = torch.autograd.grad(
+    leaves = [
+        getattr(topology, name) for topology in topologies for name in topology.LEAVES
+    ]
+    g_e, *g_leaves = torch.autograd.grad(
         energy.sum() if energy.dim() else energy,
-        (edge_vec, *pair_leaves),
+        (edge_vec, *leaves),
         create_graph=create_graph,
         retain_graph=True,
     )
@@ -228,19 +282,29 @@ def edge_energy_deriv(
         force, atom_virial, virial = edge_force_virial(
             g_e, edge_vec, edge_index, edge_mask, n_node, node_capacity=node_capacity
         )
-    for topology, g_pair in zip(topologies, g_pairs, strict=True):
-        pair_force, pair_atom_virial, pair_virial = pair_force_virial(
-            g_pair,
-            topology.vec,
-            topology.index,
-            topology.mask,
-            n_node,
-            node_capacity=force.shape[0],
-        )
-        force = force + pair_force.to(force.dtype)
-        virial = virial + pair_virial.to(virial.dtype)
+    offset = 0
+    for topology in topologies:
+        grads = g_leaves[offset : offset + len(topology.LEAVES)]
+        offset += len(topology.LEAVES)
+        if isinstance(topology, PairGraph):
+            (g_p,) = grads
+            leaf_force, leaf_atom_virial, leaf_virial = pair_force_virial(
+                g_p,
+                topology.vec,
+                topology.index,
+                topology.mask,
+                n_node,
+                node_capacity=force.shape[0],
+            )
+        else:
+            g_coord, g_strain = grads
+            leaf_force, leaf_atom_virial, leaf_virial = _cell_force_virial(
+                g_coord, g_strain, topology.coord, n_node, n_local, do_atomic_virial
+            )
+        force = force + leaf_force.to(force.dtype)
+        virial = virial + leaf_virial.to(virial.dtype)
         if do_atomic_virial:
-            atom_virial = atom_virial + pair_atom_virial.to(atom_virial.dtype)
+            atom_virial = atom_virial + leaf_atom_virial.to(atom_virial.dtype)
     return force, (atom_virial if do_atomic_virial else None), virial
 
 
@@ -255,7 +319,7 @@ def fit_output_to_model_output_graph(
     n_local: torch.Tensor | None = None,
     force_precision: torch.dtype | None = None,
     spin_leaf: torch.Tensor | None = None,
-    topologies: dict[str, PairGraph] | None = None,
+    topologies: dict[str, PairGraph | KGrid | MeshGrid] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Graph analogue of the dense pt_expt ``fit_output_to_model_output``.
 
@@ -439,6 +503,7 @@ def fit_output_to_model_output_graph(
                 create_graph=create_graph,
                 force_precision=force_precision if not create_graph else None,
                 topologies=() if topologies is None else tuple(topologies.values()),
+                n_local=n_local,
             )
             # force (N, 3) -> (N, 1, 3)  [flat; caller unravels at I/O boundary]
             ff_list.append(force.reshape(N, 1, 3))

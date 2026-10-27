@@ -164,11 +164,23 @@ class DPAtomicModel(BaseAtomicModel):
 
     def _check_long_range(self) -> None:
         """Validate the currently supported plugin composition."""
+        from deepmd.dpmodel.utils.neighbor_graph import (
+            ALL_PAIRS,
+        )
+
         if "energy" not in self.fitting_net.output_def().keys():
             raise ValueError("a long-range module requires an energy fitting")
         if self.atom_exclude_types:
             raise NotImplementedError(
                 "`atom_exclude_types` is not supported with a long-range module"
+            )
+        if self.pair_exclude_types and any(
+            name != ALL_PAIRS for name in self.long_range.required_topologies()
+        ):
+            raise NotImplementedError(
+                "`pair_exclude_types` is not supported with a long-range module "
+                "that serves periodic systems, whose reciprocal-space sum is "
+                "global and excludes no pair"
             )
         if self.long_range.uses_charge_spin() and not self.add_chg_spin_ebd:
             raise ValueError("a charge_spin constraint requires `add_chg_spin_ebd`")

@@ -138,6 +138,20 @@ class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")
         """
         raise NotImplementedError
 
+    def dipole_contact_value(self, like: Array) -> Array:
+        r"""The radial second derivative at contact, :math:`K''(0)`, in Å⁻³.
+
+        The self content of a dipole in the k-space lattice sum is
+        :math:`-\frac{1}{2} K''(0) p^2`, which the evaluation subtracts; the
+        generalized force carries :math:`k_e K''(0) p`.
+
+        Parameters
+        ----------
+        like
+            An array giving the namespace, dtype and device of the result.
+        """
+        raise NotImplementedError
+
     def kspace_cutoff(self, tolerance: float = 1e-8) -> float:
         """Wave number at which the kernel weight falls below ``tolerance``.
 
@@ -290,6 +304,12 @@ class LESKernel(BaseInteractionKernel):
         alpha = xp.exp(self._parameter("log_alpha", like))
         return 2.0 * alpha / np.sqrt(np.pi)
 
+    def dipole_contact_value(self, like: Array) -> Array:
+        xp = array_api_compat.array_namespace(like)
+        alpha = xp.exp(self._parameter("log_alpha", like))
+        # K(r) = erf(alpha r)/r = (2 alpha / sqrt(pi)) (1 - alpha^2 r^2/3 + ...)
+        return -4.0 * alpha**3 / (3.0 * np.sqrt(np.pi))
+
     def kspace_cutoff(self, tolerance: float = 1e-8) -> float:
         # exp(-k^2 / 4 alpha^2) < tolerance
         alpha = float(np.exp(to_numpy_array(self.log_alpha).astype(np.float64)))
@@ -405,6 +425,13 @@ class SOGKernel(BaseInteractionKernel):
         xp = array_api_compat.array_namespace(like)
         amplitude = self._parameter("amplitude", like)
         return xp.sum(amplitude)
+
+    def dipole_contact_value(self, like: Array) -> Array:
+        xp = array_api_compat.array_namespace(like)
+        amplitude = self._parameter("amplitude", like)
+        width = xp.exp(self._parameter("log_width", like))
+        # K(r) = sum_k a_k exp(-r^2 / 2 sigma_k^2), K''(0) = -sum_k a_k/sigma_k^2
+        return -xp.sum(amplitude / (width * width))
 
     def kspace_cutoff(self, tolerance: float = 1e-8) -> float:
         # the slowest-decaying mode is the NARROWEST Gaussian:

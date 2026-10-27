@@ -4032,7 +4032,17 @@ def long_range_latent_charge() -> list[Argument]:
             bool,
             optional=True,
             default=False,
-            doc="Periodic evaluation is reserved for a later migration stage.",
+            doc="Evaluate periodic systems in reciprocal space over the k grid "
+            "enumerated from each cell (tin-foil boundary, every constrained "
+            "channel neutral).",
+        ),
+        Argument(
+            "kspace_tolerance",
+            float,
+            optional=True,
+            default=1e-8,
+            doc="The relative weight of the slowest-decaying kernel mode at the "
+            "wave-number cutoff of the k grid of a periodic batch.",
         ),
     ]
 

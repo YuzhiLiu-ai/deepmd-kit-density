@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Non-periodic direct interaction of descriptor-predicted latent multipoles."""
+"""Direct and reciprocal interaction of descriptor-predicted latent multipoles."""
 
 from typing import Any
 
@@ -8,7 +8,12 @@ import array_api_compat
 from deepmd.dpmodel.array_api import Array, xp_erf
 from deepmd.dpmodel.common import get_xp_precision
 from deepmd.dpmodel.fitting.latent_multipole import LatentMultipoleFitting
-from deepmd.dpmodel.utils.neighbor_graph import frame_id_from_n_node, segment_sum
+from deepmd.dpmodel.utils.neighbor_graph import (
+    ALL_PAIRS,
+    K_GRID,
+    frame_id_from_n_node,
+    segment_sum,
+)
 from deepmd.dpmodel.utils.seed import child_seed
 from deepmd.utils.version import check_version_compatibility
 
@@ -18,6 +23,10 @@ from .latent_charge import (
     CHARGE_NET_NEURON,
     CHARGE_NET_SEED_INDEX,
     LatentChargeLongRange,
+)
+from .reciprocal import (
+    kspace_multipole_energy,
+    kspace_multipole_potential_field,
 )
 
 _SQRT_PI = 1.7724538509055160272981674833411451827975494561224
@@ -38,12 +47,20 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         kernel: BaseInteractionKernel,
         charge_constraint: dict | None = None,
         use_self_pol: bool = True,
+        periodic: bool = False,
+        kspace_tolerance: float = 1e-8,
     ) -> None:
         if kernel.TYPE != "les":
             raise NotImplementedError(
                 "latent multipoles currently require the LES kernel"
             )
-        super().__init__(charge_net, kernel, charge_constraint)
+        super().__init__(
+            charge_net,
+            kernel,
+            charge_constraint,
+            periodic=periodic,
+            kspace_tolerance=kspace_tolerance,
+        )
         self.use_self_pol = bool(use_self_pol)
 
     @property
@@ -73,9 +90,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 "compressed DPA4C does not expose degree-one moments for latent multipoles"
             )
         if config.get("periodic", False):
-            raise NotImplementedError(
-                "LatentMultipoleLongRange currently supports non-periodic direct evaluation only"
-            )
+            pass  # periodic evaluation over the k grid is served below
         if int(config.get("channels", 1)) != 1:
             raise ValueError("latent multipoles require `channels=1`")
         charge_net_config = {
@@ -122,6 +137,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             kernel_cls(**kernel_config),
             config.get("charge_constraint"),
             bool(config.get("use_self_pol", True)),
+            periodic=bool(config.get("periodic", False)),
+            kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
         )
 
     def call_graph(
@@ -140,7 +157,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         if descriptor_context is None or descriptor_context.get("gr") is None:
             raise RuntimeError("latent multipoles require DPA4C degree-one moments")
         n = descriptor.shape[0]
-        pairs = topologies[self.required_topologies()[0]]
+        pairs = topologies[ALL_PAIRS]
+        k_grid = topologies.get(K_GRID) if self.periodic else None
         frame_id = frame_id_from_n_node(n_node, n_total=n)
         fparam_node = None if fparam is None else xp.take(fparam, frame_id, axis=0)
         initial = self.charge_net.call_graph(
@@ -185,33 +203,26 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 )
             mask_q = xp.astype(node_mask[:, None], update_dtype)
             for _ in range(self.charge_net.lr_update_steps):
-                q_src = q[src, 0]
-                q_dst = q[dst, 0]
-                p_src = p[src]
-                p_dst = p[dst]
-                p_src_dot_r = xp.sum(p_src * update_vec, axis=-1)
-                p_dst_dot_r = xp.sum(p_dst * update_vec, axis=-1)
-                potential_dst = (
-                    q_src * update_k - update_a * p_src_dot_r
-                ) * update_mask
-                potential_src = (
-                    q_dst * update_k + update_a * p_dst_dot_r
-                ) * update_mask
-                field_dst = (
-                    q_src[:, None] * update_a[:, None] * update_vec
-                    - update_a[:, None] * p_src
-                    - update_c[:, None] * p_src_dot_r[:, None] * update_vec
-                ) * update_mask[:, None]
-                field_src = (
-                    -q_dst[:, None] * update_a[:, None] * update_vec
-                    - update_a[:, None] * p_dst
-                    - update_c[:, None] * p_dst_dot_r[:, None] * update_vec
-                ) * update_mask[:, None]
-                potential = (
-                    segment_sum(potential_dst, dst, n)
-                    + segment_sum(potential_src, src, n)
-                )[:, None]
-                field = segment_sum(field_dst, dst, n) + segment_sum(field_src, src, n)
+                potential, field = self._pair_potential_field(
+                    q,
+                    p,
+                    update_vec,
+                    update_mask,
+                    update_k,
+                    update_a,
+                    update_c,
+                    src,
+                    dst,
+                    n,
+                    xp,
+                )
+                if k_grid is not None:
+                    # The electric field of the k-space sum is -dE/dp.
+                    phi_k, force_k = kspace_multipole_potential_field(
+                        q, p, k_grid, self.kernel
+                    )
+                    potential = potential + phi_k
+                    field = field - force_k
                 q, p = self.charge_net.update_polar_state(
                     update_descriptor, q, p, local_p, potential, field
                 )
@@ -254,11 +265,53 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
+        if k_grid is not None:
+            # The k-space energy is attributed per atom as (q phi + p . F) / 2.
+            energy = energy + kspace_multipole_energy(q, p, k_grid, self.kernel)
         return {
             "energy": xp.reshape(energy, (n, 1)),
             "latent_charge": q,
             "latent_dipole": p,
         }
+
+    def _pair_potential_field(
+        self,
+        q: Array,
+        p: Array,
+        update_vec: Array,
+        update_mask: Array,
+        update_k: Array,
+        update_a: Array,
+        update_c: Array,
+        src: Array,
+        dst: Array,
+        n: int,
+        xp: Any,
+    ) -> tuple[Array, Array]:
+        """The pair-sum potential and electric field of the current state."""
+        q_src = q[src, 0]
+        q_dst = q[dst, 0]
+        p_src = p[src]
+        p_dst = p[dst]
+        p_src_dot_r = xp.sum(p_src * update_vec, axis=-1)
+        p_dst_dot_r = xp.sum(p_dst * update_vec, axis=-1)
+        potential_dst = (q_src * update_k - update_a * p_src_dot_r) * update_mask
+        potential_src = (q_dst * update_k + update_a * p_dst_dot_r) * update_mask
+        field_dst = (
+            q_src[:, None] * update_a[:, None] * update_vec
+            - update_a[:, None] * p_src
+            - update_c[:, None] * p_src_dot_r[:, None] * update_vec
+        ) * update_mask[:, None]
+        field_src = (
+            -q_dst[:, None] * update_a[:, None] * update_vec
+            - update_a[:, None] * p_dst
+            - update_c[:, None] * p_dst_dot_r[:, None] * update_vec
+        ) * update_mask[:, None]
+        potential = (
+            segment_sum(potential_dst, dst, n) + segment_sum(potential_src, src, n)
+        )[:, None]
+        field = segment_sum(field_dst, dst, n) + segment_sum(field_src, src, n)
+        return potential, field
 
     def _radial_coefficients(
         self, r_sq: Array, src: Array, n: int
@@ -313,7 +366,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         return self.kernel.coefficients(r_sq)
 
     def serialize(self) -> dict:
-        return {
+        data = {
             "@class": "LongRange",
             "type": "latent_multipole",
             "@version": 1,
@@ -322,6 +375,10 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "charge_constraint": self.charge_constraint,
             "use_self_pol": self.use_self_pol,
         }
+        if self.periodic:
+            data["periodic"] = True
+            data["kspace_tolerance"] = self.kspace_tolerance
+        return data
 
     @classmethod
     def deserialize(cls, data: dict) -> "LatentMultipoleLongRange":
@@ -332,4 +389,6 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             BaseInteractionKernel.deserialize(data["kernel"]),
             data["charge_constraint"],
             data["use_self_pol"],
+            periodic=data.get("periodic", False),
+            kspace_tolerance=data.get("kspace_tolerance", 1e-8),
         )

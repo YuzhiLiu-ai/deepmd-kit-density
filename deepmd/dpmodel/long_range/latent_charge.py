@@ -9,6 +9,7 @@ from typing import (
 )
 
 import array_api_compat
+import numpy as np
 
 from deepmd.dpmodel.array_api import (
     Array,
@@ -24,6 +25,7 @@ from deepmd.dpmodel.output_def import (
 )
 from deepmd.dpmodel.utils.neighbor_graph import (
     ALL_PAIRS,
+    K_GRID,
     frame_id_from_n_node,
     segment_sum,
 )
@@ -45,6 +47,9 @@ from .kernel import (
     COULOMB_CONSTANT,
     BaseInteractionKernel,
 )
+from .reciprocal import (
+    kspace_energy,
+)
 
 CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
 CHARGE_NET_NEURON = [64, 64]
@@ -65,6 +70,8 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         charge_net: LatentChargeFitting,
         kernel: BaseInteractionKernel,
         charge_constraint: dict | None = None,
+        periodic: bool = False,
+        kspace_tolerance: float = 1e-8,
     ) -> None:
         if charge_net.vacuum_ref:
             raise ValueError("a latent-charge readout cannot use `vacuum_ref`")
@@ -73,6 +80,15 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         self.charge_constraint = self._normalize_constraint(
             charge_constraint, charge_net
         )
+        self.periodic = bool(periodic)
+        self.kspace_tolerance = float(kspace_tolerance)
+        if (
+            not np.isfinite(self.kspace_tolerance)
+            or not 0.0 < self.kspace_tolerance < 1.0
+        ):
+            raise ValueError(
+                f"`kspace_tolerance` must be in (0, 1), got {self.kspace_tolerance}"
+            )
 
     @staticmethod
     def _normalize_constraint(
@@ -108,10 +124,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                 "LatentChargeLongRange requires the NeighborGraph lower"
             )
         if config.get("periodic", False):
-            raise NotImplementedError(
-                "LatentChargeLongRange currently supports non-periodic direct "
-                "evaluation only; periodic k-grid/PME is not implemented"
-            )
+            pass  # periodic evaluation over the k grid is served below
         charge_net_config = {
             "neuron": CHARGE_NET_NEURON,
             "activation_function": fitting.activation_function,
@@ -140,14 +153,25 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             **charge_net_config,
         )
         return cls(
-            charge_net, kernel_cls(**kernel_config), config.get("charge_constraint")
+            charge_net,
+            kernel_cls(**kernel_config),
+            config.get("charge_constraint"),
+            periodic=bool(config.get("periodic", False)),
+            kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
         )
 
     def output_def(self) -> FittingOutputDef:
         return self.charge_net.output_def()
 
     def required_topologies(self) -> tuple[str, ...]:
+        if self.periodic:
+            return (ALL_PAIRS, K_GRID)
         return (ALL_PAIRS,)
+
+    def topology_params(self) -> dict[str, dict[str, Any]]:
+        if not self.periodic:
+            return {}
+        return {K_GRID: {"k_max": self.kernel.kspace_cutoff(self.kspace_tolerance)}}
 
     def uses_charge_spin(self) -> bool:
         return (
@@ -199,8 +223,16 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
+        energy = xp.reshape(energy, (n, 1))
+        if self.periodic:
+            # The k-space energy is attributed to the atoms as q.phi/2 (see
+            # reciprocal.kspace_energy); its gradient w.r.t. the grid's coord
+            # and strain leaves gives its force and negative virial.
+            energy = energy + xp.reshape(
+                kspace_energy(charge, topologies[K_GRID], self.kernel), (n, 1)
+            )
         return {
-            "energy": xp.reshape(energy, (n, 1)),
+            "energy": energy,
             "latent_charge": charge,
         }
 
@@ -273,7 +305,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         self.charge_net.set_case_embd(case_idx)
 
     def serialize(self) -> dict:
-        return {
+        data = {
             "@class": "LongRange",
             "type": "latent_charge",
             "@version": 1,
@@ -281,6 +313,10 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             "kernel": self.kernel.serialize(),
             "charge_constraint": self.charge_constraint,
         }
+        if self.periodic:
+            data["periodic"] = True
+            data["kspace_tolerance"] = self.kspace_tolerance
+        return data
 
     @classmethod
     def deserialize(cls, data: dict) -> "LatentChargeLongRange":
@@ -290,4 +326,6 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             LatentChargeFitting.deserialize(data["charge_net"]),
             BaseInteractionKernel.deserialize(data["kernel"]),
             data["charge_constraint"],
+            periodic=data.get("periodic", False),
+            kspace_tolerance=data.get("kspace_tolerance", 1e-8),
         )

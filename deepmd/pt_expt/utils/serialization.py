@@ -674,6 +674,80 @@ def build_synthetic_graph_inputs(
     )
 
 
+def build_synthetic_topologies(
+    model: torch.nn.Module,
+    n_node_total: int,
+    n_entry: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    nframes: int,
+    forbidden: set[int] | frozenset[int] = frozenset(),
+) -> dict[str, Any]:
+    """Build trace-time samples of the topologies a model declares.
+
+    Single source of the trace-time topology inputs, shared by graph export
+    and compiled training. Tracing reads only their shapes. The pair
+    topology lists ``n_entry`` pairs, a length the caller keeps distinct from
+    the other dynamic axes; a mesh takes the three smallest even dimensions,
+    and a k grid the three smallest lengths for its slots, its blocks and the
+    points of a block, of at least four that no other axis and no entry of
+    ``forbidden`` has. Every length thus differs from the two rows of a pair
+    index and the three components of a vector, and from every other dynamic
+    axis, which a compiled graph would otherwise identify with it.
+    """
+    from deepmd.dpmodel.utils.neighbor_graph import (
+        K_GRID,
+        PME_MESH,
+        KGrid,
+        PairGraph,
+    )
+    from deepmd.dpmodel.utils.neighbor_graph.reciprocal_graph import (
+        mesh_grid_of_dims,
+    )
+
+    taken = set(forbidden) | {nframes, n_node_total, n_node_total + 1, n_entry}
+    mesh_dims = []
+    for size in range(4, 4 + 2 * len(taken) + 6, 2):
+        if size not in taken and len(mesh_dims) < 3:
+            mesh_dims.append(size)
+    free = sorted(set(range(4, len(taken) + 10)) - taken - set(mesh_dims))
+    n_slot, n_block, n_point = free[:3]
+    coord = torch.ones(n_node_total, 3, dtype=dtype, device=device)
+    # Contiguous like the inputs at run time: a compiled graph reads the
+    # strides of its samples.
+    box = torch.eye(3, dtype=dtype, device=device).repeat(nframes, 1, 1)
+    topologies = {}
+    for name in model.atomic_model.required_topologies():
+        if name == K_GRID:
+            slot = torch.arange(nframes * n_slot, dtype=torch.int64, device=device)
+            blocks = (nframes, n_block, n_point)
+            topologies[name] = KGrid(
+                # Nonzero wave numbers: the kernel transform carries 1/k^2.
+                vec=torch.ones(*blocks, 3, dtype=dtype, device=device),
+                mask=torch.ones(*blocks, dtype=torch.bool, device=device),
+                slot=(slot % n_node_total).reshape(nframes, n_slot),
+                volume=torch.ones(nframes, dtype=dtype, device=device),
+                coord=coord,
+                strain=torch.zeros(nframes, 3, 3, dtype=dtype, device=device),
+            )
+        elif name == PME_MESH:
+            topologies[name] = mesh_grid_of_dims(
+                box,
+                coord,
+                tuple(mesh_dims),
+                torch.ones(nframes, dtype=torch.bool, device=device),
+            )
+        else:
+            index = torch.arange(2 * n_entry, dtype=torch.int64, device=device)
+            topologies[name] = PairGraph(
+                index=index.reshape(2, n_entry) % n_node_total,
+                vec=torch.ones(n_entry, 3, dtype=dtype, device=device),
+                mask=torch.ones(n_entry, dtype=torch.bool, device=device),
+            )
+    return topologies
+
+
 def build_synthetic_canonical_graph_inputs(
     model: torch.nn.Module,
     e_max: int,
