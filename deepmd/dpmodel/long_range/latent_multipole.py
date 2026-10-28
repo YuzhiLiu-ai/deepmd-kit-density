@@ -11,6 +11,7 @@ from deepmd.dpmodel.fitting.latent_multipole import LatentMultipoleFitting
 from deepmd.dpmodel.utils.neighbor_graph import (
     ALL_PAIRS,
     K_GRID,
+    PME_MESH,
     frame_id_from_n_node,
     segment_sum,
 )
@@ -27,6 +28,8 @@ from .latent_charge import (
 from .reciprocal import (
     kspace_multipole_energy,
     kspace_multipole_potential_field,
+    mesh_multipole_energy,
+    mesh_multipole_potential_field,
 )
 
 _SQRT_PI = 1.7724538509055160272981674833411451827975494561224
@@ -49,6 +52,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         use_self_pol: bool = True,
         periodic: bool = False,
         kspace_tolerance: float = 1e-8,
+        k_grid_mode: str = "kgrid",
+        pme_order: int = 8,
     ) -> None:
         if kernel.TYPE != "les":
             raise NotImplementedError(
@@ -60,6 +65,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             charge_constraint,
             periodic=periodic,
             kspace_tolerance=kspace_tolerance,
+            k_grid_mode=k_grid_mode,
+            pme_order=pme_order,
         )
         self.use_self_pol = bool(use_self_pol)
 
@@ -139,6 +146,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             bool(config.get("use_self_pol", True)),
             periodic=bool(config.get("periodic", False)),
             kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
+            k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
+            pme_order=int(config.get("pme_order", 8)),
         )
 
     def call_graph(
@@ -158,7 +167,10 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             raise RuntimeError("latent multipoles require DPA4C degree-one moments")
         n = descriptor.shape[0]
         pairs = topologies[ALL_PAIRS]
-        k_grid = topologies.get(K_GRID) if self.periodic else None
+        mesh = topologies.get(PME_MESH) if self.periodic else None
+        k_grid = None
+        if self.periodic and mesh is None:
+            k_grid = topologies.get(K_GRID)
         frame_id = frame_id_from_n_node(n_node, n_total=n)
         fparam_node = None if fparam is None else xp.take(fparam, frame_id, axis=0)
         initial = self.charge_net.call_graph(
@@ -223,6 +235,12 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     )
                     potential = potential + phi_k
                     field = field - force_k
+                if mesh is not None:
+                    phi_m, force_m = mesh_multipole_potential_field(
+                        q, p, mesh, frame_id, self.kernel, self.pme_order
+                    )
+                    potential = potential + phi_m
+                    field = field - force_m
                 q, p = self.charge_net.update_polar_state(
                     update_descriptor, q, p, local_p, potential, field
                 )
@@ -268,6 +286,10 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         if k_grid is not None:
             # The k-space energy is attributed per atom as (q phi + p . F) / 2.
             energy = energy + kspace_multipole_energy(q, p, k_grid, self.kernel)
+        if mesh is not None:
+            energy = energy + mesh_multipole_energy(
+                q, p, mesh, frame_id, self.kernel, self.pme_order
+            )
         return {
             "energy": xp.reshape(energy, (n, 1)),
             "latent_charge": q,
@@ -378,17 +400,24 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         if self.periodic:
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
+            data["k_grid_mode"] = self.k_grid_mode
+            data["pme_order"] = self.pme_order
         return data
 
     @classmethod
     def deserialize(cls, data: dict) -> "LatentMultipoleLongRange":
         data = data.copy()
         check_version_compatibility(data.pop("@version"), 1, 1)
+        periodic = data.get("periodic", False)
         return cls(
             LatentMultipoleFitting.deserialize(data["charge_net"]),
             BaseInteractionKernel.deserialize(data["kernel"]),
             data["charge_constraint"],
             data["use_self_pol"],
-            periodic=data.get("periodic", False),
+            periodic=periodic,
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),
+            # A periodic record that names no mode predates the mesh and
+            # evaluates the explicit wave numbers.
+            k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
+            pme_order=data.get("pme_order", 8),
         )

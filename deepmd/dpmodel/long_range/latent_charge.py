@@ -26,6 +26,7 @@ from deepmd.dpmodel.output_def import (
 from deepmd.dpmodel.utils.neighbor_graph import (
     ALL_PAIRS,
     K_GRID,
+    PME_MESH,
     frame_id_from_n_node,
     segment_sum,
 )
@@ -49,11 +50,15 @@ from .kernel import (
 )
 from .reciprocal import (
     kspace_energy,
+    mesh_energy,
 )
 
 CHARGE_TARGET_SOURCES = ("neutral", "charge_spin", "fparam")
 CHARGE_NET_NEURON = [64, 64]
 CHARGE_NET_SEED_INDEX = 10_000
+K_GRID_MODES = ("kgrid", "pme")
+PME_ORDER = 8
+PME_SPACING_FRACTION = 0.75
 
 
 @BaseLongRange.register("latent_charge")
@@ -72,6 +77,8 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         charge_constraint: dict | None = None,
         periodic: bool = False,
         kspace_tolerance: float = 1e-8,
+        k_grid_mode: str = "kgrid",
+        pme_order: int = PME_ORDER,
     ) -> None:
         if charge_net.vacuum_ref:
             raise ValueError("a latent-charge readout cannot use `vacuum_ref`")
@@ -89,6 +96,14 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             raise ValueError(
                 f"`kspace_tolerance` must be in (0, 1), got {self.kspace_tolerance}"
             )
+        self.k_grid_mode = str(k_grid_mode)
+        if self.k_grid_mode not in K_GRID_MODES:
+            raise ValueError(
+                f"`k_grid_mode` must be one of {K_GRID_MODES}, got {self.k_grid_mode!r}"
+            )
+        self.pme_order = int(pme_order)
+        if self.pme_order < 2:
+            raise ValueError(f"`pme_order` must be at least 2, got {self.pme_order}")
 
     @staticmethod
     def _normalize_constraint(
@@ -158,6 +173,10 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             config.get("charge_constraint"),
             periodic=bool(config.get("periodic", False)),
             kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
+            # The explicit k grid stays the default until the mesh test suite
+            # lands; PME is opt-in via `k_grid_mode: "pme"`.
+            k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
+            pme_order=int(config.get("pme_order", PME_ORDER)),
         )
 
     def output_def(self) -> FittingOutputDef:
@@ -165,13 +184,20 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
 
     def required_topologies(self) -> tuple[str, ...]:
         if self.periodic:
+            if self.k_grid_mode == "pme":
+                return (ALL_PAIRS, PME_MESH)
             return (ALL_PAIRS, K_GRID)
         return (ALL_PAIRS,)
 
     def topology_params(self) -> dict[str, dict[str, Any]]:
         if not self.periodic:
             return {}
-        return {K_GRID: {"k_max": self.kernel.kspace_cutoff(self.kspace_tolerance)}}
+        k_max = self.kernel.kspace_cutoff(self.kspace_tolerance)
+        if self.k_grid_mode == "pme":
+            # B-splines of pme_order at three quarters of the Nyquist spacing
+            # of the wave-number cutoff.
+            return {PME_MESH: {"spacing": PME_SPACING_FRACTION * float(np.pi) / k_max}}
+        return {K_GRID: {"k_max": k_max}}
 
     def uses_charge_spin(self) -> bool:
         return (
@@ -225,12 +251,25 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         energy = xp.take(frame_energy / count, frame_id, axis=0)
         energy = xp.reshape(energy, (n, 1))
         if self.periodic:
-            # The k-space energy is attributed to the atoms as q.phi/2 (see
-            # reciprocal.kspace_energy); its gradient w.r.t. the grid's coord
-            # and strain leaves gives its force and negative virial.
-            energy = energy + xp.reshape(
-                kspace_energy(charge, topologies[K_GRID], self.kernel), (n, 1)
-            )
+            if self.k_grid_mode == "pme":
+                # The mesh energy is attributed to the atoms as q.phi/2 (see
+                # reciprocal.mesh_energy); its gradient w.r.t. the mesh's
+                # coord and strain leaves gives its force and negative virial.
+                energy = energy + xp.reshape(
+                    mesh_energy(
+                        charge,
+                        topologies[PME_MESH],
+                        frame_id,
+                        self.kernel,
+                        self.pme_order,
+                    ),
+                    (n, 1),
+                )
+            else:
+                # The k-space energy is attributed to the atoms as q.phi/2.
+                energy = energy + xp.reshape(
+                    kspace_energy(charge, topologies[K_GRID], self.kernel), (n, 1)
+                )
         return {
             "energy": energy,
             "latent_charge": charge,
@@ -316,16 +355,23 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         if self.periodic:
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
+            data["k_grid_mode"] = self.k_grid_mode
+            data["pme_order"] = self.pme_order
         return data
 
     @classmethod
     def deserialize(cls, data: dict) -> "LatentChargeLongRange":
         data = data.copy()
         check_version_compatibility(data.pop("@version"), 1, 1)
+        periodic = data.get("periodic", False)
         return cls(
             LatentChargeFitting.deserialize(data["charge_net"]),
             BaseInteractionKernel.deserialize(data["kernel"]),
             data["charge_constraint"],
-            periodic=data.get("periodic", False),
+            periodic=periodic,
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),
+            # A periodic record that names no mode predates the mesh and
+            # evaluates the explicit wave numbers.
+            k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
+            pme_order=data.get("pme_order", PME_ORDER),
         )

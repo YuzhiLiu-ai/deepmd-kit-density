@@ -4044,6 +4044,23 @@ def long_range_latent_charge() -> list[Argument]:
             doc="The relative weight of the slowest-decaying kernel mode at the "
             "wave-number cutoff of the k grid of a periodic batch.",
         ),
+        Argument(
+            "k_grid_mode",
+            str,
+            optional=True,
+            default="kgrid",
+            extra_check=lambda x: x in ("kgrid", "pme"),
+            doc="Evaluation of the periodic reciprocal sum: 'kgrid' sums the "
+            "explicit wave numbers; 'pme' evaluates the smooth particle-mesh "
+            "Ewald sum on a per-batch mesh.",
+        ),
+        Argument(
+            "pme_order",
+            int,
+            optional=True,
+            default=8,
+            doc="The B-spline order of the particle-mesh evaluation.",
+        ),
     ]
 
 
@@ -4096,6 +4113,31 @@ def long_range_latent_multipole() -> list[Argument]:
         ),
         Argument("lr_update_damping", float, optional=True, default=0.2),
         Argument("periodic", bool, optional=True, default=False),
+        Argument(
+            "kspace_tolerance",
+            float,
+            optional=True,
+            default=1e-8,
+            doc="The relative weight of the slowest-decaying kernel mode at the "
+            "wave-number cutoff of the k grid of a periodic batch.",
+        ),
+        Argument(
+            "k_grid_mode",
+            str,
+            optional=True,
+            default="kgrid",
+            extra_check=lambda x: x in ("kgrid", "pme"),
+            doc="Evaluation of the periodic reciprocal sum: 'kgrid' sums the "
+            "explicit wave numbers; 'pme' evaluates the smooth particle-mesh "
+            "Ewald sum on a per-batch mesh.",
+        ),
+        Argument(
+            "pme_order",
+            int,
+            optional=True,
+            default=8,
+            doc="The B-spline order of the particle-mesh evaluation.",
+        ),
     ]
 
 
