@@ -472,6 +472,45 @@ class TestSeZMSOGModel(unittest.TestCase):
             "iterative-dipole",
         )
 
+    def test_dipole_rotation_equivariance(self) -> None:
+        """The dipole readout must rotate with the frame (regression test).
+
+        The SeZM l=1 packed block decodes to Cartesian as (b3, -b1, -b2); an
+        earlier ordering broke rotation equivariance of the decoded dipoles
+        and hence rotation invariance of the dipole energy.
+        """
+        model = get_model(
+            self._model_params({"lr_kernel": "dipole", "alpha_pol": [1.0, 0.5]})
+        )
+        self._randomize_params(model)
+        model.eval()
+        theta = 0.7
+        rotation = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, math.cos(theta), -math.sin(theta)],
+                [0.0, math.sin(theta), math.cos(theta)],
+            ],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        out = model.forward(self.coord, self.atype)
+        out_rot = model.forward(self.coord @ rotation.T, self.atype)
+        np.testing.assert_allclose(
+            out["energy"].detach().cpu().numpy(),
+            out_rot["energy"].detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+            err_msg="dipole energy not rotation invariant",
+        )
+        np.testing.assert_allclose(
+            (out["latent_dipole"] @ rotation.T).detach().cpu().numpy(),
+            out_rot["latent_dipole"].detach().cpu().numpy(),
+            rtol=1e-10,
+            atol=1e-12,
+            err_msg="latent dipoles do not rotate with the frame",
+        )
+
     def test_force_loss_backward_reaches_lr_params(self) -> None:
         model = get_model(
             self._model_params({"lr_kernel": "dipole", "alpha_pol": [1.0, 0.5]})

@@ -345,10 +345,13 @@ class _SeZMVectorHead(torch.nn.Module):
         """
         projected = self.proj(latent.to(dtype=self.dtype))
         l1 = projected[:, 1:4, 0, 0]
-        # SeZM keeps the l=1 packed basis as (-y, z, -x), so decode back to
+        # SeZM keeps the l=1 packed basis as (-y, -z, x), so decode back to
         # Cartesian order (x, y, z) with two sign flips and one permutation.
+        # The decode must intertwine the packed Wigner rotation with the
+        # Cartesian one (W D1(R) = R W); the earlier (-y, z, -x) reading did
+        # not, which broke rotation equivariance of the decoded vectors.
         return self.cartesian_scale * torch.stack(
-            [-l1[:, 2], -l1[:, 0], l1[:, 1]],
+            [l1[:, 2], -l1[:, 0], -l1[:, 1]],
             dim=-1,
         )
 
