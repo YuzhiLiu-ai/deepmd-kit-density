@@ -248,6 +248,19 @@ def make_base_descriptor(
             """
             return False
 
+        def call_graph_with_context(self, *args: Any, **kwargs: Any) -> Any:
+            """Evaluate the descriptor on a graph, plus extra features for consumers.
+
+            Returns ``(outputs, context)`` where ``outputs`` is the
+            :meth:`call_graph` result, unchanged, and ``context`` is a dict of
+            additional arrays a consumer (e.g. a long-range module) may read.
+            The default adds no features; a descriptor that keeps internal
+            state its outputs discard (e.g. DPA4's equivariant latent)
+            overrides to expose it without changing the :meth:`call_graph`
+            ABI.
+            """
+            return self.call_graph(*args, **kwargs), {}
+
         def dense_lower_supports_comm(self) -> bool:
             """Whether the DENSE (nlist) lower implements comm_dict exchange.
 

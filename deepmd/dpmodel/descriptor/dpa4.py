@@ -1519,6 +1519,33 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             When ``comm_dict`` is provided and a block needs the cross-rank
             exchange (raised by the per-block leaf).
         """
+        x_scalar, _, node_gate = self.call_graph_with_context(
+            graph,
+            atype,
+            type_embedding=type_embedding,
+            comm_dict=comm_dict,
+            spin=spin,
+            charge_spin=charge_spin,
+        )[0]
+        return x_scalar, None, node_gate
+
+    def call_graph_with_context(
+        self,
+        graph: NeighborGraph,
+        atype: Array,
+        type_embedding: Array | None = None,
+        comm_dict: dict[str, Array] | None = None,
+        spin: Array | None = None,
+        charge_spin: Array | None = None,
+    ) -> tuple[tuple[Array, None, Array | None], dict[str, Array]]:
+        """The graph forward of :meth:`call_graph`, plus the equivariant latent.
+
+        The equivariant node state ``x`` with shape ``(N, D, 1, channels)``
+        (SO(3)-packed degrees, the read-out input) is otherwise discarded by
+        :meth:`call_graph`; a consumer such as a long-range multipole module
+        reads it from the context under ``"equivariant_latent"``. The
+        :meth:`call_graph` result is unchanged.
+        """
         n_nodes = atype.shape[0]
         nf = graph.n_node.shape[0]
         charge_spin = self._canonicalize_charge_spin(
@@ -1526,15 +1553,15 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             nf=nf,
             ref=graph.edge_vec,
         )
-        x_scalar, _, node_gate = self._run_graph(
+        x_scalar, x_latent, node_gate = self._run_graph(
             graph, atype, charge_spin=charge_spin, spin=spin, comm_dict=comm_dict
         )
-        # ``_run_graph`` returns the read-out with its SO(3) singleton
-        # axes still attached, shape (n_nodes, 1, 1, channels); flatten to the
-        # graph-seam contract shape (n_nodes, channels).
         xp = array_api_compat.array_namespace(x_scalar)
         x_scalar = xp.reshape(x_scalar, (n_nodes, self.channels))
-        return x_scalar, None, node_gate
+        context = {
+            "equivariant_latent": xp.astype(x_latent, get_xp_precision(xp, "global"))
+        }
+        return (x_scalar, None, node_gate), context
 
     def _run_graph(
         self,

@@ -732,14 +732,28 @@ class DPAtomicModel(BaseAtomicModel):
         )
         # A bridged descriptor returns a third element, the per-node source
         # gate of its bridging window; every other descriptor returns two.
-        outputs = self.descriptor.call_graph(
-            graph,
-            atype,
-            type_embedding=type_embedding,
-            comm_dict=comm_dict,
-            **spin_kwargs,
-            **charge_spin_kwargs,
+        wants_context = (
+            self.long_range is not None and self.long_range.uses_descriptor_context()
         )
+        if wants_context:
+            outputs, descriptor_context = self.descriptor.call_graph_with_context(
+                graph,
+                atype,
+                type_embedding=type_embedding,
+                comm_dict=comm_dict,
+                **spin_kwargs,
+                **charge_spin_kwargs,
+            )
+        else:
+            outputs = self.descriptor.call_graph(
+                graph,
+                atype,
+                type_embedding=type_embedding,
+                comm_dict=comm_dict,
+                **spin_kwargs,
+                **charge_spin_kwargs,
+            )
+            descriptor_context = {}
         gg, rot_mat = outputs[0], outputs[1]
         node_gate = outputs[2] if len(outputs) > 2 else None
         vacuum_kwargs = {}
@@ -774,14 +788,18 @@ class DPAtomicModel(BaseAtomicModel):
                     "the long-range module requires its topologies and node mask"
                 )
             context_kwargs = (
-                {"descriptor_context": {"gr": rot_mat}}
+                {"descriptor_context": {"gr": rot_mat, **descriptor_context}}
                 if self.long_range.uses_descriptor_context()
                 else {}
             )
-            if self.long_range.uses_descriptor_context() and rot_mat is None:
+            if (
+                self.long_range.uses_descriptor_context()
+                and rot_mat is None
+                and "equivariant_latent" not in descriptor_context
+            ):
                 raise NotImplementedError(
-                    "the descriptor does not expose the degree-one moments required "
-                    "by latent multipoles"
+                    "the descriptor exposes neither degree-one moments nor an "
+                    "equivariant latent for latent multipoles"
                 )
             long_range_ret = self.long_range.call_graph(
                 gg,
