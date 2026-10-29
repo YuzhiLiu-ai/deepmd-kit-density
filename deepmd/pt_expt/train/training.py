@@ -2425,7 +2425,27 @@ class Trainer(AbstractTrainer):
                         if use_random:
                             new_state[key] = target_state[key]
                         elif pretrained_key in pretrained_state:
-                            new_state[key] = pretrained_state[pretrained_key]
+                            if (
+                                torch.is_tensor(pretrained_state[pretrained_key])
+                                and pretrained_state[pretrained_key].shape
+                                != target_state[key].shape
+                            ):
+                                # Shape mismatch (e.g. out_bias/out_std gain rows
+                                # for the latent outputs of a long-range plugin
+                                # finetuned from a short-range model): keep the
+                                # fresh initialization; the statistic-based bias
+                                # adjustment below recomputes them.
+                                log.warning(
+                                    "Key %s shape mismatch between pretrained "
+                                    "model %s and current model %s, keep fresh "
+                                    "initialization.",
+                                    pretrained_key,
+                                    tuple(pretrained_state[pretrained_key].shape),
+                                    tuple(target_state[key].shape),
+                                )
+                                new_state[key] = target_state[key]
+                            else:
+                                new_state[key] = pretrained_state[pretrained_key]
                         else:
                             new_state[key] = target_state[key]
                         break

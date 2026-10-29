@@ -1034,9 +1034,31 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
                     self.get_rcut(),
                     pair_excl=self.pair_excl,
                 )
+                atype_flat = xp.reshape(atype, (-1,))
+                lr_kwargs: dict[str, Any] = {}
+                if self.has_long_range():
+                    # The graph builder leaves virtual (padded) atoms on the
+                    # node axis, so the long-range topologies are built on the
+                    # same flat axis with an explicit node mask.
+                    node_mask = atype_flat >= 0
+                    lr_kwargs["topologies"] = self.build_topologies(
+                        xp.reshape(coord, (nframes * nloc, 3)),
+                        xp.full(
+                            (nframes,),
+                            nloc,
+                            dtype=xp.int64,
+                            device=array_api_compat.device(atype),
+                        ),
+                        box,
+                        atype=xp.where(
+                            node_mask, atype_flat, xp.zeros_like(atype_flat)
+                        ),
+                        node_mask=node_mask,
+                        pair_excl=self.pair_excl,
+                    )
                 atomic_ret = self.forward_common_atomic_graph(
                     graph,
-                    xp.reshape(atype, (-1,)),
+                    atype_flat,
                     fparam=fparam,
                     aparam=(
                         xp.reshape(
@@ -1048,6 +1070,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
                     ),
                     charge_spin=charge_spin,
                     spin=None if spin is None else xp.reshape(spin, (-1, 3)),
+                    **lr_kwargs,
                 )
                 # The graph route works on a flat node axis; restore the
                 # per-frame layout the dense route returns.
