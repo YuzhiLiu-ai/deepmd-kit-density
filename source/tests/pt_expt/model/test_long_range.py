@@ -891,9 +891,21 @@ def test_compiled_periodic_force_loss_second_order_gradients_match_eager() -> No
 # ---------------------------------------------------------------------------
 
 
-def _periodic_multipole_model(steps: int = 0, train: bool = False):
+def _periodic_multipole_model(
+    steps: int = 0,
+    train: bool = False,
+    kernel="les",
+    k_grid_mode: str = "kgrid",
+):
     config = _multipole_config(steps=steps)
+    if kernel == "sog":
+        config["long_range"]["kernel"] = {
+            "type": "sog",
+            "width": [0.8, 1.6, 3.2],
+            "amplitude": [0.5, 0.7, 0.3],
+        }
     config["long_range"]["periodic"] = True
+    config["long_range"]["k_grid_mode"] = k_grid_mode
     model = get_model(config).to(env.DEVICE)
     model.train(train)
     return model
@@ -905,9 +917,30 @@ def _kspace_multipole_reference(
     """Structure-factor reference of the periodic multipole energy."""
     import math
 
-    alpha = float(np.exp(kernel.log_alpha.detach().cpu().numpy()).reshape(-1)[0])
     volume = abs(np.linalg.det(cell))
-    k_max = 2 * alpha * math.sqrt(math.log(1 / 1e-8))
+    if kernel.TYPE == "les":
+        alpha = float(np.exp(kernel.log_alpha.detach().cpu().numpy()).reshape(-1)[0])
+        k_max = 2 * alpha * math.sqrt(math.log(1 / 1e-8))
+
+        def kernel_hat(k2):
+            return 4 * np.pi * np.exp(-k2 / (4 * alpha * alpha)) / k2
+
+        contact = 2 * alpha / np.sqrt(np.pi)
+        dipole_contact = -4 * alpha**3 / (3 * np.sqrt(np.pi))
+    else:
+        amp = kernel.amplitude.detach().cpu().numpy()
+        width = np.exp(kernel.log_width.detach().cpu().numpy())
+        k_max = math.sqrt(2 * math.log(1 / 1e-8)) / width.min()
+
+        def kernel_hat(k2):
+            return (
+                (2 * math.pi) ** 1.5
+                * (amp[:, None] * width[:, None] ** 3)
+                * np.exp(-0.5 * width[:, None] ** 2 * k2[None, :])
+            ).sum(0)
+
+        contact = float(amp.sum())
+        dipole_contact = float(-(amp / width**2).sum())
     nd = np.ceil(k_max * np.linalg.norm(cell, axis=1) / (2 * math.pi)).astype(int)
     grids = np.meshgrid(*[np.arange(-m, m + 1) for m in nd], indexing="ij")
     n_grid = np.stack(grids, -1).reshape(-1, 3)
@@ -918,11 +951,10 @@ def _kspace_multipole_reference(
     phase = k @ coord.T
     k_dot_p = k @ dipole.T
     struct = ((charge[:, 0] + 1j * k_dot_p) * np.exp(1j * phase)).sum(-1)
-    kernel_hat = 4 * np.pi * np.exp(-k2 / (4 * alpha * alpha)) / k2
     return COULOMB_CONSTANT * (
-        0.5 * (kernel_hat * np.abs(struct) ** 2).sum() / volume
-        - 0.5 * (2 * alpha / np.sqrt(np.pi)) * (charge[:, 0] ** 2).sum()
-        + 0.5 * (-4 * alpha**3 / (3 * np.sqrt(np.pi))) * (dipole * dipole).sum()
+        0.5 * (kernel_hat(k2) * np.abs(struct) ** 2).sum() / volume
+        - 0.5 * contact * (charge[:, 0] ** 2).sum()
+        + 0.5 * dipole_contact * (dipole * dipole).sum()
         + ((dipole * dipole).sum(-1) / (2 * alpha_pol**2)).sum()
     )
 
@@ -937,9 +969,10 @@ def _sr_multipole_twin(model):
     return twin
 
 
+@pytest.mark.parametrize("kernel", ["les", "sog"])
 @pytest.mark.parametrize("steps", [0, 1, 2])
-def test_periodic_multipole_energy_matches_reference(steps) -> None:
-    model = _periodic_multipole_model(steps)
+def test_periodic_multipole_energy_matches_reference(steps, kernel) -> None:
+    model = _periodic_multipole_model(steps, kernel=kernel)
     twin = _sr_multipole_twin(model)
     coord, atype, box = _periodic_batch((5, 4), seed=17)
     out = model(coord, atype, box=box)
@@ -965,9 +998,12 @@ def test_periodic_multipole_energy_matches_reference(steps) -> None:
         np.testing.assert_allclose(lr_energy[f], reference, rtol=1e-9, atol=1e-9)
 
 
+@pytest.mark.parametrize("kernel", ["les", "sog"])
 @pytest.mark.parametrize("steps", [0, 1])
-def test_periodic_multipole_force_virial_match_finite_differences(steps) -> None:
-    model = _periodic_multipole_model(steps)
+def test_periodic_multipole_force_virial_match_finite_differences(
+    steps, kernel
+) -> None:
+    model = _periodic_multipole_model(steps, kernel=kernel)
     coord, atype, box = _periodic_batch((5,), seed=11)
     result = model(coord, atype, box=box, do_atomic_virial=True)
     eps = 1e-5
@@ -1036,6 +1072,61 @@ def test_compiled_periodic_multipole_matches_eager() -> None:
 
 
 @REQUIRES_SUPPORTED_COMPILE
+def test_compiled_pme_multipole_matches_eager() -> None:
+    """The PME mesh path compiles: the structure factor is assembled in real
+    and imaginary parts because a Python complex scalar in the graph breaks
+    inductor's double backward.
+    """
+    from deepmd.pt_expt.train.training import (
+        _CompiledModel,
+        _get_model_structure_key,
+    )
+
+    model = _periodic_multipole_model(steps=1, k_grid_mode="pme")
+    compiled = _CompiledModel(model, _get_model_structure_key(model)).eval()
+    coord, atype, box = _periodic_batch((5, 4), seed=19)
+    expected = model(coord, atype, box=box, do_atomic_virial=True)
+    actual = compiled(coord, atype, box, do_atomic_virial=True)
+    for key in (
+        "energy",
+        "atom_energy",
+        "force",
+        "virial",
+        "atom_virial",
+        "latent_charge",
+        "latent_dipole",
+    ):
+        torch.testing.assert_close(actual[key], expected[key], rtol=1e-9, atol=1e-9)
+
+
+@REQUIRES_SUPPORTED_COMPILE
+def test_compiled_pme_multipole_second_order_gradients_match_eager() -> None:
+    from deepmd.pt_expt.train.training import (
+        _CompiledModel,
+        _get_model_structure_key,
+    )
+
+    eager = _periodic_multipole_model(steps=1, train=True, k_grid_mode="pme")
+    compiled_model = _periodic_multipole_model(steps=1, train=True, k_grid_mode="pme")
+    compiled_model.load_state_dict(eager.state_dict())
+    compiled = _CompiledModel(
+        compiled_model, _get_model_structure_key(compiled_model)
+    ).train()
+    coord, atype, box = _periodic_batch((5,), seed=29)
+    eager_loss = eager(coord, atype, box=box)["force"].square().sum()
+    compiled_loss = compiled(coord, atype, box)["force"].square().sum()
+    eager_loss.backward()
+    compiled_loss.backward()
+    torch.testing.assert_close(compiled_loss, eager_loss)
+    eager_parameters = dict(eager.named_parameters())
+    for name, parameter in compiled_model.named_parameters():
+        assert parameter.grad is not None, name
+        torch.testing.assert_close(
+            parameter.grad, eager_parameters[name].grad, rtol=1e-6, atol=1e-6
+        )
+
+
+@REQUIRES_SUPPORTED_COMPILE
 def test_compiled_periodic_multipole_second_order_gradients_match_eager() -> None:
     from deepmd.pt_expt.train.training import (
         _CompiledModel,
@@ -1060,3 +1151,271 @@ def test_compiled_periodic_multipole_second_order_gradients_match_eager() -> Non
         torch.testing.assert_close(
             parameter.grad, eager_parameters[name].grad, rtol=1e-6, atol=1e-6
         )
+
+
+# ---------------------------------------------------------------------------
+# DPA4 descriptor support (SeZM dipole head on the equivariant latent)
+# ---------------------------------------------------------------------------
+
+
+def _dpa4_config(lr_type: str = "latent_multipole", steps: int = 0) -> dict:
+    config = {
+        "type_map": ["A", "B"],
+        "descriptor": {
+            "type": "dpa4",
+            "rcut": 3.0,
+            "sel": 20,
+            "channels": 8,
+            "lmax": 2,
+            "n_radial": 4,
+            "precision": "float64",
+            "seed": 17,
+        },
+        "fitting_net": {
+            "type": "dpa4_ener",
+            "neuron": [16, 16],
+            "precision": "float64",
+            "seed": 19,
+        },
+    }
+    if lr_type == "latent_multipole":
+        config["long_range"] = {
+            "type": "latent_multipole",
+            "charge_net": {"neuron": [8, 8], "use_glu": False},
+            "kernel": {"type": "les", "alpha": 0.9},
+            "charge_constraint": {"source": "neutral"},
+            "lr_update_steps": steps,
+        }
+    else:
+        config["long_range"] = {
+            "type": "latent_charge",
+            "channels": 1,
+            "charge_net": {"neuron": [8, 8]},
+            "kernel": {"type": "les", "alpha": 0.9},
+            "charge_constraint": {"source": "neutral", "channel": 0},
+        }
+    return config
+
+
+def _dpa4_model(lr_type: str = "latent_multipole", steps: int = 0, train: bool = False):
+    model = get_model(_dpa4_config(lr_type, steps)).to(env.DEVICE)
+    model.train(train)
+    return model
+
+
+def test_dpa4_multipole_rotation_equivariance_and_fd() -> None:
+    model = _dpa4_multipole_model = _dpa4_model("latent_multipole", steps=1)
+    assert model.atomic_model.long_range.charge_net.dipole_mode == "sezm"
+    rng = np.random.default_rng(0)
+    coord = torch.tensor(
+        rng.uniform(0, 4, (6, 3)), dtype=torch.float64, device=env.DEVICE
+    ).reshape(1, 6, 3)
+    atype = torch.tensor([[0, 1, 0, 1, 0, 1]], dtype=torch.int64, device=env.DEVICE)
+    theta = 0.7
+    rotation = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(theta), -np.sin(theta)],
+            [0.0, np.sin(theta), np.cos(theta)],
+        ],
+        dtype=torch.float64,
+        device=env.DEVICE,
+    )
+    out = model(coord, atype, do_atomic_virial=True)
+    out_rot = model(coord @ rotation.T, atype, do_atomic_virial=True)
+    torch.testing.assert_close(out["energy"], out_rot["energy"])
+    torch.testing.assert_close(
+        out["latent_dipole"] @ rotation.T, out_rot["latent_dipole"]
+    )
+    # Finite-difference force covers the DPA4 descriptor path plus the
+    # SO3Linear dipole readout on the exposed latent.
+    eps = 1e-5
+    force_fd = torch.zeros_like(out["force"][0])
+    for atom in range(6):
+        for d in range(3):
+            plus, minus = coord.clone(), coord.clone()
+            plus[0, atom, d] += eps
+            minus[0, atom, d] -= eps
+            force_fd[atom, d] = -(
+                model(plus, atype)["energy"] - model(minus, atype)["energy"]
+            ).item() / (2 * eps)
+    torch.testing.assert_close(out["force"][0], force_fd, rtol=2e-6, atol=2e-6)
+
+
+def test_dpa4_multipole_serialization_round_trip() -> None:
+    model = _dpa4_model("latent_multipole", steps=1)
+    assert model.atomic_model.serialize()["@version"] == 3
+    restored = BaseModel.deserialize(model.serialize()).to(env.DEVICE).eval()
+    assert restored.atomic_model.long_range.charge_net.dipole_mode == "sezm"
+    rng = np.random.default_rng(1)
+    coord = torch.tensor(
+        rng.uniform(0, 4, (6, 3)), dtype=torch.float64, device=env.DEVICE
+    ).reshape(1, 6, 3)
+    atype = torch.tensor([[0, 1, 0, 1, 0, 1]], dtype=torch.int64, device=env.DEVICE)
+    expected = model(coord, atype, do_atomic_virial=True)
+    actual = restored(coord, atype, do_atomic_virial=True)
+    for key in (
+        "energy",
+        "atom_energy",
+        "force",
+        "virial",
+        "latent_charge",
+        "latent_dipole",
+    ):
+        torch.testing.assert_close(actual[key], expected[key])
+
+
+def test_dpa4_charge_only_plugin() -> None:
+    """The charge-only plugin also serves the DPA4 descriptor."""
+    model = _dpa4_model("latent_charge")
+    rng = np.random.default_rng(2)
+    coord = torch.tensor(
+        rng.uniform(0, 4, (6, 3)), dtype=torch.float64, device=env.DEVICE
+    ).reshape(1, 6, 3)
+    atype = torch.tensor([[0, 1, 0, 1, 0, 1]], dtype=torch.int64, device=env.DEVICE)
+    out = model(coord, atype, do_atomic_virial=True)
+    for key in ("energy", "force", "virial", "latent_charge"):
+        assert torch.isfinite(out[key]).all()
+    assert "latent_dipole" not in out
+
+
+def test_dpa4_periodic_multipole_update_matches_finite_differences() -> None:
+    """The SeZM dipole update runs on the periodic k-grid and PME backends.
+
+    Forces match finite differences, frames are independent, and the two
+    reciprocal-space backends agree to the PME discretization accuracy.
+    """
+    coord, atype, box = _periodic_batch((6, 5), seed=3)
+    outs = {}
+    for mode in ("kgrid", "pme"):
+        config = _dpa4_config("latent_multipole", steps=1)
+        config["long_range"]["periodic"] = True
+        config["long_range"]["k_grid_mode"] = mode
+        model = get_model(config).to(env.DEVICE).eval()
+        out = model(coord, atype, box=box, do_atomic_virial=True)
+        for key in ("energy", "force", "virial", "latent_charge", "latent_dipole"):
+            assert torch.isfinite(out[key]).all()
+        single = model(coord[:1], atype[:1], box=box[:1])
+        # The explicit k grid is exact per frame; the PME mesh resolution is
+        # chosen per batch, so frames agree to the discretization accuracy.
+        torch.testing.assert_close(
+            single["energy"],
+            out["energy"][:1],
+            rtol=1e-12 if mode == "kgrid" else 1e-5,
+            atol=1e-12 if mode == "kgrid" else 1e-5,
+        )
+        outs[mode] = out
+    torch.testing.assert_close(
+        outs["pme"]["energy"], outs["kgrid"]["energy"], rtol=1e-5, atol=1e-5
+    )
+    eps = 1e-5
+    config = _dpa4_config("latent_multipole", steps=1)
+    config["long_range"]["periodic"] = True
+    model = get_model(config).to(env.DEVICE).eval()
+    force_fd = torch.zeros_like(coord[0])
+    for atom in range(coord.shape[1]):
+        for d in range(3):
+            plus, minus = coord[:1].clone(), coord[:1].clone()
+            plus[0, atom, d] += eps
+            minus[0, atom, d] -= eps
+            force_fd[atom, d] = -(
+                model(plus, atype[:1], box=box[:1])["energy"]
+                - model(minus, atype[:1], box=box[:1])["energy"]
+            ).item() / (2 * eps)
+    torch.testing.assert_close(
+        outs["kgrid"]["force"][0], force_fd, rtol=1e-5, atol=1e-5
+    )
+
+
+# ---------------------------------------------------------------------------
+# SOG multipole (closed-form radial derivatives, direct and periodic)
+# ---------------------------------------------------------------------------
+
+
+def test_sog_kernel_multipole_radial_matches_finite_differences() -> None:
+    """The SOG ``K'/r`` and ``(K''-K'/r)/r²`` are exact closed forms."""
+    from deepmd.dpmodel.long_range.kernel import (
+        SOGKernel,
+    )
+
+    kernel = SOGKernel(
+        width=[0.5, 1.0, 2.0], amplitude=[0.7, 1.1, 0.4], precision="float64"
+    )
+
+    def k_of(r: float) -> float:
+        r_sq = torch.tensor([r * r], dtype=torch.float64)
+        return float(kernel.evaluate(r_sq, kernel.coefficients(r_sq))[0])
+
+    h = 1e-4
+    for r in (0.3, 1.0, 2.5):
+        dk = (k_of(r + h) - k_of(r - h)) / (2 * h)
+        ddk = (k_of(r + h) - 2 * k_of(r) + k_of(r - h)) / h**2
+        r_sq = torch.tensor([r * r], dtype=torch.float64)
+        _, a_coeff, c_coeff = kernel.evaluate_multipole(r_sq, kernel.coefficients(r_sq))
+        assert abs(float(a_coeff[0]) - dk / r) < 1e-6
+        assert abs(float(c_coeff[0]) - (ddk - dk / r) / r**2) < 1e-5
+    r_sq = torch.tensor([1.0], dtype=torch.float64)
+    assert float(kernel.contact_value(r_sq)) == pytest.approx(0.7 + 1.1 + 0.4)
+    assert float(kernel.dipole_contact_value(r_sq)) == pytest.approx(
+        -(0.7 / 0.25 + 1.1 / 1.0 + 0.4 / 4.0)
+    )
+
+
+def test_direct_sog_multipole_matches_finite_differences() -> None:
+    """The direct (non-periodic) SOG multipole energy, force and update."""
+    config = _multipole_config(steps=1)
+    config["long_range"]["kernel"] = {
+        "type": "sog",
+        "width": [0.8, 1.6, 3.2],
+        "amplitude": [0.5, 0.7, 0.3],
+    }
+    model = get_model(config).to(env.DEVICE).eval()
+    coord, atype = _batch((5,), seed=13)
+    out = model(coord, atype, do_atomic_virial=True)
+    for key in ("energy", "force", "virial", "latent_charge", "latent_dipole"):
+        assert torch.isfinite(out[key]).all()
+    eps = 1e-5
+    force_fd = torch.zeros_like(coord[0])
+    for atom in range(coord.shape[1]):
+        for d in range(3):
+            plus, minus = coord.clone(), coord.clone()
+            plus[0, atom, d] += eps
+            minus[0, atom, d] -= eps
+            force_fd[atom, d] = -(
+                model(plus, atype)["energy"] - model(minus, atype)["energy"]
+            ).item() / (2 * eps)
+    torch.testing.assert_close(out["force"][0], force_fd, rtol=2e-6, atol=2e-6)
+
+
+def test_long_range_change_out_bias_builds_topologies() -> None:
+    """The output-statistic path (finetune bias adjustment) serves LR models.
+
+    ``model_forward`` used to build only the neighbor graph, so
+    ``change_out_bias`` on a long-range model failed with "the long-range
+    module requires its topologies and node mask".
+    """
+    model = _periodic_multipole_model(steps=1)
+    coord, atype, box = _periodic_batch((5, 4), seed=7)
+    nf, nloc = coord.shape[:2]
+    natoms = np.sum(atype.cpu().numpy() >= 0, axis=1)
+    sampled = [
+        {
+            "coord": coord.cpu().numpy(),
+            "atype": atype.cpu().numpy(),
+            "atype_ext": np.concatenate(
+                [atype.cpu().numpy(), np.zeros((nf, 0), dtype=np.int64)], axis=1
+            ),
+            "box": box.cpu().numpy(),
+            "natoms": np.stack([natoms, natoms, natoms, np.zeros(nf)], axis=1).astype(
+                np.int32
+            ),
+            "energy": np.zeros((nf, 1)),
+            "find_energy": np.float32(1.0),
+        }
+    ]
+    before = model.atomic_model.out_bias.detach().cpu().numpy().copy()
+    model.atomic_model.change_out_bias(sampled, bias_adjust_mode="change-by-statistic")
+    after = model.atomic_model.out_bias.detach().cpu().numpy()
+    # The energy row moved with the (zero-label) statistic; the latent rows
+    # keep their initialization.
+    assert after.shape == before.shape

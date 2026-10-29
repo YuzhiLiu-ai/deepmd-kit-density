@@ -146,9 +146,7 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
                 "embedding width."
             )
         if self.lr_update_steps > 0 and lr_kernel != "dipole":
-            raise ValueError(
-                "`lr_update_steps > 0` requires `lr_kernel='dipole'`."
-            )
+            raise ValueError("`lr_update_steps > 0` requires `lr_kernel='dipole'`.")
         self.lr_kernel = lr_kernel
 
         super().__init__(*args, **kwargs)
@@ -456,11 +454,7 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         update = self.polar_update_net(update_input)
         dq = xp.tanh(update[..., 0:1])
         gates = xp.tanh(update[..., 1:4])
-        dmu = (
-            gates[..., 0:1] * p
-            + gates[..., 1:2] * e_unit
-            + gates[..., 2:3] * p0
-        )
+        dmu = gates[..., 0:1] * p + gates[..., 1:2] * e_unit + gates[..., 2:3] * p0
         return (
             q + self.lr_update_damping * dq,
             p + self.lr_update_damping * dmu,

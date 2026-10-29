@@ -40,6 +40,7 @@ import math
 from deepmd.dpmodel.array_api import (
     Array,
     xp_add_at,
+    xp_complex_from_parts,
 )
 from deepmd.dpmodel.utils.neighbor_graph import (
     KGrid,
@@ -599,13 +600,23 @@ def mesh_multipole_potential_field(
         spectra.append(xp.fft.rfftn(mesh_shaped, axes=(-3, -2, -1)))
     # S = Q - i k.P on the half spectrum: rfftn transforms with e^{-ik.r},
     # and the dipole charge density -div P transforms to -i k . P with it.
-    spectrum = spectra[0]
+    # The spectrum is kept as separate real and imaginary parts: a Python
+    # complex scalar (``1j *``) in the graph breaks inductor's double
+    # backward, so the complex form is rebuilt only at the irfftn calls.
+    s_real = xp.real(spectra[0])
+    s_imag = xp.imag(spectra[0])
     for a in range(3):
-        spectrum = spectrum - 1j * k_half[..., a] * spectra[a + 1]
-    # Potential mesh V = irfft(G S); field meshes X_a = irfft(-i k_a G S).
-    convolved = influence * spectrum
+        s_real = s_real + k_half[..., a] * xp.imag(spectra[a + 1])
+        s_imag = s_imag - k_half[..., a] * xp.real(spectra[a + 1])
+    c_real = influence * s_real
+    c_imag = influence * s_imag
+    # Potential mesh V = irfft(G S); field meshes X_a = irfft(+i k_a G S),
+    # where +i k_a (c_re + i c_im) = (-k_a c_im) + i (k_a c_re).
     potential_mesh = xp.fft.irfftn(
-        convolved, s=(n1, n2, n3), axes=(-3, -2, -1), norm="forward"
+        xp_complex_from_parts(c_real, c_imag),
+        s=(n1, n2, n3),
+        axes=(-3, -2, -1),
+        norm="forward",
     )
     potential = _interpolate_mesh(xp, potential_mesh, target, spread_weight, n_node)
     periodic_node = xp.take(mesh.mask, frame_id, axis=0)
@@ -617,7 +628,7 @@ def mesh_multipole_potential_field(
     gen_force = []
     for a in range(3):
         field_mesh = xp.fft.irfftn(
-            (1j * k_half[..., a]) * convolved,
+            xp_complex_from_parts(-k_half[..., a] * c_imag, k_half[..., a] * c_real),
             s=(n1, n2, n3),
             axes=(-3, -2, -1),
             norm="forward",

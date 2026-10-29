@@ -79,6 +79,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         kspace_tolerance: float = 1e-8,
         k_grid_mode: str = "kgrid",
         pme_order: int = PME_ORDER,
+        self_interaction: bool = False,
     ) -> None:
         if charge_net.vacuum_ref:
             raise ValueError("a latent-charge readout cannot use `vacuum_ref`")
@@ -104,6 +105,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         self.pme_order = int(pme_order)
         if self.pme_order < 2:
             raise ValueError(f"`pme_order` must be at least 2, got {self.pme_order}")
+        self.self_interaction = bool(self_interaction)
 
     @staticmethod
     def _normalize_constraint(
@@ -177,6 +179,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             # lands; PME is opt-in via `k_grid_mode: "pme"`.
             k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
             pme_order=int(config.get("pme_order", PME_ORDER)),
+            self_interaction=bool(config.get("self_interaction", False)),
         )
 
     def output_def(self) -> FittingOutputDef:
@@ -246,6 +249,19 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         )
         pair_frame = xp.take(frame_id, dst, axis=0)
         frame_energy = segment_sum(pair_energy, pair_frame, n_node.shape[0])
+        if self.self_interaction:
+            # The legacy DPA4 SOG path adds the self term 1/2 K(0) sum_i q_i^2
+            # on top of the unordered pair sum.
+            self_energy = (
+                0.5
+                * self.kernel.contact_value(charge)
+                * xp.sum(charge * charge, axis=-1)
+            )
+            frame_energy = frame_energy + COULOMB_CONSTANT * segment_sum(
+                self_energy * xp.astype(node_mask, charge.dtype),
+                frame_id,
+                n_node.shape[0],
+            )
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
@@ -352,6 +368,8 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             "kernel": self.kernel.serialize(),
             "charge_constraint": self.charge_constraint,
         }
+        if self.self_interaction:
+            data["self_interaction"] = True
         if self.periodic:
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
@@ -374,4 +392,5 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             # evaluates the explicit wave numbers.
             k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
             pme_order=data.get("pme_order", PME_ORDER),
+            self_interaction=data.get("self_interaction", False),
         )

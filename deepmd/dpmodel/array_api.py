@@ -382,6 +382,21 @@ def xp_add_at(x: Array, indices: Array, values: Array) -> Array:
         return x
 
 
+def xp_complex_from_parts(real: Array, imag: Array) -> Array:
+    """A complex array from its real and imaginary parts.
+
+    The naive ``real + 1j * imag`` lowers a Python complex scalar into the
+    inductor graph, whose double backward rejects it (``'complex' object has
+    no attribute 'get_name'``); torch therefore goes through
+    ``view_as_complex`` while the other backends keep the plain expression.
+    """
+    if array_api_compat.is_torch_array(real):
+        import torch
+
+        return torch.view_as_complex(torch.stack((real, imag), dim=-1))
+    return real + 1j * imag
+
+
 def xp_hint_dynamic_size(x: Array) -> None:
     """Mark a data-dependent leading dimension as a valid size for torch.export.
 

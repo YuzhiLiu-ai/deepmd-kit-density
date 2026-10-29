@@ -4061,6 +4061,14 @@ def long_range_latent_charge() -> list[Argument]:
             default=8,
             doc="The B-spline order of the particle-mesh evaluation.",
         ),
+        Argument(
+            "self_interaction",
+            bool,
+            optional=True,
+            default=False,
+            doc="Add the self-interaction term 1/2 K(0) sum_i q_i^2 to the "
+            "direct pair sum (the legacy DPA4 SOG default).",
+        ),
     ]
 
 

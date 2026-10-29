@@ -105,6 +105,28 @@ class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")
         """
         raise NotImplementedError
 
+    def evaluate_multipole(
+        self, r_sq: Array, coefficients: dict[str, Array]
+    ) -> tuple[Array, Array, Array]:
+        r"""The kernel and its radial derivatives for multipole interactions.
+
+        Parameters
+        ----------
+        r_sq
+            Squared distances with shape ``(P,)``, in Å².
+        coefficients
+            The coefficients of :meth:`coefficients`.
+
+        Returns
+        -------
+        tuple[Array, Array, Array]
+            ``K``, ``K'/r`` and ``(K''-K'/r)/r²`` with shape ``(P,)``: the
+            charge-charge value, the charge-dipole radial coefficient and
+            the dipole-dipole angular coefficient. All three stay finite at
+            contact so coincident atoms are well defined.
+        """
+        raise NotImplementedError
+
     def kspace(self, k_sq: Array) -> Array:
         r"""Fourier transform of the kernel on squared wave numbers.
 
@@ -226,6 +248,7 @@ class BaseInteractionKernel(NativeOP, make_plugin_registry("interaction kernel")
 # the nine terms reach the float64 rounding of erf(x) / x. Above it the closed
 # form keeps the relative error of its radial derivative within 2e-14 in
 # float64 and 1e-5 in float32.
+_SQRT_PI = 1.7724538509055160272981674833411451827975494561224
 _ERF_OVER_X_SERIES = (
     1.1283791670955126,
     -0.37612638903183754,
@@ -290,6 +313,55 @@ class LESKernel(BaseInteractionKernel):
         for coefficient in reversed(_ERF_OVER_X_SERIES[:-1]):
             series = series * x_sq_near + coefficient
         return alpha * xp.where(near, series, xp_erf(x_far) / x_far)
+
+    def evaluate_multipole(
+        self, r_sq: Array, coefficients: dict[str, Array]
+    ) -> tuple[Array, Array, Array]:
+        """Stable ``K``, ``K'/r`` and ``(K''-K'/r)/r²`` of LES."""
+        xp = array_api_compat.array_namespace(r_sq)
+        alpha = coefficients["alpha"]
+        r_sq_safe = xp.maximum(r_sq, xp.full_like(r_sq, xp.finfo(r_sq.dtype).eps))
+        r = xp.sqrt(r_sq_safe)
+        x_sq = alpha * alpha * r_sq
+        exp_t = xp.exp(-x_sq)
+        erf_t = xp_erf(alpha * r)
+        k_analytic = erf_t / r
+        a_analytic = (2.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe - erf_t / (
+            r_sq_safe * r
+        )
+        kpp = (
+            -(4.0 * alpha**3 / _SQRT_PI) * exp_t
+            - (4.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe
+            + 2.0 * erf_t / (r_sq_safe * r)
+        )
+        c_analytic = (kpp - a_analytic) / r_sq_safe
+        alpha2 = alpha * alpha
+        alpha3 = alpha * alpha2
+        alpha5 = alpha3 * alpha2
+        alpha7 = alpha5 * alpha2
+        alpha9 = alpha7 * alpha2
+        r4 = r_sq * r_sq
+        r6 = r4 * r_sq
+        k_series = (2.0 / _SQRT_PI) * (
+            alpha - alpha3 * r_sq / 3.0 + alpha5 * r4 / 10.0 - alpha7 * r6 / 42.0
+        )
+        a_series = (
+            -4.0 * alpha3 / (3.0 * _SQRT_PI)
+            + 4.0 * alpha5 * r_sq / (5.0 * _SQRT_PI)
+            - 2.0 * alpha7 * r4 / (7.0 * _SQRT_PI)
+            + 2.0 * alpha9 * r6 / (27.0 * _SQRT_PI)
+        )
+        c_series = (
+            8.0 * alpha5 / (5.0 * _SQRT_PI)
+            - 8.0 * alpha7 * r_sq / (7.0 * _SQRT_PI)
+            + 4.0 * alpha9 * r4 / (9.0 * _SQRT_PI)
+        )
+        small = x_sq < 0.04
+        return (
+            xp.where(small, k_series, k_analytic),
+            xp.where(small, a_series, a_analytic),
+            xp.where(small, c_series, c_analytic),
+        )
 
     def kspace(self, k_sq: Array) -> Array:
         xp = array_api_compat.array_namespace(k_sq)
@@ -403,6 +475,27 @@ class SOGKernel(BaseInteractionKernel):
         xp = array_api_compat.array_namespace(r_sq)
         gaussian = xp.exp(-r_sq[:, None] * coefficients["inv_two_width_sq"])
         return xp.sum(coefficients["amplitude"] * gaussian, axis=-1)
+
+    def evaluate_multipole(
+        self, r_sq: Array, coefficients: dict[str, Array]
+    ) -> tuple[Array, Array, Array]:
+        r"""Closed-form ``K``, ``K'/r`` and ``(K''-K'/r)/r²`` of SOG.
+
+        With :math:`x_m = r^2/(2\sigma_m^2)` these are
+        :math:`-\sum_m (a_m/\sigma_m^2) e^{-x_m}` and
+        :math:`\sum_m (a_m/\sigma_m^4) e^{-x_m}`; every Gaussian is smooth at
+        contact, so no series switch is needed.
+        """
+        xp = array_api_compat.array_namespace(r_sq)
+        amplitude = coefficients["amplitude"]
+        inv_width_sq = 2.0 * coefficients["inv_two_width_sq"]
+        gaussian = xp.exp(-r_sq[:, None] * coefficients["inv_two_width_sq"])
+        weighted = amplitude * gaussian
+        return (
+            xp.sum(weighted, axis=-1),
+            -xp.sum(weighted * inv_width_sq, axis=-1),
+            xp.sum(weighted * inv_width_sq * inv_width_sq, axis=-1),
+        )
 
     def kspace(self, k_sq: Array) -> Array:
         xp = array_api_compat.array_namespace(k_sq)

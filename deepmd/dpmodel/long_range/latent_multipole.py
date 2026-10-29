@@ -5,7 +5,7 @@ from typing import Any
 
 import array_api_compat
 
-from deepmd.dpmodel.array_api import Array, xp_erf
+from deepmd.dpmodel.array_api import Array
 from deepmd.dpmodel.common import get_xp_precision
 from deepmd.dpmodel.fitting.latent_multipole import LatentMultipoleFitting
 from deepmd.dpmodel.utils.neighbor_graph import (
@@ -32,8 +32,6 @@ from .reciprocal import (
     mesh_multipole_potential_field,
 )
 
-_SQRT_PI = 1.7724538509055160272981674833411451827975494561224
-
 
 @BaseLongRange.register("latent_multipole")
 class LatentMultipoleLongRange(LatentChargeLongRange):
@@ -55,10 +53,6 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         k_grid_mode: str = "kgrid",
         pme_order: int = 8,
     ) -> None:
-        if kernel.TYPE != "les":
-            raise NotImplementedError(
-                "latent multipoles currently require the LES kernel"
-            )
         super().__init__(
             charge_net,
             kernel,
@@ -112,14 +106,28 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "precision": charge_net_config["precision"],
             **config["kernel"],
         }
-        if kernel_config["type"] != "les":
-            raise NotImplementedError(
-                "latent multipoles currently require the LES kernel"
-            )
         kernel_cls = BaseInteractionKernel.get_class_by_type(kernel_config.pop("type"))
-        embedding_width = int(config.get("embedding_width", 0))
-        if embedding_width == 0:
-            embedding_width = int(descriptor.degree_channels[1])
+        # The dipole head follows the descriptor family: DPA4C contracts its
+        # degree-one Cartesian moments with an invariant weight net ("gr");
+        # DPA4 projects its SO(3)-packed equivariant latent with an SO3Linear
+        # and decodes the l=1 block ("sezm").
+        from deepmd.dpmodel.descriptor.dpa4 import (
+            DescrptDPA4,
+        )
+
+        if isinstance(descriptor, DescrptDPA4):
+            dipole_mode = "sezm"
+            head_kwargs = {
+                "latent_lmax": int(descriptor.mp_init_lmax),
+                "latent_channels": int(descriptor.channels),
+                "embedding_width": 0,
+            }
+        else:
+            dipole_mode = "gr"
+            embedding_width = int(config.get("embedding_width", 0))
+            if embedding_width == 0:
+                embedding_width = int(descriptor.degree_channels[1])
+            head_kwargs = {"embedding_width": embedding_width}
         charge_net = LatentMultipoleFitting(
             var_name="latent_charge",
             ntypes=descriptor.get_ntypes(),
@@ -132,11 +140,12 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             use_aparam_as_mask=fitting.use_aparam_as_mask,
             mixed_types=descriptor.mixed_types(),
             type_map=fitting.get_type_map(),
-            embedding_width=embedding_width,
+            dipole_mode=dipole_mode,
             alpha_pol=config.get("alpha_pol"),
             lr_update_steps=int(config.get("lr_update_steps", 0)),
             lr_update_neuron=config.get("lr_update_neuron"),
             lr_update_damping=float(config.get("lr_update_damping", 0.2)),
+            **head_kwargs,
             **charge_net_config,
         )
         return cls(
@@ -163,8 +172,15 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         descriptor_context: dict[str, Array] | None = None,
     ) -> dict[str, Array]:
         xp = array_api_compat.array_namespace(descriptor)
-        if descriptor_context is None or descriptor_context.get("gr") is None:
-            raise RuntimeError("latent multipoles require DPA4C degree-one moments")
+        need_gr = self.charge_net.dipole_mode == "gr"
+        if descriptor_context is None or (
+            (need_gr and descriptor_context.get("gr") is None)
+            or (not need_gr and descriptor_context.get("equivariant_latent") is None)
+        ):
+            raise RuntimeError(
+                "latent multipoles require DPA4C degree-one moments or the "
+                "DPA4 equivariant latent"
+            )
         n = descriptor.shape[0]
         pairs = topologies[ALL_PAIRS]
         mesh = topologies.get(PME_MESH) if self.periodic else None
@@ -176,9 +192,10 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         initial = self.charge_net.call_graph(
             descriptor,
             atype,
-            gr=descriptor_context["gr"],
+            gr=descriptor_context.get("gr"),
             fparam=fparam_node,
             aparam=aparam,
+            equivariant_latent=descriptor_context.get("equivariant_latent"),
         )
         q_output_dtype = initial["latent_charge"].dtype
         p_output_dtype = initial["latent_dipole"].dtype
@@ -214,6 +231,16 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     update_r_sq, src, n
                 )
             mask_q = xp.astype(node_mask[:, None], update_dtype)
+            sezm_fukui = (
+                self.charge_net.dipole_mode == "sezm"
+                and self.charge_constraint is not None
+            )
+            if sezm_fukui:
+                # The legacy SeZM recurrence conserves the per-frame,
+                # per-channel totals the state had when the iteration
+                # started, redistributing each deficit with the learned
+                # Fukui weights instead of a uniform shift.
+                q_target = segment_sum(q, frame_id, n_node.shape[0])
             for _ in range(self.charge_net.lr_update_steps):
                 potential, field = self._pair_potential_field(
                     q,
@@ -241,12 +268,25 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     )
                     potential = potential + phi_m
                     field = field - force_m
-                q, p = self.charge_net.update_polar_state(
-                    update_descriptor, q, p, local_p, potential, field
-                )
+                if sezm_fukui:
+                    q, p, fukui = self.charge_net.update_polar_state(
+                        update_descriptor,
+                        q,
+                        p,
+                        local_p,
+                        potential,
+                        field,
+                        return_fukui=True,
+                    )
+                else:
+                    q, p = self.charge_net.update_polar_state(
+                        update_descriptor, q, p, local_p, potential, field
+                    )
                 q = q * mask_q
                 p = p * mask_q
-                if self.charge_constraint is not None:
+                if sezm_fukui:
+                    q = self._constrain_fukui(q, fukui, node_mask, frame_id, q_target)
+                elif self.charge_constraint is not None:
                     q = self._constrain(
                         q, node_mask, frame_id, n_node, fparam, charge_spin
                     )
@@ -296,6 +336,31 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "latent_dipole": p,
         }
 
+    def _constrain_fukui(
+        self,
+        charge: Array,
+        fukui: Array,
+        node_mask: Array,
+        frame_id: Array,
+        target: Array,
+    ) -> Array:
+        """Fukui-weighted charge-constraint redistribution of the SeZM update.
+
+        Conserves the per-frame, per-channel ``target`` totals by sharing each
+        frame's deficit over the real atoms in proportion to the learned
+        Fukui weights.
+        """
+        xp = array_api_compat.array_namespace(charge)
+        nf = target.shape[0]
+        weight = fukui[:, 0] * xp.astype(node_mask, charge.dtype)
+        weight_total = segment_sum(weight, frame_id, nf)
+        weight_total = xp.where(
+            weight_total > 1e-12, weight_total, xp.full_like(weight_total, 1e-12)
+        )
+        weights = weight / xp.take(weight_total, frame_id, axis=0)
+        deficit = target - segment_sum(charge, frame_id, nf)
+        return charge + weights[:, None] * xp.take(deficit, frame_id, axis=0)
+
     def _pair_potential_field(
         self,
         q: Array,
@@ -338,50 +403,9 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
     def _radial_coefficients(
         self, r_sq: Array, src: Array, n: int
     ) -> tuple[Array, Array, Array]:
-        """Stable ``K``, ``K'/r`` and ``(K''-K'/r)/r²`` of LES."""
-        xp = array_api_compat.array_namespace(r_sq)
-        alpha = self._kernel_coefficients(r_sq, src, n)["alpha"]
-        r_sq_safe = xp.maximum(r_sq, xp.full_like(r_sq, xp.finfo(r_sq.dtype).eps))
-        r = xp.sqrt(r_sq_safe)
-        x_sq = alpha * alpha * r_sq
-        exp_t = xp.exp(-x_sq)
-        erf_t = xp_erf(alpha * r)
-        k_analytic = erf_t / r
-        a_analytic = (2.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe - erf_t / (
-            r_sq_safe * r
-        )
-        kpp = (
-            -(4.0 * alpha**3 / _SQRT_PI) * exp_t
-            - (4.0 * alpha / _SQRT_PI) * exp_t / r_sq_safe
-            + 2.0 * erf_t / (r_sq_safe * r)
-        )
-        c_analytic = (kpp - a_analytic) / r_sq_safe
-        alpha2 = alpha * alpha
-        alpha3 = alpha * alpha2
-        alpha5 = alpha3 * alpha2
-        alpha7 = alpha5 * alpha2
-        alpha9 = alpha7 * alpha2
-        r4 = r_sq * r_sq
-        r6 = r4 * r_sq
-        k_series = (2.0 / _SQRT_PI) * (
-            alpha - alpha3 * r_sq / 3.0 + alpha5 * r4 / 10.0 - alpha7 * r6 / 42.0
-        )
-        a_series = (
-            -4.0 * alpha3 / (3.0 * _SQRT_PI)
-            + 4.0 * alpha5 * r_sq / (5.0 * _SQRT_PI)
-            - 2.0 * alpha7 * r4 / (7.0 * _SQRT_PI)
-            + 2.0 * alpha9 * r6 / (27.0 * _SQRT_PI)
-        )
-        c_series = (
-            8.0 * alpha5 / (5.0 * _SQRT_PI)
-            - 8.0 * alpha7 * r_sq / (7.0 * _SQRT_PI)
-            + 4.0 * alpha9 * r4 / (9.0 * _SQRT_PI)
-        )
-        small = x_sq < 0.04
-        return (
-            xp.where(small, k_series, k_analytic),
-            xp.where(small, a_series, a_analytic),
-            xp.where(small, c_series, c_analytic),
+        """The pair kernel's ``K``, ``K'/r`` and ``(K''-K'/r)/r²``."""
+        return self.kernel.evaluate_multipole(
+            r_sq, self._kernel_coefficients(r_sq, src, n)
         )
 
     def _kernel_coefficients(self, r_sq: Array, src: Array, n: int) -> dict[str, Array]:
