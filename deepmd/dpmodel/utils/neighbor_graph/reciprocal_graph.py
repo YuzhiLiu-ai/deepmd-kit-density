@@ -561,6 +561,57 @@ def build_mesh_grid(box: Array, spacing: float, coord: Array) -> MeshGrid:
     return mesh_grid_of_dims(box, coord, mesh_dims_of_cells(box, spacing), mask)
 
 
+def build_fixed_mesh_grid(
+    box: Array, dims: tuple[int, int, int], coord: Array, spacing: float
+) -> MeshGrid:
+    """Pack the cells of the periodic frames on a fixed mesh.
+
+    The mesh is fixed at the dimensions the training-time cell statistic
+    resolved, so a compiled graph keeps one mesh shape for the whole run.  A
+    frame whose cell outgrows the mesh at the reference ``spacing`` raises,
+    instead of silently aliasing its high wave numbers.
+
+    Parameters
+    ----------
+    box
+        Simulation cells with shape ``(nf, 3, 3)`` or ``(nf, 9)``; rows are
+        the lattice vectors.
+    dims
+        The fixed mesh dimensions ``(n1, n2, n3)``.
+    spacing
+        The reference mesh spacing the dims were sized from, in Å.
+    coord
+        Node positions with shape ``(N, 3)``.
+
+    Returns
+    -------
+    MeshGrid
+        The cells, the fixed mesh and the geometry of the frames.
+    """
+    xp = array_api_compat.array_namespace(box)
+    box = _cells(box)
+    dims = tuple(int(d) for d in dims)
+    cell = np.asarray(to_numpy_array(box), dtype=np.float64)
+    length = np.sqrt(
+        cell[..., 0] * cell[..., 0]
+        + cell[..., 1] * cell[..., 1]
+        + cell[..., 2] * cell[..., 2]
+    )
+    needed = np.ceil(length / float(spacing)).astype(np.int64)
+    over = np.argwhere(needed > np.asarray(dims)[None, :])
+    if over.size:
+        frame, axis = (int(i) for i in over[0])
+        raise ValueError(
+            f"frame {frame} needs at least {int(needed[frame, axis])} mesh points "
+            f"along axis {axis} (cell length {length[frame, axis]:.3f} Å at the "
+            f"reference spacing {spacing:.4f} Å), but the fixed pme_mesh is "
+            f"{dims}; enlarge `pme_mesh` or repeat the training-time cell "
+            "statistic"
+        )
+    mask = xp.ones((box.shape[0],), dtype=xp.bool, device=array_api_compat.device(box))
+    return mesh_grid_of_dims(box, coord, dims, mask)
+
+
 def empty_mesh_grid(nf: int, coord: Array) -> MeshGrid:
     """The mesh grid of a batch without periodic frames: every frame masked."""
     xp = array_api_compat.array_namespace(coord)

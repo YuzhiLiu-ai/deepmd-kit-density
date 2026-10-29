@@ -79,6 +79,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         kspace_tolerance: float = 1e-8,
         k_grid_mode: str = "kgrid",
         pme_order: int = PME_ORDER,
+        pme_mesh: list[int] | tuple[int, int, int] | None = None,
         self_interaction: bool = False,
     ) -> None:
         if charge_net.vacuum_ref:
@@ -105,6 +106,13 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         self.pme_order = int(pme_order)
         if self.pme_order < 2:
             raise ValueError(f"`pme_order` must be at least 2, got {self.pme_order}")
+        self.pme_mesh = None if pme_mesh is None else tuple(int(d) for d in pme_mesh)
+        if self.pme_mesh is not None and (
+            len(self.pme_mesh) != 3 or any(d < 2 for d in self.pme_mesh)
+        ):
+            raise ValueError(
+                f"`pme_mesh` must hold three dimensions of at least 2, got {pme_mesh!r}"
+            )
         self.self_interaction = bool(self_interaction)
 
     @staticmethod
@@ -179,6 +187,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             # lands; PME is opt-in via `k_grid_mode: "pme"`.
             k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
             pme_order=int(config.get("pme_order", PME_ORDER)),
+            pme_mesh=config.get("pme_mesh"),
             self_interaction=bool(config.get("self_interaction", False)),
         )
 
@@ -199,7 +208,12 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         if self.k_grid_mode == "pme":
             # B-splines of pme_order at three quarters of the Nyquist spacing
             # of the wave-number cutoff.
-            return {PME_MESH: {"spacing": PME_SPACING_FRACTION * float(np.pi) / k_max}}
+            spacing = PME_SPACING_FRACTION * float(np.pi) / k_max
+            if self.pme_mesh is not None:
+                # A mesh fixed by the training-time cell statistic keeps the
+                # compiled graph at one mesh shape for the whole run.
+                return {PME_MESH: {"dims": self.pme_mesh, "spacing": spacing}}
+            return {PME_MESH: {"spacing": spacing}}
         return {K_GRID: {"k_max": k_max}}
 
     def uses_charge_spin(self) -> bool:
@@ -375,6 +389,8 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             data["kspace_tolerance"] = self.kspace_tolerance
             data["k_grid_mode"] = self.k_grid_mode
             data["pme_order"] = self.pme_order
+            if self.pme_mesh is not None:
+                data["pme_mesh"] = list(self.pme_mesh)
         return data
 
     @classmethod
@@ -392,5 +408,6 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             # evaluates the explicit wave numbers.
             k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
             pme_order=data.get("pme_order", PME_ORDER),
+            pme_mesh=data.get("pme_mesh"),
             self_interaction=data.get("self_interaction", False),
         )

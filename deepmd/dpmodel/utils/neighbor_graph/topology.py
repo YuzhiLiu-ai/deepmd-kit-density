@@ -41,6 +41,7 @@ from .reciprocal_graph import (
     KGrid,
     MeshGrid,
     build_fixed_k_grid,
+    build_fixed_mesh_grid,
     build_k_grid,
     build_mesh_grid,
     check_periodic_cells,
@@ -86,6 +87,8 @@ def _build_reciprocal(
         )
     check_periodic_cells(box)
     if name == PME_MESH:
+        if "dims" in params:
+            return build_fixed_mesh_grid(box, params["dims"], coord, params["spacing"])
         return build_mesh_grid(box, params["spacing"], coord)
     if "bounds" in params:
         return build_fixed_k_grid(box, params["bounds"], params["k_max"], coord, n_node)

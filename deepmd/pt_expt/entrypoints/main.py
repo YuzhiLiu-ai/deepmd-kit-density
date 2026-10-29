@@ -115,6 +115,47 @@ def _detect_lmdb_path(systems_raw: Any) -> str | None:
     return None
 
 
+def _max_cell_lengths(
+    systems_raw: Any,
+    type_map: list[str] | None,
+) -> Any:
+    """The largest lattice-vector length per axis over the data systems.
+
+    npy systems are scanned exactly over every ``set.*/box.npy`` (the box
+    arrays are small); an LMDB system is scanned over the frame sample of
+    the neighbor statistic.  Returns ``None`` when no system carries cells.
+    """
+    import glob
+
+    import numpy as np
+
+    systems = systems_raw if isinstance(systems_raw, list) else [systems_raw]
+    max_length = None
+
+    def _take(boxes: Any) -> None:
+        nonlocal max_length
+        lengths = np.linalg.norm(boxes.reshape(-1, 3, 3), axis=-1).max(axis=0)
+        max_length = lengths if max_length is None else np.maximum(max_length, lengths)
+
+    for system in systems:
+        if not isinstance(system, str):
+            continue
+        if is_lmdb(system):
+            from deepmd.dpmodel.utils.lmdb_data import (
+                make_neighbor_stat_data,
+            )
+
+            proxy = make_neighbor_stat_data(system, type_map)
+            for data_system in proxy.data_systems:
+                boxes = data_system._load_set(None)["box"]
+                if boxes is not None:
+                    _take(boxes)
+        else:
+            for box_file in sorted(glob.glob(os.path.join(system, "set.*", "box.npy"))):
+                _take(np.load(box_file))
+    return max_length
+
+
 def _get_neighbor_stat_data(
     dataset_params: dict[str, Any],
     type_map: list[str] | None,
@@ -393,6 +434,88 @@ class PTExptTrainEntrypoint(AbstractTrainEntrypoint):
         if multi_task:
             return config, min_nbor_dist
         return config, next(iter(min_nbor_dist.values()), None)
+
+    def update_mesh_stat(
+        self,
+        config: dict[str, Any],
+        options: TrainEntrypointOptions,
+        *,
+        multi_task: bool,
+    ) -> dict[str, Any]:
+        """Fix the PME mesh of every periodic long-range task from the data cells.
+
+        A batch-sized mesh would change the compiled graph whenever the
+        largest cell of a batch changes, so the mesh is sized once here from
+        the largest training and validation cell and stored as ``pme_mesh``
+        in the model config (and, from there, in every checkpoint).  Tasks
+        with an explicit ``pme_mesh`` keep it.
+        """
+        import numpy as np
+
+        from deepmd.dpmodel.long_range.kernel import (
+            BaseInteractionKernel,
+        )
+        from deepmd.dpmodel.long_range.latent_charge import (
+            PME_SPACING_FRACTION,
+        )
+        from deepmd.dpmodel.utils.neighbor_graph.reciprocal_graph import (
+            mesh_dims_of_cells,
+        )
+
+        for task_config in iter_training_task_configs(config):
+            model_params = task_config.model_params
+            long_range = model_params.get("long_range")
+            if not isinstance(long_range, dict):
+                continue
+            if not long_range.get("periodic", False):
+                continue
+            if long_range.get("k_grid_mode", "kgrid") != "pme":
+                continue
+            if long_range.get("pme_mesh") is not None:
+                continue
+            kernel_config = dict(long_range["kernel"])
+            kernel_cls = BaseInteractionKernel.get_class_by_type(
+                kernel_config.pop("type")
+            )
+            kernel = kernel_cls(**kernel_config)
+            k_max = kernel.kspace_cutoff(
+                float(long_range.get("kspace_tolerance", 1e-8))
+            )
+            spacing = PME_SPACING_FRACTION * float(np.pi) / k_max
+            max_length = None
+            for data_params in (
+                task_config.training_data_params,
+                task_config.validation_data_params,
+            ):
+                if data_params is None:
+                    continue
+                lengths = _max_cell_lengths(
+                    data_params["systems"],
+                    model_params.get("type_map"),
+                )
+                if lengths is not None:
+                    max_length = (
+                        lengths
+                        if max_length is None
+                        else np.maximum(max_length, lengths)
+                    )
+            if max_length is None:
+                log.warning(
+                    "task %s: no cells found in the data; the PME mesh stays "
+                    "batch-sized",
+                    task_config.key,
+                )
+                continue
+            dims = mesh_dims_of_cells(np.diag(max_length)[None, :, :], spacing)
+            long_range["pme_mesh"] = [int(d) for d in dims]
+            log.info(
+                "task %s: PME mesh fixed to %s from cells up to %s Å (spacing %.4f Å)",
+                task_config.key,
+                long_range["pme_mesh"],
+                np.round(max_length, 2).tolist(),
+                spacing,
+            )
+        return config
 
     def print_summary(self) -> None:
         """Print pt_expt backend summary."""

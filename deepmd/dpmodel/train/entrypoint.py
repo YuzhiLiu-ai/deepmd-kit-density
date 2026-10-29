@@ -79,6 +79,10 @@ class AbstractTrainEntrypoint(ABC):
                 options,
                 multi_task=multi_task,
             )
+        # Static-shape resolution (e.g. the PME mesh from the training cells)
+        # is cheap and keeps compiled graphs at one shape, so it runs even
+        # when the expensive neighbor statistic is skipped.
+        config = self.update_mesh_stat(config, options, multi_task=multi_task)
 
         self.dump_config(config, options.output)
         self.print_summary()
@@ -142,6 +146,22 @@ class AbstractTrainEntrypoint(ABC):
     ) -> tuple[dict[str, Any], Any]:
         """Update descriptor selections from neighbor statistics."""
         return config, None
+
+    def update_mesh_stat(
+        self,
+        config: dict[str, Any],
+        options: TrainEntrypointOptions,
+        *,
+        multi_task: bool,
+    ) -> dict[str, Any]:
+        """Resolve data-sized static topologies (e.g. the PME mesh).
+
+        Runs even when the neighbor statistic is skipped: sizing a mesh from
+        the training cells is a cheap read of the box arrays and keeps the
+        compiled graph at one mesh shape for the whole run. The default is a
+        no-op for backends without data-sized topologies.
+        """
+        return config
 
     def dump_config(self, config: dict[str, Any], output: str) -> None:
         """Dump the normalized config used for training."""

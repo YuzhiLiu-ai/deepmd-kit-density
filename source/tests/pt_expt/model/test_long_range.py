@@ -1419,3 +1419,95 @@ def test_long_range_change_out_bias_builds_topologies() -> None:
     # The energy row moved with the (zero-label) statistic; the latent rows
     # keep their initialization.
     assert after.shape == before.shape
+
+
+# ---------------------------------------------------------------------------
+# Fixed PME mesh (training-time cell statistic)
+# ---------------------------------------------------------------------------
+
+
+def _fixed_mesh_config(dims) -> dict:
+    config = _periodic_config("les")
+    config["long_range"]["k_grid_mode"] = "pme"
+    config["long_range"]["pme_mesh"] = list(dims)
+    return config
+
+
+def test_fixed_pme_mesh_matches_auto() -> None:
+    """A fixed mesh at the auto dimensions reproduces the auto evaluation."""
+    coord, atype, box = _periodic_batch((5, 4), seed=23)
+    auto = _periodic_model("les")
+    auto.atomic_model.long_range.k_grid_mode = "pme"
+    from deepmd.dpmodel.utils.neighbor_graph.reciprocal_graph import (
+        mesh_dims_of_cells,
+    )
+
+    spacing = auto.atomic_model.long_range.topology_params()["pme_mesh"]["spacing"]
+    dims = mesh_dims_of_cells(box.cpu().numpy(), spacing)
+    fixed = get_model(_fixed_mesh_config(dims)).to(env.DEVICE).eval()
+    fixed.load_state_dict(auto.state_dict())
+    expected = auto(coord, atype, box=box, do_atomic_virial=True)
+    actual = fixed(coord, atype, box=box, do_atomic_virial=True)
+    for key in ("energy", "force", "virial", "latent_charge"):
+        torch.testing.assert_close(actual[key], expected[key], rtol=1e-11, atol=1e-11)
+
+
+def test_fixed_pme_mesh_rejects_larger_cell() -> None:
+    """A frame whose cell outgrows the fixed mesh raises instead of aliasing."""
+    coord, atype, box = _periodic_batch((5,), seed=23)
+    model = get_model(_fixed_mesh_config([4, 4, 4])).to(env.DEVICE).eval()
+    with pytest.raises(ValueError, match="pme_mesh"):
+        model(coord, atype, box=box)
+
+
+def test_fixed_pme_mesh_serialization_round_trip() -> None:
+    model = get_model(_fixed_mesh_config([12, 12, 24])).to(env.DEVICE).eval()
+    record = model.serialize()
+    assert record["long_range"]["pme_mesh"] == [12, 12, 24]
+    restored = BaseModel.deserialize(record).to(env.DEVICE).eval()
+    assert restored.atomic_model.long_range.pme_mesh == (12, 12, 24)
+
+
+def test_update_mesh_stat_fixes_pme_mesh_from_data(tmp_path) -> None:
+    """The training entrypoint sizes the PME mesh from the largest data cell."""
+    import json
+
+    from deepmd.pt_expt.entrypoints.main import (
+        PTExptTrainEntrypoint,
+    )
+
+    system = tmp_path / "system"
+    (system / "set.000").mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    cells = np.stack(
+        [np.eye(3) * (10.0 + 2.0 * i) + rng.normal(0, 0.01, (3, 3)) for i in range(4)]
+    )
+    np.save(system / "set.000" / "box.npy", cells.reshape(4, 9))
+    config = {
+        "model": {
+            "type_map": ["A", "B"],
+            "long_range": {
+                "type": "latent_charge",
+                "periodic": True,
+                "k_grid_mode": "pme",
+                "kernel": {"type": "les", "alpha": 0.3},
+            },
+        },
+        "training": {
+            "training_data": {"systems": [str(system)]},
+        },
+    }
+    config = PTExptTrainEntrypoint().update_mesh_stat(config, None, multi_task=False)
+    mesh = config["model"]["long_range"]["pme_mesh"]
+    assert mesh is not None
+    # The rule matches the runtime builder: largest cell 16 A, LES alpha 0.3
+    # at tolerance 1e-8 -> spacing ~0.91 A.
+    from deepmd.dpmodel.utils.neighbor_graph.reciprocal_graph import (
+        mesh_dims_of_cells,
+    )
+
+    spacing = 0.75 * np.pi / (2 * 0.3 * np.sqrt(np.log(1e8)))
+    expected = mesh_dims_of_cells(cells, spacing)
+    assert list(mesh) == list(expected)
+    # Stable across the run: serialized into the dumped config.
+    json.dumps(config)

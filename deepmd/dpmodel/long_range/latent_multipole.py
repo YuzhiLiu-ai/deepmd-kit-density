@@ -52,6 +52,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         kspace_tolerance: float = 1e-8,
         k_grid_mode: str = "kgrid",
         pme_order: int = 8,
+        pme_mesh: list[int] | tuple[int, int, int] | None = None,
     ) -> None:
         super().__init__(
             charge_net,
@@ -61,6 +62,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             kspace_tolerance=kspace_tolerance,
             k_grid_mode=k_grid_mode,
             pme_order=pme_order,
+            pme_mesh=pme_mesh,
         )
         self.use_self_pol = bool(use_self_pol)
 
@@ -157,6 +159,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
             k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
             pme_order=int(config.get("pme_order", 8)),
+            pme_mesh=config.get("pme_mesh"),
         )
 
     def call_graph(
@@ -426,6 +429,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             data["kspace_tolerance"] = self.kspace_tolerance
             data["k_grid_mode"] = self.k_grid_mode
             data["pme_order"] = self.pme_order
+            if self.pme_mesh is not None:
+                data["pme_mesh"] = list(self.pme_mesh)
         return data
 
     @classmethod
@@ -444,4 +449,5 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             # evaluates the explicit wave numbers.
             k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
             pme_order=data.get("pme_order", 8),
+            pme_mesh=data.get("pme_mesh"),
         )

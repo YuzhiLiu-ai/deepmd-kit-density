@@ -4062,6 +4062,15 @@ def long_range_latent_charge() -> list[Argument]:
             doc="The B-spline order of the particle-mesh evaluation.",
         ),
         Argument(
+            "pme_mesh",
+            [list[int], type(None)],
+            optional=True,
+            default=None,
+            doc="Fixed particle-mesh dimensions [n1, n2, n3]. When omitted, the "
+            "mesh is sized from the training cells at the start of training and "
+            "kept fixed; a batch whose cell outgrows the mesh raises.",
+        ),
+        Argument(
             "self_interaction",
             bool,
             optional=True,
@@ -4145,6 +4154,15 @@ def long_range_latent_multipole() -> list[Argument]:
             optional=True,
             default=8,
             doc="The B-spline order of the particle-mesh evaluation.",
+        ),
+        Argument(
+            "pme_mesh",
+            [list[int], type(None)],
+            optional=True,
+            default=None,
+            doc="Fixed particle-mesh dimensions [n1, n2, n3]. When omitted, the "
+            "mesh is sized from the training cells at the start of training and "
+            "kept fixed; a batch whose cell outgrows the mesh raises.",
         ),
     ]
 
