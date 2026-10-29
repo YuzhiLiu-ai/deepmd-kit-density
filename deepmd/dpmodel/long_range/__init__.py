@@ -24,6 +24,8 @@ from .latent_multipole import (
     LatentMultipoleLongRange,
 )
 from .migration import (
+    migrate_dpa4_lr_config,
+    migrate_dpa4_lr_record,
     migrate_dpa4c_lr_config,
     migrate_dpa4c_lr_record,
 )
@@ -38,6 +40,8 @@ __all__ = [
     "SOGKernel",
     "check_long_range_support",
     "make_base_long_range",
+    "migrate_dpa4_lr_config",
+    "migrate_dpa4_lr_record",
     "migrate_dpa4c_lr_config",
     "migrate_dpa4c_lr_record",
 ]
