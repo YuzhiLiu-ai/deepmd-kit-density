@@ -810,6 +810,7 @@ class DeepEval(DeepEvalBackend):
                     lr_edge_index: torch.Tensor | None = None,
                     lr_edge_vec: torch.Tensor | None = None,
                     lr_edge_mask: torch.Tensor | None = None,
+                    topologies: dict | None = None,
                 ) -> dict[str, torch.Tensor]:
                     long_range_kwargs = {}
                     if needs_long_range_edges:
@@ -834,6 +835,7 @@ class DeepEval(DeepEvalBackend):
                         fparam=fparam,
                         aparam=aparam,
                         charge_spin=charge_spin,
+                        topologies=topologies,
                         **long_range_kwargs,
                     )
                     return _translate_energy_keys(
@@ -2578,10 +2580,32 @@ class DeepEval(DeepEvalBackend):
                         device=DEVICE,
                     ),
                 )
+        runner_kwargs: dict[str, Any] = {}
+        dp_model = getattr(self, "_dpmodel", None)
+        atomic_model = getattr(dp_model, "atomic_model", None)
+        if atomic_model is not None and atomic_model.has_long_range():
+            # The long-range plugin's pair/k-grid/mesh topologies are built
+            # beside the neighbor graph from the same eval geometry.
+            coord_flat_t = torch.as_tensor(
+                coord_input.reshape(nframes * natoms, 3),
+                dtype=edge_vec_t.dtype,
+                device=DEVICE,
+            )
+            box_t = (
+                torch.as_tensor(box_input, dtype=edge_vec_t.dtype, device=DEVICE)
+                if box_input is not None
+                else None
+            )
+            runner_kwargs["topologies"] = atomic_model.build_topologies(
+                coord_flat_t,
+                n_node_t,
+                box_t,
+                atype=atype_t,
+            )
         if self._is_pt2:
             model_ret = self._pt2_runner(*model_inputs)
         else:
-            model_ret = self.exported_module(*model_inputs)
+            model_ret = self.exported_module(*model_inputs, **runner_kwargs)
 
         results = []
         for odef in request_defs:
