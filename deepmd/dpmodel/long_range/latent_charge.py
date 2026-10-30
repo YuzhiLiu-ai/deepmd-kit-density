@@ -80,6 +80,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         k_grid_mode: str = "kgrid",
         pme_order: int = PME_ORDER,
         pme_mesh: list[int] | tuple[int, int, int] | None = None,
+        pme_mesh_spacing: float | None = None,
         self_interaction: bool = False,
     ) -> None:
         if charge_net.vacuum_ref:
@@ -112,6 +113,20 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         ):
             raise ValueError(
                 f"`pme_mesh` must hold three dimensions of at least 2, got {pme_mesh!r}"
+            )
+        # The reference spacing of a fixed mesh is frozen at construction:
+        # the kernel parameters may drift during training, and validating
+        # later cells against the drifted spacing would spuriously reject the
+        # very cells the mesh was sized for.
+        if self.pme_mesh is None:
+            self.pme_mesh_spacing = None
+        elif pme_mesh_spacing is not None:
+            self.pme_mesh_spacing = float(pme_mesh_spacing)
+        else:
+            self.pme_mesh_spacing = (
+                PME_SPACING_FRACTION
+                * float(np.pi)
+                / self.kernel.kspace_cutoff(self.kspace_tolerance)
             )
         self.self_interaction = bool(self_interaction)
 
@@ -211,8 +226,14 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             spacing = PME_SPACING_FRACTION * float(np.pi) / k_max
             if self.pme_mesh is not None:
                 # A mesh fixed by the training-time cell statistic keeps the
-                # compiled graph at one mesh shape for the whole run.
-                return {PME_MESH: {"dims": self.pme_mesh, "spacing": spacing}}
+                # compiled graph at one mesh shape for the whole run; the
+                # reference spacing stays at its frozen value.
+                return {
+                    PME_MESH: {
+                        "dims": self.pme_mesh,
+                        "spacing": self.pme_mesh_spacing,
+                    }
+                }
             return {PME_MESH: {"spacing": spacing}}
         return {K_GRID: {"k_max": k_max}}
 
@@ -391,6 +412,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             data["pme_order"] = self.pme_order
             if self.pme_mesh is not None:
                 data["pme_mesh"] = list(self.pme_mesh)
+                data["pme_mesh_spacing"] = self.pme_mesh_spacing
         return data
 
     @classmethod
@@ -409,5 +431,6 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
             pme_order=data.get("pme_order", PME_ORDER),
             pme_mesh=data.get("pme_mesh"),
+            pme_mesh_spacing=data.get("pme_mesh_spacing"),
             self_interaction=data.get("self_interaction", False),
         )

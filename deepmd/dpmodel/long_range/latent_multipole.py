@@ -53,6 +53,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         k_grid_mode: str = "kgrid",
         pme_order: int = 8,
         pme_mesh: list[int] | tuple[int, int, int] | None = None,
+        pme_mesh_spacing: float | None = None,
     ) -> None:
         super().__init__(
             charge_net,
@@ -63,6 +64,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             k_grid_mode=k_grid_mode,
             pme_order=pme_order,
             pme_mesh=pme_mesh,
+            pme_mesh_spacing=pme_mesh_spacing,
         )
         self.use_self_pol = bool(use_self_pol)
 
@@ -431,6 +433,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             data["pme_order"] = self.pme_order
             if self.pme_mesh is not None:
                 data["pme_mesh"] = list(self.pme_mesh)
+                data["pme_mesh_spacing"] = self.pme_mesh_spacing
         return data
 
     @classmethod
@@ -450,4 +453,5 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             k_grid_mode=data.get("k_grid_mode", "kgrid" if periodic else "pme"),
             pme_order=data.get("pme_order", 8),
             pme_mesh=data.get("pme_mesh"),
+            pme_mesh_spacing=data.get("pme_mesh_spacing"),
         )
