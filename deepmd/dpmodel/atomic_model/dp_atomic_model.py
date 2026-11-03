@@ -763,6 +763,12 @@ class DPAtomicModel(BaseAtomicModel):
             atype = atype[:n_real]
             rot_mat = None if rot_mat is None else rot_mat[:n_real]
             node_gate = None if node_gate is None else node_gate[:n_real]
+            # The appended vacuum frames padded the node axis the descriptor
+            # context lives on too; truncate the per-node context tensors the
+            # same way (the sezm multipole head reads the equivariant latent).
+            for key in ("equivariant_latent", "gr"):
+                if key in descriptor_context and descriptor_context[key] is not None:
+                    descriptor_context[key] = descriptor_context[key][:n_real]
         elif vacuum_ref:
             vacuum_kwargs["vacuum_descriptor"] = self.vacuum_descriptor()
         # === Step 4. Fitting ===

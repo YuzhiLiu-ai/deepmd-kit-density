@@ -178,7 +178,7 @@ def _compute_model_predict(
         # Convert inputs to numpy to avoid gradient issues
         coord = to_numpy_array(system["coord"])
         atype = to_numpy_array(system["atype"])
-        box = to_numpy_array(system["box"])
+        box = to_numpy_array(system.get("box", None))
         fparam = to_numpy_array(system.get("fparam", None))
         aparam = to_numpy_array(system.get("aparam", None))
         charge_spin = to_numpy_array(system.get("charge_spin", None))
