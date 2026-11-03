@@ -3282,7 +3282,7 @@ def fitting_sog_energy() -> list[Argument]:
             "remove_self_interaction",
             bool,
             optional=True,
-            default=False,
+            default=True,
             doc=supported_backends("pt") + doc_remove_self_interaction,
         ),
         Argument(

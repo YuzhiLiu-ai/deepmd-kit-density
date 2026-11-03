@@ -144,7 +144,7 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         b: float | torch.Tensor | None = None,
         sigma: float | torch.Tensor | None = None,
         M: int | None = None,
-        remove_self_interaction: bool = False,
+        remove_self_interaction: bool = True,
         use_charge_constraint: bool = False,
         use_self_pol: bool = True,
         lr_kernel: str = "les",

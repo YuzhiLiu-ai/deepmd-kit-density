@@ -226,7 +226,7 @@ class _SogLRKernel(nn.Module):
 
     def __init__(
         self,
-        remove_self_interaction: bool = False,
+        remove_self_interaction: bool = True,
         norm_factor: float = E2_PER_ANGSTROM_TO_EV,
         lr_kernel: str = "les",
     ) -> None:
