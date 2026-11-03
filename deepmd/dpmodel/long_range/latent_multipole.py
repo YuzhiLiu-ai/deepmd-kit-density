@@ -100,7 +100,10 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             raise ValueError("latent multipoles require `channels=1`")
         charge_net_config = {
             "neuron": CHARGE_NET_NEURON,
-            "activation_function": fitting.activation_function,
+            # The LR charge/dipole readout defaults to tanh (independent of
+            # the main fitting's activation), still overridable via
+            # `charge_net`.
+            "activation_function": "tanh",
             "resnet_dt": fitting.resnet_dt,
             "precision": fitting.precision,
             "seed": child_seed(fitting_seed, CHARGE_NET_SEED_INDEX),

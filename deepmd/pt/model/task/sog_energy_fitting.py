@@ -252,7 +252,9 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
                         in_dim,
                         self.dim_out_lr,
                         self.neuron_lr,
-                        activation_function=self.activation_function,
+                        # The LR charge readout defaults to tanh, independent
+                        # of the main fitting's activation (silu by default).
+                        activation_function="tanh",
                         resnet_dt=self.resnet_dt,
                         precision=self.precision,
                         bias_out=self.bias_out,
@@ -275,7 +277,7 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
                         in_dim,
                         self.dim_out_lr,
                         self.neuron_lr,
-                        self.activation_function,
+                        "tanh",  # the LR charge readout defaults to tanh
                         self.resnet_dt,
                         self.precision,
                         bias_out=self.bias_out,

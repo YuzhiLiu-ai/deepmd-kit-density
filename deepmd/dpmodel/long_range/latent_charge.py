@@ -167,7 +167,9 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             pass  # periodic evaluation over the k grid is served below
         charge_net_config = {
             "neuron": CHARGE_NET_NEURON,
-            "activation_function": fitting.activation_function,
+            # The LR charge readout defaults to tanh (independent of the main
+            # fitting's activation), still overridable via `charge_net`.
+            "activation_function": "tanh",
             "resnet_dt": fitting.resnet_dt,
             "precision": fitting.precision,
             "seed": child_seed(fitting_seed, CHARGE_NET_SEED_INDEX),
