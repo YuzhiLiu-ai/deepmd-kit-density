@@ -152,7 +152,7 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
         dipole_lmax: int | None = None,
         dipole_channels: int | None = None,
         charge_bound: float | None = None,
-        use_glu: bool = True,
+        use_glu: bool = False,
         lr_update_steps: int = 0,
         lr_update_neuron: list[int] | None = None,
         lr_update_damping: float = 0.2,
@@ -232,9 +232,9 @@ class SOGEnergyFittingNet(SeZMEnergyFittingNet):
             )
 
         # --- LR (latent charge) branch ---
-        # use_glu=True (default) uses GLUFittingNet; use_glu=False uses standard
-        # FittingNet (MLP) which is less expressive but more stable (no
-        # unbounded val branch that can blow up the latent charge).
+        # use_glu=False (default) uses the standard FittingNet (MLP), which is
+        # less expressive but more stable (no unbounded val branch that can
+        # blow up the latent charge); use_glu=True opts into GLUFittingNet.
         in_dim = (
             self.dim_descrpt
             + self.numb_fparam

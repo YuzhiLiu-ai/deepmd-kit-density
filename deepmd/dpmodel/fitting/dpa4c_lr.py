@@ -97,7 +97,7 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         use_charge_constraint: bool = False,
         lr_kernel: str = "les",
         charge_bound: float | None = None,
-        use_glu: bool = True,
+        use_glu: bool = False,
         embedding_width: int = 0,
         alpha_pol: float | list[float] | None = None,
         use_self_pol: bool = True,
@@ -152,9 +152,9 @@ class DPA4CLRFitting(SeZMEnergyFittingNet):
         super().__init__(*args, **kwargs)
 
         # --- latent-charge branch ---
-        # use_glu=True (default) uses GLUFittingNet; use_glu=False uses standard
-        # FittingNet (MLP) which is less expressive but more stable (no
-        # unbounded val branch that can blow up the latent charge).
+        # use_glu=False (default) uses the standard FittingNet (MLP), which is
+        # less expressive but more stable (no unbounded val branch that can
+        # blow up the latent charge); use_glu=True opts into GLUFittingNet.
         case_dim = 0 if self.case_film_embd else self.dim_case_embd
         in_dim = (
             self.dim_descrpt

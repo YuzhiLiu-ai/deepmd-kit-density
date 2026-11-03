@@ -3349,12 +3349,12 @@ def fitting_sog_energy() -> list[Argument]:
             "use_glu",
             bool,
             optional=True,
-            default=True,
+            default=False,
             doc=supported_backends("pt")
             + "Whether to use GLU (Gated Linear Unit) for the long-range branch. "
-            + "If True (default), use GLUFittingNet which is more expressive but "
-            + "can produce unbounded outputs. If False, use standard FittingNet "
-            + "(MLP) which is more stable (no unbounded val branch).",
+            + "If True, use GLUFittingNet which is more expressive but "
+            + "can produce unbounded outputs. If False (default), use standard "
+            + "FittingNet (MLP) which is more stable (no unbounded val branch).",
         ),
     ]
 
@@ -3538,12 +3538,12 @@ def fitting_dpa4c_lr() -> list[Argument]:
             "use_glu",
             bool,
             optional=True,
-            default=True,
+            default=False,
             doc=supported_backends("pt_expt")
             + "Whether to use GLU (Gated Linear Unit) for the long-range branch. "
-            + "If True (default), use GLUFittingNet which is more expressive but "
-            + "can produce unbounded outputs. If False, use standard FittingNet "
-            + "(MLP) which is more stable (no unbounded val branch).",
+            + "If True, use GLUFittingNet which is more expressive but "
+            + "can produce unbounded outputs. If False (default), use standard "
+            + "FittingNet (MLP) which is more stable (no unbounded val branch).",
         ),
     ]
 
