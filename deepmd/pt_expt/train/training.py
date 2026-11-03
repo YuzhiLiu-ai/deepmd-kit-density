@@ -1895,6 +1895,49 @@ class _CompiledModel(torch.nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _is_pt_native_sezm_checkpoint(state_dict: dict) -> bool:
+    """A pt-native SeZM/DPA4 checkpoint stores descriptor linear weights as ``.matrix``.
+
+    pt_expt-native checkpoints store them as ``.w``; the finetune loader can
+    only ``load_state_dict`` the latter directly, so pt-native records take the
+    serialize/deserialize bridge.
+    """
+    return any(
+        key.startswith("model.") and "descriptor" in key and key.endswith(".matrix")
+        for key in state_dict
+    )
+
+
+def _pt_native_checkpoint_to_ptexpt(
+    model_params: dict, state_dict: dict
+) -> torch.nn.Module:
+    """Load a pt-native SeZM/DPA4 checkpoint and convert it to a pt_expt model.
+
+    The pt backend stores fitting/descriptor linear weights under ``.matrix``
+    while pt_expt uses ``.w``; the two backends share the record format, so
+    the bridge is pt model -> serialize -> pt_expt deserialize.  A
+    ``sog_energy`` record is additionally migrated to the long-range plugin
+    layout.
+    """
+    from deepmd.pt.model.model import (
+        get_model as pt_get_model,
+    )
+    from deepmd.pt_expt.model import (
+        BaseModel,
+    )
+
+    pt_model = pt_get_model(deepcopy(model_params)).to(DEVICE)
+    ModelWrapper(pt_model).load_state_dict(state_dict)
+    record = pt_model.serialize()
+    if model_params.get("fitting_net", {}).get("type") == "sog_energy":
+        from deepmd.dpmodel.long_range.migration import (
+            migrate_dpa4_lr_record,
+        )
+
+        record = migrate_dpa4_lr_record(record)
+    return BaseModel.deserialize(record).to(DEVICE)
+
+
 class Trainer(AbstractTrainer):
     """Training driver for the pt_expt backend.
 
@@ -2324,18 +2367,29 @@ class Trainer(AbstractTrainer):
                     # Single-task pretrained → wrap as {"Default": model}
                     if is_pte:
                         pretrained_models = pretrained_model
+                        pretrained_loaded = True
+                    elif _is_pt_native_sezm_checkpoint(state_dict):
+                        # pt-native SeZM/DPA4 checkpoint (weights stored as
+                        # `.matrix`): bridge through the record format rather
+                        # than a raw state_dict load (`.w` expected here).
+                        pretrained_models = _pt_native_checkpoint_to_ptexpt(
+                            pretrained_model_params, state_dict
+                        )
+                        pretrained_loaded = True
                     else:
                         pretrained_models = get_model(
                             deepcopy(pretrained_model_params)
                         ).to(DEVICE)
+                        pretrained_loaded = False
                 else:
                     pretrained_models = {}
                     for pk in pretrained_model_params["model_dict"]:
                         pretrained_models[pk] = get_model(
                             deepcopy(pretrained_model_params["model_dict"][pk])
                         ).to(DEVICE)
+                    pretrained_loaded = False
                 pretrained_wrapper = ModelWrapper(pretrained_models)
-                if not is_pte:
+                if not pretrained_loaded:
                     pretrained_wrapper.load_state_dict(state_dict)
 
                 # Per-branch type map change

@@ -344,6 +344,24 @@ def train(
     if is_node_main_process():
         SummaryPrinter()()
     config = j_loader(input_file)
+    # The long-range plugin architecture lives in the pt_expt backend; a model
+    # config carrying `long_range` is routed there.  Legacy dpa4_lr/sog_energy
+    # configs (no `long_range`) stay on this backend.
+    if config.get("model", {}).get("long_range") is not None:
+        from deepmd.pt_expt.entrypoints.main import (
+            train as pt_expt_train,
+        )
+
+        return pt_expt_train(
+            input_file,
+            init_model=init_model,
+            restart=restart,
+            finetune=finetune,
+            model_branch=model_branch,
+            use_pretrain_script=use_pretrain_script,
+            skip_neighbor_stat=skip_neighbor_stat,
+            output=output,
+        )
     config["model"] = expand_model_preset(config["model"])
     # ensure suffix, as in the command line help, we say "path prefix of checkpoint files"
     if init_model is not None and not init_model.endswith(".pt"):
