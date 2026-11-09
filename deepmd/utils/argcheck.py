@@ -5969,7 +5969,7 @@ def loss_ener() -> list[Argument]:
 
 @loss_args_plugin.register(
     "ener_latent",
-    doc=supported_backends("pt")
+    doc=supported_backends("pt", "pt_expt")
     + "Energy/force loss with atomic latent charge and dipole supervision for DPA4-LR.",
 )
 def loss_ener_latent() -> list[Argument]:

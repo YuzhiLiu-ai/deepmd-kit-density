@@ -5,6 +5,9 @@ from deepmd.pt_expt.loss.dos import (
 from deepmd.pt_expt.loss.ener import (
     EnergyLoss,
 )
+from deepmd.pt_expt.loss.ener_latent import (
+    EnergyLatentLoss,
+)
 from deepmd.pt_expt.loss.ener_spin import (
     EnergySpinLoss,
 )
@@ -20,6 +23,7 @@ from deepmd.pt_expt.loss.unimol import (
 
 __all__ = [
     "DOSLoss",
+    "EnergyLatentLoss",
     "EnergyLoss",
     "EnergySpinLoss",
     "PropertyLoss",

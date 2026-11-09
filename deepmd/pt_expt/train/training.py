@@ -107,6 +107,7 @@ from deepmd.pt.utils.compile_compat import (
 from deepmd.pt.utils.compile_compat import trace_pad_dim as _trace_pad_dim
 from deepmd.pt_expt.loss import (
     DOSLoss,
+    EnergyLatentLoss,
     EnergyLoss,
     EnergySpinLoss,
     PropertyLoss,
@@ -357,6 +358,9 @@ def get_loss(
     if loss_type == "ener":
         loss_params["starter_learning_rate"] = start_lr
         return EnergyLoss(**loss_params)
+    elif loss_type == "ener_latent":
+        loss_params["starter_learning_rate"] = start_lr
+        return EnergyLatentLoss(**loss_params)
     elif loss_type == "dos":
         loss_params["starter_learning_rate"] = start_lr
         loss_params["numb_dos"] = _model.model_output_def()["dos"].output_size
