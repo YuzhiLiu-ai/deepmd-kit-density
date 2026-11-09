@@ -615,6 +615,11 @@ class TestSeZMModelCompile(unittest.TestCase):
         out_dyn = model_dyn(coord, atype, box=box, charge_spin=charge_spin)
         out_cmp = model_cmp(coord, atype, box=box, charge_spin=charge_spin)
         out_default = model_cmp(coord, atype, box=box)
+        coord2 = torch.cat([coord, coord], dim=0)
+        atype2 = torch.cat([atype, atype], dim=0)
+        box2 = torch.cat([box, box], dim=0)
+        out_default_two_frames = model_cmp(coord2, atype2, box=box2)
+        self.assertEqual(out_default_two_frames["energy"].shape[0], 2)
         out_shifted = model_cmp(
             coord,
             atype,

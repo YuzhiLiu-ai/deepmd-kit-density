@@ -143,6 +143,19 @@ class TestDPTestDensity(unittest.TestCase):
         os.unlink(cls.model_path)
         cls.tmpdir.cleanup()
 
+    def test_training_samples_grid_and_density(self) -> None:
+        config = deepcopy(self.config)
+        config["training"]["grid_sample_size"] = 1
+        trainer = get_trainer(normalize(config))
+        with torch.device("cpu"):
+            input_dict, label_dict, _ = trainer.get_data(is_train=True)
+            valid_input, valid_label, _ = trainer.get_data(is_train=False)
+        nsample = 1
+        self.assertEqual(input_dict["grid"].shape[1], nsample)
+        self.assertEqual(label_dict["density"].shape[1], nsample)
+        self.assertEqual(valid_input["grid"].shape[1], nsample)
+        self.assertEqual(valid_label["density"].shape[1], nsample)
+
     def test_change_out_bias_noop(self) -> None:
         # fine-tuning calls the model-level change_out_bias, whose default
         # change-by-statistic mode would run the grid-less stat wrapper;
@@ -679,10 +692,13 @@ class TestDPTestDensity(unittest.TestCase):
             detail_file=detail_file,
             atomic=False,
         )
-        # one detail file per frame, each holding ngrid [label, pred] pairs
+        # one detail file per frame, each holding 1/10 [label, pred] pairs
+        nsample = max(1, int(np.ceil(self.ngrid * 0.1)))
         for frame in range(self.nframes):
-            detail = np.loadtxt(f"{detail_file}.density.out.{frame}", skiprows=1)
-            self.assertEqual(detail.shape, (self.ngrid, 2))
+            detail = np.atleast_2d(
+                np.loadtxt(f"{detail_file}.density.out.{frame}", skiprows=1)
+            )
+            self.assertEqual(detail.shape, (nsample, 2))
 
     def test_dp_test_shuffle(self) -> None:
         # grid/density must be shuffled together with the frames: every
@@ -696,12 +712,15 @@ class TestDPTestDensity(unittest.TestCase):
             numb_test=0,
             rand_seed=None,
             shuffle_test=False,
+            grid_sample_ratio=1.0,
             detail_file=detail_ref,
             atomic=False,
         )
         ref_rows = set()
         for frame in range(self.nframes):
-            detail = np.loadtxt(f"{detail_ref}.density.out.{frame}", skiprows=1)
+            detail = np.atleast_2d(
+                np.loadtxt(f"{detail_ref}.density.out.{frame}", skiprows=1)
+            )
             for row in detail:
                 ref_rows.add(tuple(np.round(row, decimals=5)))
 
@@ -718,9 +737,12 @@ class TestDPTestDensity(unittest.TestCase):
         )
         shuf_rows = []
         for frame in range(2):
-            detail = np.loadtxt(f"{detail_shuf}.density.out.{frame}", skiprows=1)
+            detail = np.atleast_2d(
+                np.loadtxt(f"{detail_shuf}.density.out.{frame}", skiprows=1)
+            )
             shuf_rows.extend(tuple(np.round(row, decimals=5)) for row in detail)
-        self.assertEqual(len(shuf_rows), 2 * self.ngrid)
+        nsample = max(1, int(np.ceil(self.ngrid * 0.1)))
+        self.assertEqual(len(shuf_rows), 2 * nsample)
         for row in shuf_rows:
             self.assertIn(row, ref_rows)
 

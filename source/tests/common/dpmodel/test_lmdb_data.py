@@ -545,6 +545,58 @@ class TestLmdbDataReader(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed LMDB reader"):
             _ = second[0]
 
+    def test_grid_sampling_precedes_variable_grid_collation(self):
+        """Different original grid sizes can share a sampled training batch."""
+        path = _create_lmdb(
+            f"{self._tmpdir.name}/variable_grid.lmdb", nframes=2, natoms=6
+        )
+        environment = lmdb.open(path, readonly=False, lock=False)
+        with environment.begin(write=True) as transaction:
+            for index, ngrid in enumerate((3, 5)):
+                frame = _make_frame(natoms=6, seed=index)
+                grid = np.arange(ngrid * 3, dtype=np.float64).reshape(ngrid, 3)
+                density = grid[:, :1].copy()
+                frame["grid"] = {
+                    "type": "float64",
+                    "shape": list(grid.shape),
+                    "data": grid.tobytes(),
+                }
+                frame["density"] = {
+                    "type": "float64",
+                    "shape": list(density.shape),
+                    "data": density.tobytes(),
+                }
+                transaction.put(
+                    format(index, "012d").encode(),
+                    msgpack.packb(frame, use_bin_type=True),
+                )
+        environment.close()
+
+        config = LmdbDecodeConfig(
+            ntypes=2,
+            natoms=6,
+            type_remap=None,
+            data_requirements={},
+            grid_sample_size=2,
+            grid_sample_seed=42,
+        )
+        environment = lmdb.open(path, readonly=True, lock=False)
+        with environment.begin() as transaction:
+            batch = decode_lmdb_batch(transaction, [0, 1], "012d", config)
+        environment.close()
+
+        self.assertEqual(batch["grid"].shape, (2, 2, 3))
+        self.assertEqual(batch["density"].shape, (2, 2, 1))
+        np.testing.assert_array_equal(batch["grid"][:, :, 0], batch["density"][:, :, 0])
+
+        reader = LmdbDataReader(path, self._type_map, batch_size=2)
+        reader.set_grid_sampling(2, seed=42, resample=False)
+        first = reader.decode_batch([0, 1])
+        second = reader.decode_batch([0, 1])
+        reader.close()
+        np.testing.assert_array_equal(first["grid"], second["grid"])
+        np.testing.assert_array_equal(first["density"], second["density"])
+
     def test_batch_dtype_and_field_order_are_chunk_independent(self):
         """Batch promotion and schema matching do not depend on chunking."""
         path = _create_lmdb(

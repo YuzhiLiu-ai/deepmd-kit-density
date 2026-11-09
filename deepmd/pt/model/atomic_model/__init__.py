@@ -20,6 +20,9 @@ from .base_atomic_model import (
 from .density_atomic_model import (
     DPDensityAtomicModel,
 )
+from .density_basis_atomic_model import (
+    DensityBasisAtomicModel,
+)
 from .dipole_atomic_model import (
     DPDipoleAtomicModel,
 )
@@ -63,6 +66,7 @@ __all__ = [
     "DPPopulationAtomicModel",
     "DPPropertyAtomicModel",
     "DPZBLLinearEnergyAtomicModel",
+    "DensityBasisAtomicModel",
     "LinearEnergyAtomicModel",
     "PairTabAtomicModel",
     "SeZMAtomicModel",

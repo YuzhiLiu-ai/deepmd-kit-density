@@ -216,8 +216,14 @@ class LmdbDataset(Dataset):
         type_map: list[str],
         batch_size: int | str = "auto",
         auto_prob_style: str | None = None,
+        grid_sample_size: int | None = None,
+        grid_sample_seed: int = 0,
+        grid_sample_resample: bool = True,
     ) -> None:
         self._reader = LmdbDataReader(lmdb_path, type_map, batch_size)
+        self._reader.set_grid_sampling(
+            grid_sample_size, grid_sample_seed, resample=grid_sample_resample
+        )
         self._collate = functools.partial(
             _collate_lmdb_batch, config=self._reader.decode_config
         )

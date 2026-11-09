@@ -261,14 +261,23 @@ class C3CutoffEnvelope(torch.nn.Module):
             torch.tensor(self.rcut, dtype=self.dtype, device=self.device),
             persistent=False,
         )
+        # tensor copy of the coefficients: the Horner loop in forward
+        # indexes a buffer so the module stays TorchScript-compatible
+        self.register_buffer(
+            "series_coefficients",
+            torch.tensor(
+                self._series_coefficients, dtype=self.dtype, device=self.device
+            ),
+            persistent=False,
+        )
 
     def forward(self, dst: torch.Tensor) -> torch.Tensor:
         """Compute the envelope value for given distances."""
         u = ((self.rcut_tensor - dst) / self.rcut_tensor).clamp(min=0.0, max=1.0)
         x = 1.0 - u
         series = torch.full_like(x, self._series_coefficients[-1])
-        for coefficient in reversed(self._series_coefficients[:-1]):
-            series = coefficient + x * series
+        for ii in range(self.p - 2, -1, -1):
+            series = self.series_coefficients[ii] + x * series
         return u.pow(4) * series
 
 

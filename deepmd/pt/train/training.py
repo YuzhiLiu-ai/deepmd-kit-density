@@ -242,6 +242,8 @@ class Trainer:
         self.ema_save_ckpt = get_ema_checkpoint_prefix(self.save_ckpt)
         self.display_in_training = training_params.get("disp_training", True)
         self.timing_in_training = training_params.get("time_training", True)
+        self.grid_sample_size = int(training_params.get("grid_sample_size", 125))
+        self.grid_sample_seed = int(training_params.get("seed") or 0)
         self.change_bias_after_training = training_params.get(
             "change_bias_after_training", False
         )
@@ -2274,6 +2276,38 @@ class Trainer:
             else:
                 if item_key not in ["sid", "fid"]:
                     label_dict[item_key] = batch_data[item_key]
+        task_model = self.model[task_key] if self.multi_task else self.model
+        model_has_grid = getattr(task_model, "has_grid", False)
+        if callable(model_has_grid):
+            model_has_grid = model_has_grid()
+        if model_has_grid and input_dict.get("grid") is not None:
+            grid = input_dict["grid"]
+            density = label_dict.get("density")
+            nframes, ngrid = grid.shape[:2]
+            nsample = min(ngrid, self.grid_sample_size)
+            sampled_grid = []
+            sampled_density = []
+            for ii in range(nframes):
+                # Sampling before the forward pass also reduces neighbor-list and
+                # descriptor work. Sorting preserves coalesced grid memory access.
+                if is_train:
+                    idx = torch.randperm(ngrid, device=grid.device)[:nsample]
+                else:
+                    # Validation always evaluates the same points for a given
+                    # frame position, making sampled metrics comparable.
+                    generator = torch.Generator(device="cpu")
+                    generator.manual_seed(self.grid_sample_seed + ii)
+                    idx = torch.randperm(ngrid, generator=generator, device="cpu")[
+                        :nsample
+                    ].to(grid.device)
+                idx = idx.sort().values
+                sampled_grid.append(grid[ii, idx])
+                if density is not None:
+                    sampled_density.append(density[ii, idx])
+            input_dict["grid"] = torch.stack(sampled_grid)
+            if density is not None:
+                label_dict["density"] = torch.stack(sampled_density)
+
         log_dict = {}
         if "fid" in batch_data:
             log_dict["fid"] = batch_data["fid"]
@@ -2281,10 +2315,6 @@ class Trainer:
         # models without grid support do not accept a grid keyword in forward;
         # drop it when the data does not provide grid, or when the task model
         # has no grid input (multi-task branches may share grid-carrying data)
-        task_model = self.model[task_key] if self.multi_task else self.model
-        model_has_grid = getattr(task_model, "has_grid", False)
-        if callable(model_has_grid):
-            model_has_grid = model_has_grid()
         if not model_has_grid or input_dict.get("grid") is None:
             input_dict.pop("grid", None)
         return input_dict, label_dict, log_dict

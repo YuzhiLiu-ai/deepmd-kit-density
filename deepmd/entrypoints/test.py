@@ -58,6 +58,7 @@ def test(
     shuffle_test: bool,
     detail_file: str,
     atomic: bool,
+    grid_sample_ratio: float = 0.1,
     head: str | None = None,
     **kwargs: Any,
 ) -> None:
@@ -81,6 +82,8 @@ def test(
         seed for random generator
     shuffle_test : bool
         whether to shuffle tests
+    grid_sample_ratio : float
+        fraction of grid points evaluated per frame for density models
     detail_file : Optional[str]
         file where test details will be output
     atomic : bool
@@ -144,7 +147,12 @@ def test(
 
     # init model
     dp = DeepEval(model, head=head)
-    tester = build_tester(dp, atomic=atomic)
+    tester = build_tester(
+        dp,
+        atomic=atomic,
+        grid_sample_ratio=grid_sample_ratio,
+        rand_seed=rand_seed,
+    )
 
     for cc, system in enumerate(all_sys):
         log.info("# ---------------output of dp test--------------- ")

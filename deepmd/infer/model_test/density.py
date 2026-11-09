@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Testing of models predicting charge density on grid points."""
 
+from typing import (
+    Any,
+)
+
+import numpy as np
+
 from deepmd.infer.model_test.base import (
     ChunkContext,
     ModelTester,
@@ -24,6 +30,22 @@ class DensityTester(ModelTester):
         ("mae_density", "DENSITY MAE             : {} units"),
         ("rmse_density", "DENSITY RMSE            : {} units"),
     )
+
+    def __init__(
+        self,
+        dp: Any,
+        *,
+        atomic: bool,
+        grid_sample_ratio: float = 0.1,
+        rand_seed: int | None = None,
+    ) -> None:
+        super().__init__(dp, atomic=atomic)
+        if not 0.0 < grid_sample_ratio <= 1.0:
+            raise ValueError("grid_sample_ratio must be in the interval (0, 1]")
+        self.grid_sample_ratio = grid_sample_ratio
+        # A dedicated generator makes grid sampling reproducible without
+        # changing frame shuffling or other users of the global random state.
+        self.grid_rng = np.random.default_rng(0 if rand_seed is None else rand_seed)
 
     def add_data_requirements(self, data: DeepmdData) -> None:
         """Declare the labels a density test consumes."""
@@ -76,7 +98,19 @@ class DensityTester(ModelTester):
             atype = test_data["type"][0]
         fparam = test_data["fparam"] if dp.get_dim_fparam() > 0 else None
         aparam = test_data["aparam"] if dp.get_dim_aparam() > 0 else None
-        grid = test_data["grid"]
+        grid = test_data["grid"].reshape(nframes, -1, 3)
+        label = test_data["density"].reshape(nframes, -1)
+        if self.grid_sample_ratio < 1.0:
+            ngrid = grid.shape[1]
+            nsample = min(ngrid, max(1, int(np.ceil(ngrid * self.grid_sample_ratio))))
+            sampled_grid = []
+            sampled_label = []
+            for ii in range(nframes):
+                idx = np.sort(self.grid_rng.choice(ngrid, nsample, replace=False))
+                sampled_grid.append(grid[ii, idx])
+                sampled_label.append(label[ii, idx])
+            grid = np.stack(sampled_grid)
+            label = np.stack(sampled_label)
 
         prediction = dp.eval(
             coord,
@@ -87,7 +121,6 @@ class DensityTester(ModelTester):
             aparam=aparam,
             mixed_type=mixed_type,
         ).reshape(nframes, -1)
-        label = test_data["density"].reshape(nframes, -1)
 
         diff = prediction - label
         errors: dict[str, tuple[float, float]] = {

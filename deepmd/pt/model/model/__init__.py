@@ -45,6 +45,9 @@ from deepmd.utils.spin import (
     Spin,
 )
 
+from .density_basis_model import (
+    DensityBasisModel,
+)
 from .density_model import (
     GridDensityModel,
 )
@@ -127,6 +130,24 @@ def _get_standard_model_components(model_params: dict, ntypes: int) -> tuple:
     if fitting_net["type"] in ["dipole", "polar"]:
         fitting_net["embedding_width"] = descriptor.get_dim_emb()
     fitting_net["dim_descrpt"] = descriptor.get_dim_out()
+    if fitting_net["type"] == "density_basis":
+        # the radial expansion shares the descriptor cutoff, which also
+        # builds the grid neighbor list
+        fitting_net["rcut"] = descriptor.get_rcut()
+        if fitting_net.get("use_equivariant", False):
+            # the equivariant density coefficients are projected from the
+            # descriptor's SO(3) latent; only dpa4-family descriptors
+            # expose one
+            latent_lmax = getattr(descriptor, "node_readout_lmax", None)
+            if latent_lmax is None or not hasattr(descriptor, "forward_with_edges"):
+                raise ValueError(
+                    "density_basis with use_equivariant=True requires a "
+                    "descriptor exposing its SO(3) latent via "
+                    "forward_with_edges (e.g. dpa4), but got "
+                    f"{type(descriptor).__name__}"
+                )
+            fitting_net["latent_lmax"] = latent_lmax
+            fitting_net["latent_channels"] = descriptor.get_dim_out()
     grad_force = "direct" not in fitting_net["type"]
     if not grad_force:
         fitting_net["out_dim"] = descriptor.get_dim_emb()
@@ -432,6 +453,8 @@ def get_standard_model(model_params: dict) -> BaseModel:
         modelcls = EnergyModel
     elif fitting_net_type == "density":
         modelcls = GridDensityModel
+    elif fitting_net_type == "density_basis":
+        modelcls = DensityBasisModel
     elif fitting_net_type == "property":
         modelcls = PropertyModel
     elif fitting_net_type == "population":
@@ -780,6 +803,7 @@ __all__ = [
     "DOSModel",
     "DPModelCommon",
     "DPZBLModel",
+    "DensityBasisModel",
     "DipoleModel",
     "EnergyModel",
     "FrozenModel",

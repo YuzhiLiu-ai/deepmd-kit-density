@@ -199,6 +199,8 @@ def get_trainer(
                 model_params_single["type_map"],
                 training_dataset_params["batch_size"],
                 auto_prob_style=auto_prob,
+                grid_sample_size=config["training"].get("grid_sample_size"),
+                grid_sample_seed=(data_seed or 0) + rank,
             )
             if (
                 validation_systems is not None
@@ -209,6 +211,9 @@ def get_trainer(
                     validation_systems,
                     model_params_single["type_map"],
                     validation_dataset_params["batch_size"],
+                    grid_sample_size=config["training"].get("grid_sample_size"),
+                    grid_sample_seed=(data_seed or 0) + rank,
+                    grid_sample_resample=False,
                 )
             elif validation_systems is not None:
                 validation_data_single = _make_dp_loader_set(

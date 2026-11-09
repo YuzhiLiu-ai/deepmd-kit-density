@@ -316,10 +316,13 @@ class TestDPTestDensitySeZM(unittest.TestCase):
             detail_file=detail_file,
             atomic=False,
         )
-        # one detail file per frame, each holding ngrid [label, pred] pairs
+        # one detail file per frame, each holding 1/10 [label, pred] pairs
+        nsample = max(1, int(np.ceil(self.ngrid * 0.1)))
         for frame in range(self.nframes):
-            detail = np.loadtxt(f"{detail_file}.density.out.{frame}", skiprows=1)
-            self.assertEqual(detail.shape, (self.ngrid, 2))
+            detail = np.atleast_2d(
+                np.loadtxt(f"{detail_file}.density.out.{frame}", skiprows=1)
+            )
+            self.assertEqual(detail.shape, (nsample, 2))
 
 
 if __name__ == "__main__":

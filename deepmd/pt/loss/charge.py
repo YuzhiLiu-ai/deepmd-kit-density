@@ -29,6 +29,9 @@ class GridDensityLoss(TaskLoss):
         start_pref_d: float = 0.0,
         limit_pref_d: float = 0.0,
         inference: bool = False,
+        transform: str = "none",
+        asinh_scale: float = 1.0,
+        mae_weight: float = 0.0,
         **kwargs: Any,
     ) -> None:
         r"""Construct a layer to compute loss on grid density.
@@ -47,6 +50,25 @@ class GridDensityLoss(TaskLoss):
             The prefactor of charge density loss at the end of the training.
         inference : bool
             If true, it will output all losses found in output, ignoring the pre-factors.
+        transform : str
+            Space in which the optimized squared error is computed:
+            ``"none"`` (default) keeps the raw density; ``"asinh"`` applies
+            ``asinh(rho / asinh_scale)`` to both prediction and label before
+            differencing. The asinh transform behaves linearly for small
+            densities and logarithmically for large ones, so the gradient
+            contribution of high-density (core) regions is damped like
+            ``1/rho`` and low-density (valence/tail) regions are trained on
+            an equal footing, i.e. the *shape* of the density is optimized
+            instead of its absolute magnitude only.
+        asinh_scale : float
+            Characteristic density scale ``s`` of the asinh transform, in the
+            same units as the density label. Values ``rho >> s`` are in the
+            logarithmic regime; values ``rho << s`` are unaffected. A good
+            default is a typical valence density of the dataset.
+        mae_weight : float
+            Weight of an additional raw-space MAE term anchoring the
+            absolute density scale: ``loss = pref_d * (MSE_transform +
+            mae_weight * MAE_raw)``. Zero (default) disables the anchor.
         **kwargs
             Other keyword arguments.
         """
@@ -57,6 +79,15 @@ class GridDensityLoss(TaskLoss):
         self.start_pref_d = start_pref_d
         self.limit_pref_d = limit_pref_d
         self.inference = inference
+        self.transform = str(transform).lower()
+        if self.transform not in ("none", "asinh"):
+            raise ValueError(f"transform must be 'none' or 'asinh', got {transform!r}")
+        self.asinh_scale = float(asinh_scale)
+        if self.asinh_scale <= 0.0:
+            raise ValueError(f"asinh_scale must be positive, got {asinh_scale}")
+        self.mae_weight = float(mae_weight)
+        if self.mae_weight < 0.0:
+            raise ValueError(f"mae_weight must be non-negative, got {mae_weight}")
 
     def forward(
         self,
@@ -117,18 +148,31 @@ class GridDensityLoss(TaskLoss):
             else:
                 mask_f = mask.reshape(density_pred.shape[:2]).to(density_pred.dtype)
             mask_sum = mask_f.sum(dim=-1).clamp(min=1.0)
-            residual = (
-                density_label.reshape(nframes, -1) - density_pred.reshape(nframes, -1)
-            ) * mask_f
+            label_f = density_label.reshape(nframes, -1)
+            pred_f = density_pred.reshape(nframes, -1)
+            residual = (label_f - pred_f) * mask_f
             l2_density_loss = torch.square(residual).sum(dim=-1).div(mask_sum).mean()
             rmse_d = l2_density_loss.sqrt()
             more_loss["rmse_d"] = self.display_if_exist(rmse_d.detach(), find_density)
             l1_density_loss = residual.abs().sum(dim=-1).div(mask_sum).mean()
             mae_d = l1_density_loss
-            # minimise the squared error, consistent with every other loss
-            # in the package; the absolute error is only for display
-            loss += (pref_d * l2_density_loss).to(GLOBAL_PT_FLOAT_PRECISION)
             more_loss["mae_d"] = self.display_if_exist(mae_d.detach(), find_density)
+            # the optimized squared error may live in a transformed space;
+            # the displayed rmse_d / mae_d above always stay in raw space so
+            # the learning curve remains comparable with dp test
+            if self.transform == "asinh":
+                residual_eff = (
+                    torch.asinh(label_f / self.asinh_scale)
+                    - torch.asinh(pred_f / self.asinh_scale)
+                ) * mask_f
+                l2_opt = torch.square(residual_eff).sum(dim=-1).div(mask_sum).mean()
+            else:
+                l2_opt = l2_density_loss
+            # minimise the (optionally transformed) squared error, with an
+            # optional raw-space MAE anchor for the absolute density scale
+            loss += (pref_d * (l2_opt + self.mae_weight * l1_density_loss)).to(
+                GLOBAL_PT_FLOAT_PRECISION
+            )
         elif not self.inference and "density" in model_pred:
             # the density term is disabled (zero prefactors), but the graph
             # must stay connected so that backward() does not fail
@@ -161,6 +205,9 @@ class GridDensityLoss(TaskLoss):
             "starter_learning_rate": self.starter_learning_rate,
             "start_pref_d": self.start_pref_d,
             "limit_pref_d": self.limit_pref_d,
+            "transform": self.transform,
+            "asinh_scale": self.asinh_scale,
+            "mae_weight": self.mae_weight,
         }
 
     @classmethod

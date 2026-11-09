@@ -77,7 +77,13 @@ __all__ = [
 ]
 
 
-def build_tester(dp: Any, *, atomic: bool) -> ModelTester:
+def build_tester(
+    dp: Any,
+    *,
+    atomic: bool,
+    grid_sample_ratio: float = 0.1,
+    rand_seed: int | None = None,
+) -> ModelTester:
     """Return the tester of the model class under test.
 
     Parameters
@@ -104,7 +110,12 @@ def build_tester(dp: Any, *, atomic: bool) -> ModelTester:
     if isinstance(dp, DeepDOS):
         return DosTester(dp, atomic=atomic)
     if isinstance(dp, DeepDensity):
-        return DensityTester(dp, atomic=atomic)
+        return DensityTester(
+            dp,
+            atomic=atomic,
+            grid_sample_ratio=grid_sample_ratio,
+            rand_seed=rand_seed,
+        )
     if isinstance(dp, DeepProperty):
         return PropertyTester(dp, atomic=atomic)
     if isinstance(dp, DeepGlobalPolar):

@@ -695,6 +695,8 @@ class LmdbDecodeConfig:
     type_remap: np.ndarray | None
     data_requirements: dict[str, Any]
     dataset: str = "<unknown LMDB>"
+    grid_sample_size: int | None = None
+    grid_sample_seed: int = 0
 
 
 def _requirement_dtype(requirement: Any) -> np.dtype:
@@ -1220,6 +1222,27 @@ def _promote_batch_field(
     return promoted
 
 
+def _sample_lmdb_grid(
+    frame: dict[str, Any],
+    config: LmdbDecodeConfig,
+    original_key: int,
+) -> None:
+    """Sample grid coordinates and labels before frames are stacked."""
+    sample_size = config.grid_sample_size
+    if sample_size is None or frame.get("grid") is None:
+        return
+    grid = np.asarray(frame["grid"])
+    ngrid = grid.shape[0]
+    if ngrid <= sample_size:
+        return
+    rng = np.random.default_rng(config.grid_sample_seed + original_key)
+    indices = np.sort(rng.choice(ngrid, sample_size, replace=False))
+    frame["grid"] = grid[indices]
+    density = frame.get("density")
+    if density is not None and np.asarray(density).shape[0] == ngrid:
+        frame["density"] = np.asarray(density)[indices]
+
+
 def decode_lmdb_batch(
     transaction: lmdb.Transaction,
     original_keys: Sequence[int],
@@ -1290,6 +1313,7 @@ def decode_lmdb_batch(
             config,
             copy_arrays=False,
         )
+        _sample_lmdb_grid(frame, config, int(original_key))
         frame_nloc = frame["coord"].shape[0]
         if layout is None:
             layout = BatchLayout.over(
@@ -1738,7 +1762,7 @@ class LmdbBatchIterator:
             stop = start + base_size + int(worker_index < remainder)
             chunks.append((original_keys[start:stop], layout.chunk(start, stop)))
             start = stop
-        decode_config = self._reader.worker_decode_config()
+        decode_config = self._reader.next_grid_decode_config()
         return [
             self._pool.executor.submit(
                 _decode_lmdb_worker_chunk,
@@ -2006,6 +2030,7 @@ class LmdbDataReader:
         # independent process-local environments and transactions.
         self._txn = self._env.begin()
         self._closed = False
+        self._grid_decode_counter = 0
 
         # Per-frame atom counts drive every batching rule: same-nloc grouping,
         # the ``filter:N`` drop, and the atom-axis layout of a ``mix:N`` batch.
@@ -2392,7 +2417,7 @@ class LmdbDataReader:
             self._transaction(),
             self.original_keys(indices),
             self._frame_fmt,
-            self._decode_config,
+            self.next_grid_decode_config(),
             self.batch_layout(indices, ragged=ragged),
         )
 
@@ -2416,6 +2441,28 @@ class LmdbDataReader:
         """Freeze and return decoder state for worker serialization."""
         self._data_requirements_frozen = True
         return self._decode_config
+
+    def set_grid_sampling(
+        self, sample_size: int | None, seed: int = 0, resample: bool = True
+    ) -> None:
+        """Enable grid sampling during batch decode, before frames are stacked."""
+        if sample_size is not None and sample_size <= 0:
+            raise ValueError("grid_sample_size must be greater than 0")
+        self._decode_config.grid_sample_size = sample_size
+        self._decode_config.grid_sample_seed = seed
+        self._grid_resample = resample
+        self._grid_decode_counter = 0
+
+    def next_grid_decode_config(self) -> LmdbDecodeConfig:
+        """Return decoder state with a fresh deterministic grid-sample seed."""
+        self._data_requirements_frozen = True
+        if self._decode_config.grid_sample_size is None:
+            return self._decode_config
+        config = dataclasses.replace(self._decode_config)
+        if self._grid_resample:
+            config.grid_sample_seed += self._grid_decode_counter
+            self._grid_decode_counter += 1
+        return config
 
     @property
     def closed(self) -> bool:

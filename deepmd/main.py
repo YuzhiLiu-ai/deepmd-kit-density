@@ -447,6 +447,13 @@ def main_parser() -> argparse.ArgumentParser:
         "--shuffle-test", action="store_true", default=False, help="Shuffle test data"
     )
     parser_tst.add_argument(
+        "--grid-sample-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of grid points sampled per frame in density tests. "
+        "Set to 1.0 for full-grid evaluation.",
+    )
+    parser_tst.add_argument(
         "-d",
         "--detail-file",
         type=str,

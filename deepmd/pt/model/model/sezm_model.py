@@ -2899,7 +2899,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                     "fparam is required because fitting net dim_fparam > 0"
                 )
             fp = default_fparam.to(device=device, dtype=dtype).view(1, dim_fparam)
-            fp = fp.expand(nf, -1)
+            fp = fp.expand(nf, -1).contiguous()
         else:
             if fp.numel() != nf * dim_fparam:
                 raise ValueError(
@@ -2972,7 +2972,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             raise ValueError("charge_spin must have shape (nf, 2)")
 
         if charge_spin.shape[0] == 1 and nf != 1:
-            charge_spin = charge_spin.expand(nf, -1)
+            charge_spin = charge_spin.expand(nf, -1).contiguous()
         elif charge_spin.shape[0] != nf:
             raise ValueError("charge_spin first dimension must match nframes")
         return charge_spin
