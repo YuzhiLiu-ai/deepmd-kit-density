@@ -468,5 +468,42 @@ class DescrptDPA4(DescrptDPA4DP):
         model_prob: float = 1.0,
         resume: bool = False,
     ) -> None:
-        # Multi-task parameter sharing for DPA4 is out of scope for this PR.
-        raise NotImplementedError("share_params is not yet implemented for DescrptDPA4")
+        """Share descriptor parameters with ``base_class`` for multitask training.
+
+        The backend-neutral rebinding in the dpmodel base registers the shared
+        submodules/parameters in this module's tables, producing correct PyTorch
+        sharing. Branch-local state -- the ``graph_lower_disabled`` /
+        ``version_tensor`` routing buffers, the ``emask`` pair-exclusion mask and
+        the ``contact_radius`` table -- is deliberately left untouched so each
+        branch keeps its own routing decision and exclusion mask.
+
+        Parameters
+        ----------
+        base_class
+            DPA4 descriptor that owns the shared parameters.
+        shared_level
+            Sharing level (0 shares every learnable submodule, 1 only the type
+            and condition embeddings).
+        model_prob
+            Model sampling probability accepted by the common ABI; unused.
+        resume
+            Checkpoint-restoration flag accepted by the common ABI; unused.
+
+        Raises
+        ------
+        RuntimeError
+            If either descriptor is a compressed inference snapshot.
+        """
+        del model_prob, resume
+        if bool(getattr(self, "compress", False)) or bool(
+            getattr(base_class, "compress", False)
+        ):
+            raise RuntimeError(
+                "Compressed DPA4 snapshots cannot participate in parameter sharing."
+            )
+        super().share_params(base_class, shared_level)
+        # The inference kernels captured the pre-sharing ``edge_envelope`` and
+        # ``radial_basis`` at construction; drop them so they rebuild against the
+        # shared submodules if this branch is ever used for inference.
+        self._cuda_radial_fn = None
+        self._cuda_wigner_fn = None

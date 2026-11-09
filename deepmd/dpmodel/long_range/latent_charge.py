@@ -396,6 +396,69 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
     def set_case_embd(self, case_idx: int) -> None:
         self.charge_net.set_case_embd(case_idx)
 
+    def share_params(
+        self,
+        base_class: "LatentChargeLongRange",
+        shared_level: int,
+        model_prob: float = 1.0,
+        protection: float = 1e-2,
+        resume: bool = False,
+    ) -> None:
+        """Share the charge/dipole head and kernel with ``base_class``.
+
+        The learnable state of a long-range plugin is the readout head
+        (``charge_net`` -- for a multipole also carrying the dipole projection,
+        the recurrent polar-update net and the self-polarization strength) and
+        the interaction ``kernel``. Rebinding them registers the shared modules
+        in this plugin's tables, which produces correct PyTorch parameter
+        sharing. Branch-local runtime state -- the neighbor topologies, the PME
+        mesh and the charge-constraint configuration -- is deliberately left
+        untouched so each branch keeps its own graph-derived topology.
+
+        Parameters
+        ----------
+        base_class
+            The plugin that owns the shared parameters.
+        shared_level
+            Sharing level. Only level ``0`` (share head and kernel) is supported.
+        model_prob, protection, resume
+            Accepted by the common multitask ABI; unused.
+
+        Raises
+        ------
+        TypeError
+            If ``base_class`` is not the same plugin class.
+        ValueError
+            If the structural configuration differs between the replicas.
+        NotImplementedError
+            If ``shared_level`` is not ``0``.
+        """
+        del model_prob, protection, resume
+        if self.__class__ is not base_class.__class__:
+            raise TypeError(
+                "Only identical long-range plugins can share parameters, got "
+                f"{type(base_class).__name__}."
+            )
+        if shared_level != 0:
+            raise NotImplementedError(
+                f"Long-range plugins support only shared_level=0, got {shared_level}."
+            )
+        # Defensive structural agreement check; two branches built from the same
+        # ``shared_dict`` entry are identical by construction.
+        for attr in ("periodic", "self_interaction", "k_grid_mode"):
+            if getattr(self, attr, None) != getattr(base_class, attr, None):
+                raise ValueError(
+                    "Long-range parameter sharing requires identical "
+                    f"`{attr}`, got {getattr(self, attr, None)!r} vs "
+                    f"{getattr(base_class, attr, None)!r}."
+                )
+        if type(self.kernel) is not type(base_class.kernel):
+            raise ValueError(
+                "Long-range parameter sharing requires the same kernel type."
+            )
+        self.charge_net = base_class.charge_net
+        self.kernel = base_class.kernel
+
     def serialize(self) -> dict:
         data = {
             "@class": "LongRange",

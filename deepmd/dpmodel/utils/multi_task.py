@@ -74,7 +74,7 @@ def preprocess_shared_params(
     if cascade_defaults:
         cascade_top_level_defaults(model_config)
 
-    supported_types = ["type_map", "descriptor", "fitting_net"]
+    supported_types = ["type_map", "descriptor", "fitting_net", "long_range"]
     shared_dict = model_config.get("shared_dict", {})
     shared_links: dict[str, Any] = {}
     type_map_keys: list[str] = []

@@ -2643,7 +2643,75 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
         NotImplementedError
             If ``shared_level`` is not ``0`` or ``1``.
         """
-        raise NotImplementedError("share_params is not yet implemented for DescrptDPA4")
+        if self.__class__ is not base_class.__class__:
+            raise TypeError(
+                "Only DescrptDPA4 descriptors can share parameters, got "
+                f"{type(base_class).__name__}."
+            )
+        # Defensive structural agreement check. Two branches built from the same
+        # ``shared_dict`` entry are identical by construction; this guards the
+        # rarer hand-built case where a config drifted.
+        for attr in (
+            "ntypes",
+            "rcut",
+            "channels",
+            "lmax",
+            "mmax",
+            "n_radial",
+            "n_blocks",
+            "mixing_layers",
+            "radial_so2_rank",
+            "use_env_seed",
+            "add_chg_spin_ebd",
+        ):
+            if getattr(self, attr, None) != getattr(base_class, attr, None):
+                raise ValueError(
+                    "DPA4 parameter sharing requires identical structural "
+                    f"parameters, but `{attr}` differs: "
+                    f"{getattr(self, attr, None)!r} vs "
+                    f"{getattr(base_class, attr, None)!r}."
+                )
+        if len(self.blocks) != len(base_class.blocks):
+            raise ValueError("DPA4 parameter sharing requires the same block count.")
+
+        if shared_level == 0:
+            # Every learnable submodule (Optional ones are None on both replicas,
+            # so a plain rebinding is correct) plus the FiLM strength parameters.
+            names = (
+                "type_embedding",
+                "charge_spin_embedding",
+                "spin_embedding",
+                "env_seed_embedding",
+                "film_scale_norm",
+                "film_shift_norm",
+                "film_scale_strength_log",
+                "film_shift_strength_log",
+                "radial_basis",
+                "radial_embedding",
+                "edge_envelope",
+                "wigner_calc",
+                "gie",
+                "gie_zonal_wigner_calc",
+                "blocks",
+                "final_full_attn_res",
+                "final_block_attn_res",
+                "readout_pre_layers",
+                "output_ffn",
+            )
+            for name in names:
+                setattr(self, name, getattr(base_class, name))
+            # Input statistics follow the base branch (the larger reference set).
+            self.mean = base_class.mean
+            self.stddev = base_class.stddev
+        elif shared_level == 1:
+            # Only the type embedding and the optional condition embeddings.
+            self.type_embedding = base_class.type_embedding
+            self.charge_spin_embedding = base_class.charge_spin_embedding
+            self.spin_embedding = base_class.spin_embedding
+        else:
+            raise NotImplementedError(
+                f"DPA4 parameter sharing supports shared_level 0 or 1, got {shared_level}."
+            )
 
     def enable_compression(
         self,

@@ -12,6 +12,9 @@ from deepmd.pt_expt.descriptor.base_descriptor import (
 from deepmd.pt_expt.fitting import (
     BaseFitting,
 )
+from deepmd.pt_expt.long_range import (
+    BaseLongRange,
+)
 
 
 def preprocess_shared_params(
@@ -44,5 +47,7 @@ def get_class_name(item_key: str, item_params: dict[str, Any]) -> type:
         return BaseDescriptor.get_class_by_type(item_params.get("type", "se_e2_a"))
     elif item_key == "fitting_net":
         return BaseFitting.get_class_by_type(item_params.get("type", "ener"))
+    elif item_key == "long_range":
+        return BaseLongRange.get_class_by_type(item_params["type"])
     else:
         raise RuntimeError(f"Unknown class_name type {item_key}")
