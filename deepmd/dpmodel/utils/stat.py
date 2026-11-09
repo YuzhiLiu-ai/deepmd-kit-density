@@ -287,8 +287,11 @@ def compute_output_stats(
         ]
         keys = new_keys
 
-        # compute model predictions if model_forward is provided
-        if model_forward is not None:
+        # compute model predictions if model_forward is provided and there are
+        # outputs to fit; when every key needing bias is covered by
+        # preset_out_bias (or latent outputs have no data labels), skip the
+        # model forward entirely to avoid a wasted (and possibly OOM) pass
+        if model_forward is not None and keys:
             model_pred = _compute_model_predict(sampled, keys, model_forward)
         else:
             model_pred = None
