@@ -407,7 +407,11 @@ class EnergyLoss(Loss):
                 self.limit_pref_h + (self.start_pref_h - self.limit_pref_h) * lr_ratio
             )
 
-        loss = 0
+        # Initialize as a zero tensor (not the int ``0``) so that a fully
+        # disabled objective -- e.g. an ``ener_latent`` branch that supervises
+        # only latent charge/dipole with every energy/force/virial prefactor at
+        # zero -- still yields a tensor for the closing ``xp.sqrt(loss)``.
+        loss = xp.zeros((), dtype=energy.dtype, device=array_api_compat.device(energy))
         more_loss = {}
         # Normalization exponent controls loss scaling with system size:
         # - norm_exp=2 (intensive_ener_virial=True): loss uses 1/N² scaling, making it independent of system size
