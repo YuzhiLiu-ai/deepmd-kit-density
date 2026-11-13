@@ -637,6 +637,7 @@ class DPAtomicModel(BaseAtomicModel):
         aparam: Array | None = None,
         charge_spin: Array | None = None,
         spin: Array | None = None,
+        efield: Array | None = None,
         comm_dict: dict | None = None,
         topologies: dict[str, Any] | None = None,
         node_mask: Array | None = None,
@@ -816,6 +817,7 @@ class DPAtomicModel(BaseAtomicModel):
                 fparam=fparam,
                 aparam=aparam_node,
                 charge_spin=charge_spin_frame,
+                efield=efield,
                 **context_kwargs,
             )
             ret["energy"] = ret["energy"] + long_range_ret["energy"]

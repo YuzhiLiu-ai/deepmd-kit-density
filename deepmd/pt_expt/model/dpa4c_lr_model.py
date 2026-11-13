@@ -433,8 +433,14 @@ class DPA4CLREnergyModel(EnergyModel):
         neighbor_list: Any | None = None,
         neighbor_graph_method: str | None = None,
         spin: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Reject periodic cells; both LR kernels are non-periodic."""
+        if efield is not None:
+            raise ValueError(
+                "the external electric field (`efield`) is only supported by the "
+                "non-periodic latent-multipole long-range plugin, not this model"
+            )
         if box is not None:
             xp = array_api_compat.array_namespace(box)
             if bool(xp.any(box != 0)):
@@ -879,6 +885,7 @@ class DPA4CLREnergyModel(EnergyModel):
         do_atomic_virial: bool = False,
         spin: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Carry-all graph forward with the LR correction.
 
@@ -886,6 +893,11 @@ class DPA4CLREnergyModel(EnergyModel):
         all-pairs graph eagerly and passes it into
         :meth:`forward_common_lower_graph`.
         """
+        if efield is not None:
+            raise ValueError(
+                "the external electric field (`efield`) is only supported by the "
+                "non-periodic latent-multipole long-range plugin, not this model"
+            )
         if not (self.mixed_types() and self.atomic_model.uses_graph_lower()):
             raise NotImplementedError(
                 "neighbor_graph_method requires a mixed_types descriptor with a "

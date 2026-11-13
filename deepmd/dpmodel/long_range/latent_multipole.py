@@ -49,6 +49,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         kernel: BaseInteractionKernel,
         charge_constraint: dict | None = None,
         use_self_pol: bool = True,
+        efield: bool = False,
         periodic: bool = False,
         kspace_tolerance: float = 1e-8,
         k_grid_mode: str = "kgrid",
@@ -56,6 +57,13 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         pme_mesh: list[int] | tuple[int, int, int] | None = None,
         pme_mesh_spacing: float | None = None,
     ) -> None:
+        if efield and int(getattr(charge_net, "lr_update_steps", 0)) <= 0:
+            raise ValueError(
+                "the external electric field (`efield`) requires the latent "
+                "electrostatic feedback (LEF), i.e. `lr_update_steps > 0`; got "
+                f"lr_update_steps={getattr(charge_net, 'lr_update_steps', 0)}. "
+                "Set a positive `lr_update_steps` to use an external field."
+            )
         super().__init__(
             charge_net,
             kernel,
@@ -68,6 +76,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             pme_mesh_spacing=pme_mesh_spacing,
         )
         self.use_self_pol = bool(use_self_pol)
+        self.efield = bool(efield)
 
     @property
     def multipole_net(self) -> LatentMultipoleFitting:
@@ -161,6 +170,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             kernel_cls(**kernel_config),
             config.get("charge_constraint"),
             bool(config.get("use_self_pol", True)),
+            efield=bool(config.get("efield", False)),
             periodic=bool(config.get("periodic", False)),
             kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
             k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
@@ -178,6 +188,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         fparam: Array | None = None,
         aparam: Array | None = None,
         charge_spin: Array | None = None,
+        efield: Array | None = None,
         descriptor_context: dict[str, Array] | None = None,
     ) -> dict[str, Array]:
         xp = array_api_compat.array_namespace(descriptor)
@@ -198,6 +209,15 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             k_grid = topologies.get(K_GRID)
         frame_id = frame_id_from_n_node(n_node, n_total=n)
         fparam_node = None if fparam is None else xp.take(fparam, frame_id, axis=0)
+        # Uniform external field, gathered to the node axis. Active only when
+        # the plugin was built with `efield=True` (which the constructor gates
+        # on LEF, `lr_update_steps > 0`); otherwise the argument is ignored so
+        # field-free models/checkpoints are untouched. Translation invariant:
+        # it shifts the field each atom responds to, never the geometry (which
+        # enters only through the relative pair vectors).
+        efield_node = None
+        if self.efield and efield is not None:
+            efield_node = xp.take(efield, frame_id, axis=0)
         initial = self.charge_net.call_graph(
             descriptor,
             atype,
@@ -277,6 +297,11 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     )
                     potential = potential + phi_m
                     field = field - force_m
+                if efield_node is not None:
+                    # External field enters the latent electrostatic feedback:
+                    # the update sees the total field (system + applied), so
+                    # the dipoles/charges polarize self-consistently.
+                    field = field + xp.astype(efield_node, field.dtype)
                 if sezm_fukui:
                     q, p, fukui = self.charge_net.update_polar_state(
                         update_descriptor,
@@ -329,6 +354,18 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 self_pol, frame_id, n_node.shape[0]
             )
         frame_energy = frame_energy * COULOMB_CONSTANT
+        if efield_node is not None:
+            # Dipole-field interaction energy -E . (sum_i p_i). The charge-field
+            # potential -E . (sum_i q_i r_i) is omitted: it is not translation
+            # invariant and the model carries no absolute coordinates (geometry
+            # enters only through relative pair vectors). Its gradient, the
+            # uniform per-atom force q_i E, is added directly by the wrapper.
+            mu_frame = segment_sum(
+                xp.astype(p, frame_energy.dtype), frame_id, n_node.shape[0]
+            )
+            frame_energy = frame_energy - xp.sum(
+                xp.astype(efield, frame_energy.dtype) * mu_frame, axis=-1
+            )
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
@@ -339,11 +376,20 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             energy = energy + mesh_multipole_energy(
                 q, p, mesh, frame_id, self.kernel, self.pme_order
             )
-        return {
+        ret = {
             "energy": xp.reshape(energy, (n, 1)),
             "latent_charge": q,
             "latent_dipole": p,
         }
+        if efield_node is not None:
+            # Uniform field force q_i E on each real atom (translation
+            # invariant). Returned as a side output for the model wrapper to
+            # ADD to the autograd force; not a fitting output, so the wrapper
+            # pops it before the output reduction.
+            ret["efield_force"] = (
+                xp.astype(q, efield_node.dtype) * efield_node * node_mask[:, None]
+            )
+        return ret
 
     def _constrain_fukui(
         self,
@@ -430,6 +476,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "charge_constraint": self.charge_constraint,
             "use_self_pol": self.use_self_pol,
         }
+        if self.efield:
+            data["efield"] = True
         if self.periodic:
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
@@ -450,6 +498,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             BaseInteractionKernel.deserialize(data["kernel"]),
             data["charge_constraint"],
             data["use_self_pol"],
+            efield=bool(data.get("efield", False)),
             periodic=periodic,
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),
             # A periodic record that names no mode predates the mesh and

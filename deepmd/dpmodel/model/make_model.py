@@ -313,6 +313,7 @@ def make_model(
             neighbor_list: NeighborList | None = None,
             neighbor_graph_method: str | None = None,
             spin: Array | None = None,
+            efield: Array | None = None,
         ) -> dict[str, Array]:
             """Return model prediction.
 
@@ -440,6 +441,7 @@ def make_model(
                     do_atomic_virial,
                     spin=sp,
                     charge_spin=cs,
+                    efield=efield,
                 )
             else:
                 # legacy dense-nlist path (builds the extended quartet)

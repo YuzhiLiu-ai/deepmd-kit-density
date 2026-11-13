@@ -4125,6 +4125,18 @@ def long_range_latent_multipole() -> list[Argument]:
             "alpha_pol", [float, list[float], type(None)], optional=True, default=None
         ),
         Argument("use_self_pol", bool, optional=True, default=True),
+        Argument(
+            "efield",
+            bool,
+            optional=True,
+            default=False,
+            doc="Enable an external uniform electric field `efield` (a per-frame "
+            "(nf, 3) input, in eV/(e.Angstrom)) that enters the latent "
+            "electrostatic feedback (LEF) and the dipole-field energy, giving a "
+            "self-consistent polarization response. Requires the LEF, i.e. "
+            "`lr_update_steps > 0`; any other configuration raises. The "
+            "charge-field force q_i E is added directly to the atomic force.",
+        ),
         Argument("lr_update_steps", int, optional=True, default=0),
         Argument(
             "lr_update_neuron", [list[int], type(None)], optional=True, default=None

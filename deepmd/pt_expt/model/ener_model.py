@@ -346,6 +346,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         charge_spin: torch.Tensor | None = None,
         neighbor_list: NeighborList | None = None,
         neighbor_graph_method: str | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Evaluate the energy model.
 
@@ -390,6 +391,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             do_atomic_virial=do_atomic_virial,
             neighbor_list=neighbor_list,
             neighbor_graph_method=neighbor_graph_method,
+            efield=efield,
         )
         return self._translate_eager_call(
             model_ret,

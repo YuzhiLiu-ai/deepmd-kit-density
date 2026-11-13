@@ -625,6 +625,7 @@ def make_model(
             aparam: torch.Tensor | None = None,
             charge_spin: torch.Tensor | None = None,
             spin: torch.Tensor | None = None,
+            efield: torch.Tensor | None = None,
             comm_dict: dict | None = None,
             topologies: dict[str, Any] | None = None,
         ) -> dict[str, torch.Tensor]:
@@ -763,7 +764,10 @@ def make_model(
             # The fused pipeline emits the magnetic force as a value for a
             # descriptor that declares native spin, and returns nothing when it
             # cannot serve the request at all.
-            if not self.training and fused_energy_force_enabled():
+            # An external field adds a non-autograd force correction (q_i E) in
+            # the autograd lower below, which the fused custom-op pipeline does
+            # not assemble -- so a field request bypasses the fused path.
+            if not self.training and efield is None and fused_energy_force_enabled():
                 fused = _fused_energy_force_graph(
                     self, graph, atype, do_atomic_virial, spin
                 )
@@ -776,12 +780,17 @@ def make_model(
                 aparam=aparam,
                 charge_spin=charge_spin,
                 spin=spin,
+                efield=efield,
                 comm_dict=comm_dict,
                 topologies=topologies,
             )
+            # Uniform-field force q_i E rides as a side output (not a fitting
+            # output): keep it out of the output reduction and add it to the
+            # autograd-assembled force below.
+            efield_force = atomic_ret.pop("efield_force", None)
             # ``forward_common_atomic_graph`` returns flat ``(N, *)`` output.
             # Pass directly to the flat-N transform; no rectangular reshape needed.
-            return fit_output_to_model_output_graph(
+            model_predict = fit_output_to_model_output_graph(
                 atomic_ret,
                 self.atomic_output_def(),
                 graph,
@@ -801,6 +810,12 @@ def make_model(
                 n_local=n_local,
                 topologies=topologies,
             )
+            if efield_force is not None and "energy_derv_r" in model_predict:
+                force = model_predict["energy_derv_r"]
+                model_predict["energy_derv_r"] = force + efield_force.reshape(
+                    force.shape
+                )
+            return model_predict
 
         def _resolve_graph_method(
             self, neighbor_graph_method: str | None
@@ -973,6 +988,7 @@ def make_model(
             do_atomic_virial: bool = False,
             spin: torch.Tensor | None = None,
             charge_spin: torch.Tensor | None = None,
+            efield: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             """Carry-all graph forward with autograd force/virial (pt_expt override).
 
@@ -1083,6 +1099,7 @@ def make_model(
                 aparam=ap_flat,
                 spin=spin_flat,
                 charge_spin=charge_spin,
+                efield=efield,
                 topologies=topologies,
             )
             # ``forward_common_lower_graph`` returns flat ``(N, *)`` per-atom
