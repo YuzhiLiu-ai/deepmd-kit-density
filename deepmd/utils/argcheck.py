@@ -4137,8 +4137,10 @@ def long_range_latent_multipole() -> list[Argument]:
             "compile/export-friendly transport, since fparam is part of the "
             "traced ABI -- or from the explicit per-frame (nf, 3) `efield` "
             "model input, which overrides fparam. Requires the LEF, i.e. "
-            "`lr_update_steps > 0`; any other configuration raises. Cannot be "
-            "combined with `charge_constraint.source = 'fparam'`. The "
+            "`lr_update_steps > 0`; any other configuration raises. With "
+            "`charge_constraint.source = 'fparam'`, the total-charge target "
+            "must sit outside the field slice (`fparam_index >= 3`, e.g. "
+            "numb_fparam=4 with fparam = [Ex, Ey, Ez, Q]). The "
             "charge-field force q_i E is added directly to the atomic force.",
         ),
         Argument("lr_update_steps", int, optional=True, default=0),

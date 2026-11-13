@@ -65,12 +65,15 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 "Set a positive `lr_update_steps` to use an external field."
             )
         if efield and (charge_constraint or {}).get("source") == "fparam":
-            raise ValueError(
-                "the external electric field (`efield`) reads the field from "
-                "fparam[:, :3], which conflicts with "
-                "`charge_constraint.source='fparam'`; use 'neutral' or "
-                "'charge_spin' instead."
-            )
+            _cc_index = int((charge_constraint or {}).get("fparam_index", 0))
+            if _cc_index < 3:
+                raise ValueError(
+                    "the external electric field (`efield`) reads the field "
+                    "from fparam[:, :3], which overlaps the charge "
+                    f"constraint's fparam_index={_cc_index}; move the "
+                    "total-charge target to fparam_index >= 3 (and size "
+                    "numb_fparam accordingly)."
+                )
         super().__init__(
             charge_net,
             kernel,

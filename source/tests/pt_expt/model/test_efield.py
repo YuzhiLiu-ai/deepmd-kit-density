@@ -350,7 +350,8 @@ class TestEfieldFparamTransport:
         e_fp = m(coord, atype, charge_spin=cs, fparam=fp)["energy"]
         torch.testing.assert_close(e0, e_fp)
 
-    def test_fparam_charge_constraint_conflicts_with_efield(self) -> None:
+    def _combo_model(self, fparam_index: int, steps: int = 2):
+        """Efield + charge constraint from fparam (numb_fparam=4 layout)."""
         cfg = {
             "type_map": ["A", "B"],
             "descriptor": {
@@ -377,10 +378,38 @@ class TestEfieldFparamTransport:
                 "type": "latent_multipole",
                 "charge_net": {"neuron": [8, 8], "use_glu": False},
                 "kernel": {"type": "les", "alpha": 0.9},
-                "charge_constraint": {"source": "fparam", "fparam_index": 3},
-                "lr_update_steps": 2,
+                "charge_constraint": {
+                    "source": "fparam",
+                    "fparam_index": fparam_index,
+                },
+                "lr_update_steps": steps,
                 "efield": True,
             },
         }
-        with pytest.raises(ValueError, match="charge_constraint"):
-            get_model(cfg)
+        return get_model(cfg).to(env.DEVICE).eval()
+
+    def test_fparam_charge_constraint_overlap_rejected(self) -> None:
+        """fparam_index < 3 overlaps the field slice fparam[:3]."""
+        with pytest.raises(ValueError, match="fparam_index"):
+            self._combo_model(fparam_index=2)
+
+    def test_efield_and_fparam_charge_constraint_coexist(self) -> None:
+        """Fparam = [Ex, Ey, Ez, Q]: field from [:3], charge target from [3]."""
+        m = self._combo_model(fparam_index=3)
+        coord, atype, cs = _batch()
+        fp = torch.tensor(
+            [[0.0, 0.0, 0.5, 1.5], [0.0, 0.0, 0.5, -0.5]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        out = m(coord, atype, charge_spin=cs, fparam=fp)
+        # 1. The field in fparam[:3] is active: energy matches the explicit
+        #    kwarg evaluation with the same field.
+        out_kw = m(coord, atype, charge_spin=cs, fparam=fp, efield=fp[:, :3])
+        torch.testing.assert_close(out["energy"], out_kw["energy"])
+        out_nofield = m(coord, atype, charge_spin=cs, fparam=fp * 0.0)
+        assert not torch.allclose(out["energy"], out_nofield["energy"])
+        # 2. The charge constraint reads fparam[:, 3]: per-frame latent
+        #    charges sum to the target.
+        q_sum = out["latent_charge"].sum(dim=1).squeeze(-1)  # (nf,)
+        torch.testing.assert_close(q_sum, fp[:, 3], rtol=1e-8, atol=1e-8)
