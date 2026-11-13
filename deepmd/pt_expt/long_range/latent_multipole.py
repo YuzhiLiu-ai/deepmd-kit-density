@@ -14,7 +14,7 @@ from .kernel import LESKernel
 @BaseLongRange.register("latent_multipole")
 @torch_module
 class LatentMultipoleLongRange(LatentMultipoleLongRangeDP):
-    """Non-periodic direct latent-multipole interaction (pt_expt)."""
+    """Non-periodic direct latent-multipole interaction (pt_expt) with latent electrostatic feedback (LEF)."""
 
     charge_net: LatentMultipoleFitting
     kernel: LESKernel

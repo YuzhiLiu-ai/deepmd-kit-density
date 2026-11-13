@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Charge/dipole readout and recurrent updates owned by a long-range plugin."""
+"""Charge/dipole readout and the latent electrostatic feedback (LEF) recurrent updates owned by a long-range plugin."""
 
 from typing import (
     Any,
@@ -246,7 +246,10 @@ class LatentMultipoleFitting(LatentChargeFitting):
     ) -> tuple[Any, Any] | tuple[Any, Any, Any]:
         """Apply one normalized, gated and damped equivariant polar update.
 
-        In ``sezm`` mode the update net emits an additional Fukui log-weight
+        This is a single latent electrostatic feedback (LEF) step: the
+        electrostatic potential/field of the current latent state is fed back
+        through the update net to refine the charge and dipole.  In ``sezm``
+        mode the update net emits an additional Fukui log-weight
         channel between the charge update and the three equivariant gates;
         the Fukui weights are returned when ``return_fukui`` is set so the
         caller can redistribute the charge-constraint deficit with them.

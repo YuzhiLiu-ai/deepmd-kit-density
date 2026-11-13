@@ -37,8 +37,9 @@ from .reciprocal import (
 class LatentMultipoleLongRange(LatentChargeLongRange):
     """LES charge--charge, charge--dipole and dipole--dipole direct energy.
 
-    Unordered intra-frame pairs are counted once.  Recurrent updates and the
-    single self-polarization term use the final latent state, with no detached
+    Unordered intra-frame pairs are counted once.  The recurrent updates --
+    the latent electrostatic feedback (LEF) -- and the single
+    self-polarization term use the final latent state, with no detached
     tensors anywhere in the readout/update/energy path.
     """
 

@@ -3203,15 +3203,16 @@ def fitting_sog_energy() -> list[Argument]:
         "sum_i |p_i|^2 / (2 alpha_pol_i). Only used when lr_kernel='dipole'."
     )
     doc_lr_update_steps = (
-        "Number of shared non-self-consistent long-range field updates applied "
-        "to charge and dipole before evaluating the final energy. A positive "
-        "value currently requires lr_kernel='dipole'."
+        "Number of latent electrostatic feedback (LEF) iterations: shared "
+        "non-self-consistent long-range field updates applied to charge and "
+        "dipole before evaluating the final energy. A positive value currently "
+        "requires lr_kernel='dipole'."
     )
     doc_lr_update_neuron = (
-        "Hidden widths of the shared charge/dipole field-update network."
+        "Hidden widths of the shared charge/dipole LEF update network."
     )
     doc_lr_update_damping = (
-        "Residual damping factor for every charge/dipole field update."
+        "Residual damping factor for every charge/dipole LEF update."
     )
     return [
         # The short-range branch shares the dpa4_ener GLU fitting arguments.
