@@ -393,6 +393,56 @@ class TestEfieldFparamTransport:
         with pytest.raises(ValueError, match="fparam_index"):
             self._combo_model(fparam_index=2)
 
+    def test_efield_and_charge_spin_constraint_coexist(self) -> None:
+        """The production combo: field via fparam[:3], charge via charge_spin."""
+        cfg = {
+            "type_map": ["A", "B"],
+            "descriptor": {
+                "type": "dpa4",
+                "rcut": 3.0,
+                "sel": 20,
+                "channels": 8,
+                "lmax": 2,
+                "n_radial": 4,
+                "precision": "float64",
+                "seed": 17,
+                "add_chg_spin_ebd": True,
+                "default_chg_spin": [0.0, 1.0],
+                "use_env_seed": True,
+            },
+            "fitting_net": {
+                "type": "dpa4_ener",
+                "neuron": [16, 16],
+                "precision": "float64",
+                "seed": 19,
+            },
+            "long_range": {
+                "type": "latent_multipole",
+                "charge_net": {"neuron": [8, 8], "use_glu": False},
+                "kernel": {"type": "les", "alpha": 0.9},
+                "charge_constraint": {"source": "charge_spin"},
+                "lr_update_steps": 2,
+                "efield": True,
+            },
+        }
+        m = get_model(cfg).to(env.DEVICE).eval()
+        coord, atype, _ = _batch()
+        cs = torch.tensor(
+            [[-1.0, 2.0], [0.5, 1.0]], dtype=torch.float64, device=env.DEVICE
+        )
+        fp = torch.tensor(
+            [[0.0, 0.0, 0.5], [0.0, 0.0, 0.5]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        out = m(coord, atype, charge_spin=cs, fparam=fp)
+        # The field in fparam[:3] is active.
+        out_nofield = m(coord, atype, charge_spin=cs, fparam=fp * 0.0)
+        assert not torch.allclose(out["energy"], out_nofield["energy"])
+        # The charge constraint reads charge_spin[:, 0] (spin channel untouched).
+        q_sum = out["latent_charge"].sum(dim=1).squeeze(-1)  # (nf,)
+        torch.testing.assert_close(q_sum, cs[:, 0], rtol=1e-8, atol=1e-8)
+
     def test_efield_and_fparam_charge_constraint_coexist(self) -> None:
         """Fparam = [Ex, Ey, Ez, Q]: field from [:3], charge target from [3]."""
         m = self._combo_model(fparam_index=3)
