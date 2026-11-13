@@ -204,3 +204,82 @@ class TestEfieldPhysics:
         # q_i E broadcast to (nf, nloc, 3)
         expected = q * ef[:, None, :].expand(-1, q.shape[1], -1)
         torch.testing.assert_close(diff, expected, rtol=1e-10, atol=1e-8)
+
+
+class TestEfieldTrainingWiring:
+    """The training pipeline loads ``efield.npy`` and feeds it to the model."""
+
+    def test_data_requirement_registered_when_enabled(self) -> None:
+        from deepmd.pt_expt.train.training import get_additional_data_requirement
+
+        reqs = get_additional_data_requirement(_model(efield=True, steps=2))
+        efield_reqs = [r for r in reqs if r.key == "efield"]
+        assert len(efield_reqs) == 1
+        req = efield_reqs[0]
+        assert req.ndof == 3
+        assert req.atomic is False
+        # Optional with a zero default: a system without ``efield.npy`` trains
+        # field-free instead of being rejected.
+        assert req.must is False
+
+    def test_no_data_requirement_when_disabled(self) -> None:
+        from deepmd.pt_expt.train.training import get_additional_data_requirement
+
+        reqs = get_additional_data_requirement(_model(efield=False, steps=2))
+        assert all(r.key != "efield" for r in reqs)
+
+    def test_split_batch_routes_efield_to_inputs(self) -> None:
+        from deepmd.dpmodel.utils.batch import split_batch
+
+        batch = {
+            "coord": np.zeros((2, 15)),
+            "type": np.zeros((2, 5), dtype=np.int64),
+            "efield": np.ones((2, 3)),
+            "energy": np.zeros((2, 1)),
+            "find_efield": np.bool_(True),
+        }
+        input_dict, label_dict = split_batch(batch)
+        assert "efield" in input_dict
+        assert "efield" not in label_dict
+        # The find flag stays with the labels, like find_fparam.
+        assert "find_efield" in label_dict
+
+    def test_wrapper_forward_passes_efield(self) -> None:
+        from deepmd.pt_expt.train.wrapper import ModelWrapper
+
+        m = _model(efield=True, steps=1)
+        wrapper = ModelWrapper(m).eval()
+        coord, atype, cs = _batch()
+        ef = _efield(0.5)
+        pred_e, _, _ = wrapper(coord, atype, charge_spin=cs, efield=ef)
+        pred_0, _, _ = wrapper(coord, atype, charge_spin=cs)
+        # The field reaches the plugin: polarized energy differs from the
+        # field-free evaluation.
+        assert not torch.allclose(pred_e["energy"], pred_0["energy"])
+
+    def test_wrapper_forward_ignores_efield_kwarg_when_absent(self) -> None:
+        """A field-free model is never called with the efield key."""
+        from deepmd.pt_expt.train.wrapper import ModelWrapper
+
+        m = _model(efield=False, steps=1)
+        wrapper = ModelWrapper(m).eval()
+        coord, atype, cs = _batch()
+        pred, _, _ = wrapper(coord, atype, charge_spin=cs)
+        direct = m(coord, atype, charge_spin=cs)
+        torch.testing.assert_close(pred["energy"], direct["energy"])
+
+    def test_compiled_model_rejects_efield(self) -> None:
+        from deepmd.pt_expt.train.training import _CompiledModel
+
+        m = _model(efield=True, steps=1)
+        compiled = _CompiledModel(m, structure_key=(0,))
+        compiled.train()
+        coord, atype, cs = _batch()
+        with pytest.raises(NotImplementedError, match="enable_compile"):
+            compiled(
+                coord,
+                atype,
+                None,
+                charge_spin=cs,
+                efield=_efield(0.5),
+            )

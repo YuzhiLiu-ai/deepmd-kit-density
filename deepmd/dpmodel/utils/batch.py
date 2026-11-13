@@ -26,6 +26,9 @@ _INPUT_KEYS = {
     "aparam",
     "charge_spin",
     "n_node",
+    # Uniform external electric field, one (3,) vector per frame; consumed by
+    # efield-enabled long-range plugins, never a label.
+    "efield",
 }
 
 
@@ -103,7 +106,7 @@ def split_batch(
     Returns
     -------
     input_dict : dict[str, Any]
-        Model inputs (coord, atype, box, fparam, aparam, spin).
+        Model inputs (coord, atype, box, fparam, aparam, spin, efield).
     label_dict : dict[str, Any]
         Labels and find flags (energy, force, virial, find_*, natoms, …).
     """

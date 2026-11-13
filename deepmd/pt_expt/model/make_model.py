@@ -869,6 +869,7 @@ def make_model(
             do_atomic_virial: bool = False,
             charge_spin: torch.Tensor | None = None,
             spin: torch.Tensor | None = None,
+            efield: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             """Model forward over a batch whose node axis is already flat.
 
@@ -901,6 +902,8 @@ def make_model(
             spin : torch.Tensor or None, optional
                 Native spin with shape ``(N, 3)``. Virtual-atom spin models do
                 not expose this ragged entry.
+            efield : torch.Tensor or None, optional
+                Uniform external electric field with shape ``(nf, 3)``.
 
             Returns
             -------
@@ -969,6 +972,7 @@ def make_model(
                 aparam=aparam,
                 charge_spin=charge_spin,
                 spin=spin,
+                efield=efield,
                 topologies=topologies,
             )
             # The per-atom mask a rectangular batch carries is what tells the

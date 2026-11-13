@@ -532,6 +532,8 @@ class FullValidator:
         spin = (
             test_data["spin"].reshape(nframes, -1) if self.profile.needs_spin else None
         )
+        _atomic_model = getattr(self.model, "atomic_model", None)
+        _has_efield = _atomic_model is not None and _atomic_model.has_efield()
         prediction = self._predict_outputs(
             coord=test_data["coord"].reshape(nframes, -1),
             atom_types=test_data["type"],
@@ -542,6 +544,9 @@ class FullValidator:
             else None,
             aparam=test_data["aparam"] if self.model.get_dim_aparam() > 0 else None,
             spin=spin,
+            efield=test_data["efield"]
+            if _has_efield and bool(test_data.get("find_efield", 0.0))
+            else None,
             include_virial=include_virial,
             natoms=natoms,
             nframes=nframes,
@@ -559,6 +564,7 @@ class FullValidator:
         fparam: np.ndarray | None,
         aparam: np.ndarray | None,
         spin: np.ndarray | None,
+        efield: np.ndarray | None = None,
         include_virial: bool,
         natoms: int,
         nframes: int,
@@ -577,6 +583,7 @@ class FullValidator:
             fparam_batch: np.ndarray | None,
             aparam_batch: np.ndarray | None,
             spin_batch: np.ndarray | None,
+            efield_batch: np.ndarray | None = None,
         ) -> dict[str, np.ndarray]:
             coord_input = torch.tensor(
                 coord_batch.reshape(-1, natoms, 3).astype(
@@ -630,6 +637,17 @@ class FullValidator:
                 }
             else:
                 spin_kwargs = {}
+            efield_kwargs = {}
+            if efield_batch is not None:
+                efield_kwargs["efield"] = torch.tensor(
+                    efield_batch.reshape(-1, 3).astype(
+                        NP_PRECISION_DICT[
+                            RESERVED_PRECISION_DICT[GLOBAL_PT_FLOAT_PRECISION]
+                        ]
+                    ),
+                    dtype=GLOBAL_PT_FLOAT_PRECISION,
+                    device=DEVICE,
+                )
 
             # Do not use `torch.no_grad()` here: force/virial predictions rely on
             # autograd inside the model even during evaluation.
@@ -640,6 +658,7 @@ class FullValidator:
                 fparam=fparam_input,
                 aparam=aparam_input,
                 **spin_kwargs,
+                **efield_kwargs,
             )
             if isinstance(batch_output, tuple):
                 batch_output = batch_output[0]
@@ -684,6 +703,7 @@ class FullValidator:
             fparam,
             aparam,
             spin,
+            efield,
         )
         prediction = {
             "energy": batch_prediction["energy"],

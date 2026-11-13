@@ -455,6 +455,22 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
                 source_policy="default" if has_default_cs else "tracked",
             )
         )
+    atomic_model = getattr(_model, "atomic_model", None)
+    if atomic_model is not None and atomic_model.has_efield():
+        # Uniform external field, one (3,) vector per frame, from
+        # ``efield.npy``. Optional with a zero default: a system without the
+        # file trains field-free, which the plugin reads exactly like
+        # ``efield=None``.
+        additional_data_requirement.append(
+            DataRequirementItem(
+                "efield",
+                ndof=3,
+                atomic=False,
+                must=False,
+                default=0.0,
+                source_policy="default",
+            )
+        )
     return additional_data_requirement
 
 
@@ -1245,6 +1261,7 @@ class _CompiledModel(torch.nn.Module):
         charge_spin: torch.Tensor | None,
         spin: torch.Tensor | None,
         n_node: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Delegate one rectangular or ragged evaluation to the original model."""
         kwargs = {
@@ -1256,6 +1273,8 @@ class _CompiledModel(torch.nn.Module):
         }
         if spin is not None:
             kwargs["spin"] = spin
+        if efield is not None:
+            kwargs["efield"] = efield
         if n_node is not None:
             return self.original_model.forward_ragged(
                 coord,
@@ -1275,6 +1294,7 @@ class _CompiledModel(torch.nn.Module):
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
         spin: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if not self.training and not self._compile_eval:
             return self._forward_eager(
@@ -1286,6 +1306,16 @@ class _CompiledModel(torch.nn.Module):
                 do_atomic_virial,
                 charge_spin,
                 spin,
+                efield=efield,
+            )
+        if efield is not None:
+            # The traced ABI is shared with the .pt2 export; threading a new
+            # conditioning input through make_fx and the serialization is not
+            # done yet, so the field requires the eager path for now.
+            raise NotImplementedError(
+                "the external electric field (efield) is not yet supported "
+                "with enable_compile; train with enable_compile=false or run "
+                "the eager evaluation"
             )
 
         from deepmd.dpmodel.utils.nlist import (
@@ -2954,7 +2984,7 @@ class Trainer(AbstractTrainer):
         input_dict, label_dict = split_batch(batch)
 
         # Drop optional inputs whose find_* flag is False so the model sees None.
-        for opt_key in ("fparam", "charge_spin"):
+        for opt_key in ("fparam", "charge_spin", "efield"):
             find_key = f"find_{opt_key}"
             if (
                 opt_key in input_dict

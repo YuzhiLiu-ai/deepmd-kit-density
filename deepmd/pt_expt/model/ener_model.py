@@ -410,6 +410,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
         spin: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Evaluate the energy model over a batch whose node axis is flat.
 
@@ -438,6 +439,8 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             Frame-level charge and spin conditioning with shape ``(nf, 2)``.
         spin : torch.Tensor or None, optional
             Per-atom native spin with shape ``(N, 3)``.
+        efield : torch.Tensor or None, optional
+            Uniform external electric field with shape ``(nf, 3)``.
 
         Returns
         -------
@@ -455,6 +458,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             do_atomic_virial=do_atomic_virial,
             charge_spin=charge_spin,
             spin=spin,
+            efield=efield,
         )
         return self._translate_eager_call(
             model_ret,

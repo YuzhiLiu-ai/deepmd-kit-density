@@ -162,6 +162,7 @@ class ModelWrapper(torch.nn.Module):
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
         n_node: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None, dict | None]:
         if not self.multi_task:
             task_key = "Default"
@@ -180,6 +181,12 @@ class ModelWrapper(torch.nn.Module):
             "charge_spin": charge_spin,
             "n_node": n_node,
         }
+        # ``efield`` reaches only models whose long-range plugin requested it
+        # (the data requirement is gated on ``atomic_model.has_efield()``), so
+        # it is injected unconditionally when present; models without the
+        # input never see the key.
+        if efield is not None:
+            input_dict["efield"] = efield
         # ``spin`` (native or virtual-atom magnetic moment) is only accepted
         # by spin-capable model forward()s; mirrors
         # ``deepmd.pt.train.wrapper.ModelWrapper.forward``'s ``has_spin`` gate

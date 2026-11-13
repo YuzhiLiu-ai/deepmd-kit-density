@@ -257,6 +257,15 @@ class DPAtomicModel(BaseAtomicModel):
         """Whether a long-range plugin is attached to this atomic model."""
         return self.long_range is not None
 
+    def has_efield(self) -> bool:
+        """Whether the long-range plugin consumes a uniform external field.
+
+        Only the latent-multipole plugin built with ``efield=True`` (gated on
+        LEF, ``lr_update_steps > 0``) reads the per-frame ``efield`` input;
+        every other configuration reports ``False``.
+        """
+        return bool(getattr(self.long_range, "efield", False))
+
     def required_topologies(self) -> tuple[str, ...]:
         """Topologies declared by the optional long-range plugin."""
         if self.long_range is None:
