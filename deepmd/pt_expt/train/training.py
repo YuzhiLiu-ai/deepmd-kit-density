@@ -458,17 +458,16 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
     atomic_model = getattr(_model, "atomic_model", None)
     if atomic_model is not None and atomic_model.has_efield():
         # Uniform external field, one (3,) vector per frame, from
-        # ``efield.npy``. Optional with a zero default: a system without the
-        # file trains field-free, which the plugin reads exactly like
-        # ``efield=None``.
+        # ``efield.npy``. Tracked and optional: a system without the file
+        # reports find_efield=False and the model sees ``efield=None``
+        # (field-free), so a zero-field run keeps working -- crucially also
+        # under enable_compile, whose traced ABI cannot take the field yet.
         additional_data_requirement.append(
             DataRequirementItem(
                 "efield",
                 ndof=3,
                 atomic=False,
                 must=False,
-                default=0.0,
-                source_policy="default",
             )
         )
     return additional_data_requirement
