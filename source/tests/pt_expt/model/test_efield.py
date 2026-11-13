@@ -3,7 +3,9 @@
 
 The field enters the latent electrostatic feedback (LEF), polarizing the
 latent dipoles, and adds a dipole-field energy. It is gated to LEF-only
-(``lr_update_steps > 0``); every other configuration raises.
+(``lr_update_steps > 0``); every other configuration raises. Two transports:
+the explicit per-frame ``efield`` input (API/tests, eager-only) and
+``fparam[:, :3]`` (training data, compile/export/deploy-friendly).
 """
 
 import numpy as np
@@ -207,26 +209,28 @@ class TestEfieldPhysics:
 
 
 class TestEfieldTrainingWiring:
-    """The training pipeline loads ``efield.npy`` and feeds it to the model."""
+    """The training pipeline feeds the field via fparam[:, :3] (V/AA)."""
 
     def test_data_requirement_registered_when_enabled(self) -> None:
         from deepmd.pt_expt.train.training import get_additional_data_requirement
 
         reqs = get_additional_data_requirement(_model(efield=True, steps=2))
-        efield_reqs = [r for r in reqs if r.key == "efield"]
-        assert len(efield_reqs) == 1
-        req = efield_reqs[0]
+        # dim_fparam == 0 model: the field transport registers fparam dim 3.
+        fparam_reqs = [r for r in reqs if r.key == "fparam"]
+        assert len(fparam_reqs) == 1
+        req = fparam_reqs[0]
         assert req.ndof == 3
         assert req.atomic is False
-        # Optional with a zero default: a system without ``efield.npy`` trains
-        # field-free instead of being rejected.
+        # Optional: a system without fparam.npy trains field-free.
         assert req.must is False
+        # No separate efield data key.
+        assert all(r.key != "efield" for r in reqs)
 
     def test_no_data_requirement_when_disabled(self) -> None:
         from deepmd.pt_expt.train.training import get_additional_data_requirement
 
         reqs = get_additional_data_requirement(_model(efield=False, steps=2))
-        assert all(r.key != "efield" for r in reqs)
+        assert all(r.key not in ("efield", "fparam") for r in reqs)
 
     def test_split_batch_routes_efield_to_inputs(self) -> None:
         from deepmd.dpmodel.utils.batch import split_batch
@@ -283,3 +287,100 @@ class TestEfieldTrainingWiring:
                 charge_spin=cs,
                 efield=_efield(0.5),
             )
+
+
+class TestEfieldFparamTransport:
+    """The compile/export-friendly transport: the field rides fparam[:, :3]."""
+
+    def test_fparam_transport_matches_explicit_kwarg(self) -> None:
+        m = _model(efield=True, steps=2)
+        coord, atype, cs = _batch()
+        fp = torch.tensor(
+            [[0.0, 0.0, 0.5], [0.0, 0.0, 0.5]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        out_fp = m(coord, atype, charge_spin=cs, fparam=fp)
+        out_kw = m(coord, atype, charge_spin=cs, efield=fp)
+        torch.testing.assert_close(out_fp["energy"], out_kw["energy"])
+        torch.testing.assert_close(out_fp["force"], out_kw["force"])
+
+    def test_fparam_transport_polarizes(self) -> None:
+        m = _model(efield=True, steps=2)
+        coord, atype, cs = _batch()
+        fp = torch.tensor(
+            [[0.0, 0.0, 0.5], [0.0, 0.0, 0.5]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        e0 = m(coord, atype, charge_spin=cs)["energy"]
+        e_fp = m(coord, atype, charge_spin=cs, fparam=fp)["energy"]
+        assert not torch.allclose(e0, e_fp)
+
+    def test_explicit_kwarg_wins_over_fparam(self) -> None:
+        m = _model(efield=True, steps=2)
+        coord, atype, cs = _batch()
+        fp = torch.tensor(
+            [[0.0, 0.0, 0.5], [0.0, 0.0, 0.5]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        kw = _efield(0.1)
+        out_both = m(coord, atype, charge_spin=cs, fparam=fp, efield=kw)
+        out_kw = m(coord, atype, charge_spin=cs, efield=kw)
+        torch.testing.assert_close(out_both["energy"], out_kw["energy"])
+
+    def test_short_fparam_rejected(self) -> None:
+        m = _model(efield=True, steps=2)
+        coord, atype, cs = _batch()
+        fp = torch.full((2, 1), 0.5, dtype=torch.float64, device=env.DEVICE)
+        with pytest.raises(ValueError, match="fparam"):
+            m(coord, atype, charge_spin=cs, fparam=fp)
+
+    def test_field_free_model_ignores_fparam(self) -> None:
+        """efield=False: fparam stays invisible (dim_fparam is 0)."""
+        m = _model(efield=False, steps=2)
+        coord, atype, cs = _batch()
+        fp = torch.tensor(
+            [[0.0, 0.0, 0.5], [0.0, 0.0, 0.5]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        e0 = m(coord, atype, charge_spin=cs)["energy"]
+        e_fp = m(coord, atype, charge_spin=cs, fparam=fp)["energy"]
+        torch.testing.assert_close(e0, e_fp)
+
+    def test_fparam_charge_constraint_conflicts_with_efield(self) -> None:
+        cfg = {
+            "type_map": ["A", "B"],
+            "descriptor": {
+                "type": "dpa4",
+                "rcut": 3.0,
+                "sel": 20,
+                "channels": 8,
+                "lmax": 2,
+                "n_radial": 4,
+                "precision": "float64",
+                "seed": 17,
+                "add_chg_spin_ebd": True,
+                "default_chg_spin": [0.0, 1.0],
+                "use_env_seed": True,
+            },
+            "fitting_net": {
+                "type": "dpa4_ener",
+                "neuron": [16, 16],
+                "precision": "float64",
+                "seed": 19,
+                "numb_fparam": 4,
+            },
+            "long_range": {
+                "type": "latent_multipole",
+                "charge_net": {"neuron": [8, 8], "use_glu": False},
+                "kernel": {"type": "les", "alpha": 0.9},
+                "charge_constraint": {"source": "fparam", "fparam_index": 3},
+                "lr_update_steps": 2,
+                "efield": True,
+            },
+        }
+        with pytest.raises(ValueError, match="charge_constraint"):
+            get_model(cfg)

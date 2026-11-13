@@ -395,6 +395,13 @@ def get_loss(
         raise ValueError(f"Unsupported loss type for pt_expt: {loss_type}")
 
 
+def _model_has_efield(_model: Any) -> bool:
+    """Whether the model's long-range plugin reads an external field."""
+    _am = getattr(_model, "atomic_model", None)
+    has_efield = getattr(_am, "has_efield", None)
+    return bool(has_efield is not None and has_efield())
+
+
 def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
     additional_data_requirement: list[DataRequirementItem] = []
     if _model.get_dim_fparam() > 0:
@@ -455,16 +462,16 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
                 source_policy="default" if has_default_cs else "tracked",
             )
         )
-    atomic_model = getattr(_model, "atomic_model", None)
-    if atomic_model is not None and atomic_model.has_efield():
-        # Uniform external field, one (3,) vector per frame, from
-        # ``efield.npy``. Tracked and optional: a system without the file
-        # reports find_efield=False and the model sees ``efield=None``
-        # (field-free), so a zero-field run keeps working -- crucially also
-        # under enable_compile, whose traced ABI cannot take the field yet.
+    if _model_has_efield(_model) and _model.get_dim_fparam() == 0:
+        # The external field RIDES fparam[:, :3] (V/AA): fparam is part of
+        # the traced ABI, so the field stays compile/export/deploy-compatible
+        # without a new input slot. Registered here because the model's own
+        # dim_fparam is 0 (fitting/descriptor ignore fparam; only the plugin
+        # reads it). Tracked and optional: a system without fparam.npy reports
+        # find_fparam=False and the model sees a zero field.
         additional_data_requirement.append(
             DataRequirementItem(
-                "efield",
+                "fparam",
                 ndof=3,
                 atomic=False,
                 must=False,
@@ -1431,6 +1438,13 @@ class _CompiledModel(torch.nn.Module):
                     .reshape(1, _dim_fparam)
                     .expand(nframes, -1)
                 )
+        if fparam is None and _dim_fparam == 0 and _model_has_efield(_model):
+            # The field rides fparam[:, :3]; the traced branch is frozen with
+            # the input present, so normalize an absent one to a zero field
+            # (numerically identical to None) instead of changing the pytree.
+            fparam = torch.zeros(
+                nframes, 3, dtype=ext_coord.dtype, device=ext_coord.device
+            )
         _dim_cs = _model.get_dim_chg_spin()
         if charge_spin is None and _dim_cs > 0:
             _default_cs = _model.get_default_chg_spin()
@@ -1717,6 +1731,12 @@ class _CompiledModel(torch.nn.Module):
                     .reshape(1, _dim_fparam)
                     .expand(nframes, -1)
                 )
+        if fparam is None and _dim_fparam == 0 and _model_has_efield(_model):
+            # See the dense path: the field rides fparam[:, :3], so an absent
+            # fparam is normalized to a zero field (identical to None).
+            fparam = torch.zeros(
+                nframes, 3, dtype=coord_3d.dtype, device=coord_3d.device
+            )
         _dim_cs = _model.get_dim_chg_spin()
         if charge_spin is None and _dim_cs > 0:
             _default_cs = _model.get_default_chg_spin()

@@ -64,6 +64,13 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 f"lr_update_steps={getattr(charge_net, 'lr_update_steps', 0)}. "
                 "Set a positive `lr_update_steps` to use an external field."
             )
+        if efield and (charge_constraint or {}).get("source") == "fparam":
+            raise ValueError(
+                "the external electric field (`efield`) reads the field from "
+                "fparam[:, :3], which conflicts with "
+                "`charge_constraint.source='fparam'`; use 'neutral' or "
+                "'charge_spin' instead."
+            )
         super().__init__(
             charge_net,
             kernel,
@@ -215,14 +222,36 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         # field-free models/checkpoints are untouched. Translation invariant:
         # it shifts the field each atom responds to, never the geometry (which
         # enters only through the relative pair vectors).
-        efield_node = None
-        if self.efield and efield is not None:
-            efield_node = xp.take(efield, frame_id, axis=0)
+        #
+        # Two transports: the explicit `efield` input (per-frame (nf, 3), API
+        # and tests) wins; otherwise the field RIDES fparam[:, :3] (V/AA) --
+        # the compile/export/deploy-friendly route, because fparam is already
+        # part of the traced ABI. With fparam as the transport the charge net
+        # (built for the model's own numb_fparam, 0 in this configuration)
+        # must NOT see it as conditioning, so it receives None below.
+        efield_frame = None
+        if self.efield:
+            if efield is not None:
+                efield_frame = efield
+            elif fparam is not None:
+                if fparam.shape[-1] < 3:
+                    raise ValueError(
+                        "`efield` reads the external field from fparam[:, :3], "
+                        f"but the given fparam has dimension "
+                        f"{fparam.shape[-1]} (< 3)."
+                    )
+                efield_frame = fparam[:, :3]
+        efield_node = (
+            None if efield_frame is None else xp.take(efield_frame, frame_id, axis=0)
+        )
+        charge_net_fparam = (
+            fparam_node if int(getattr(self.charge_net, "numb_fparam", 0)) > 0 else None
+        )
         initial = self.charge_net.call_graph(
             descriptor,
             atype,
             gr=descriptor_context.get("gr"),
-            fparam=fparam_node,
+            fparam=charge_net_fparam,
             aparam=aparam,
             equivariant_latent=descriptor_context.get("equivariant_latent"),
         )
@@ -364,7 +393,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 xp.astype(p, frame_energy.dtype), frame_id, n_node.shape[0]
             )
             frame_energy = frame_energy - xp.sum(
-                xp.astype(efield, frame_energy.dtype) * mu_frame, axis=-1
+                xp.astype(efield_frame, frame_energy.dtype) * mu_frame, axis=-1
             )
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))

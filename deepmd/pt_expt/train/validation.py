@@ -538,15 +538,14 @@ class FullValidator:
             coord=test_data["coord"].reshape(nframes, -1),
             atom_types=test_data["type"],
             box=test_data["box"] if data_system.pbc else None,
+            # The field rides fparam[:, :3] (V/AA): an efield-enabled plugin
+            # needs fparam even when the model's own dim_fparam is 0.
             fparam=test_data["fparam"]
-            if self.model.get_dim_fparam() > 0
+            if (self.model.get_dim_fparam() > 0 or _has_efield)
             and bool(test_data.get("find_fparam", 0.0))
             else None,
             aparam=test_data["aparam"] if self.model.get_dim_aparam() > 0 else None,
             spin=spin,
-            efield=test_data["efield"]
-            if _has_efield and bool(test_data.get("find_efield", 0.0))
-            else None,
             include_virial=include_virial,
             natoms=natoms,
             nframes=nframes,
@@ -564,7 +563,6 @@ class FullValidator:
         fparam: np.ndarray | None,
         aparam: np.ndarray | None,
         spin: np.ndarray | None,
-        efield: np.ndarray | None = None,
         include_virial: bool,
         natoms: int,
         nframes: int,
@@ -583,7 +581,6 @@ class FullValidator:
             fparam_batch: np.ndarray | None,
             aparam_batch: np.ndarray | None,
             spin_batch: np.ndarray | None,
-            efield_batch: np.ndarray | None = None,
         ) -> dict[str, np.ndarray]:
             coord_input = torch.tensor(
                 coord_batch.reshape(-1, natoms, 3).astype(
@@ -612,8 +609,10 @@ class FullValidator:
             else:
                 box_input = None
             if fparam_batch is not None:
+                # dim 0 happens for an efield-enabled plugin: the field rides
+                # fparam[:, :3] while the model's own dim_fparam is 0.
                 fparam_input = to_torch_tensor(
-                    fparam_batch.reshape(-1, self.model.get_dim_fparam())
+                    fparam_batch.reshape(-1, self.model.get_dim_fparam() or 3)
                 )
             else:
                 fparam_input = None
@@ -637,17 +636,6 @@ class FullValidator:
                 }
             else:
                 spin_kwargs = {}
-            efield_kwargs = {}
-            if efield_batch is not None:
-                efield_kwargs["efield"] = torch.tensor(
-                    efield_batch.reshape(-1, 3).astype(
-                        NP_PRECISION_DICT[
-                            RESERVED_PRECISION_DICT[GLOBAL_PT_FLOAT_PRECISION]
-                        ]
-                    ),
-                    dtype=GLOBAL_PT_FLOAT_PRECISION,
-                    device=DEVICE,
-                )
 
             # Do not use `torch.no_grad()` here: force/virial predictions rely on
             # autograd inside the model even during evaluation.
@@ -658,7 +646,6 @@ class FullValidator:
                 fparam=fparam_input,
                 aparam=aparam_input,
                 **spin_kwargs,
-                **efield_kwargs,
             )
             if isinstance(batch_output, tuple):
                 batch_output = batch_output[0]
@@ -703,7 +690,6 @@ class FullValidator:
             fparam,
             aparam,
             spin,
-            efield,
         )
         prediction = {
             "energy": batch_prediction["energy"],

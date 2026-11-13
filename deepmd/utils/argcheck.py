@@ -4130,11 +4130,15 @@ def long_range_latent_multipole() -> list[Argument]:
             bool,
             optional=True,
             default=False,
-            doc="Enable an external uniform electric field `efield` (a per-frame "
-            "(nf, 3) input, in eV/(e.Angstrom)) that enters the latent "
-            "electrostatic feedback (LEF) and the dipole-field energy, giving a "
-            "self-consistent polarization response. Requires the LEF, i.e. "
-            "`lr_update_steps > 0`; any other configuration raises. The "
+            doc="Enable an external uniform electric field that enters the "
+            "latent electrostatic feedback (LEF) and the dipole-field energy, "
+            "giving a self-consistent polarization response. The field is read "
+            "from fparam[:, :3] (in eV/(e.Angstrom), i.e. V/Angstrom) -- the "
+            "compile/export-friendly transport, since fparam is part of the "
+            "traced ABI -- or from the explicit per-frame (nf, 3) `efield` "
+            "model input, which overrides fparam. Requires the LEF, i.e. "
+            "`lr_update_steps > 0`; any other configuration raises. Cannot be "
+            "combined with `charge_constraint.source = 'fparam'`. The "
             "charge-field force q_i E is added directly to the atomic force.",
         ),
         Argument("lr_update_steps", int, optional=True, default=0),
