@@ -13,11 +13,15 @@ at and beyond the cutoff.
 
 import logging
 import math
+import os
 from typing import (
     Any,
+    Final,
 )
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 from deepmd.dpmodel import (
     FittingOutputDef,
@@ -51,6 +55,9 @@ from deepmd.pt.model.network.mlp import (
 )
 from deepmd.pt.model.network.network import (
     TypeEmbedNet,
+)
+from deepmd.pt.model.task.density_reference import (
+    RadialReferenceDensity,
 )
 from deepmd.pt.model.task.fitting import (
     Fitting,
@@ -127,12 +134,53 @@ class DensityBasisHead(Fitting):
     cg_width : int
         Channel width of the Clebsch-Gordan source projection, only used
         when ``coef_lmax > 2``.
+    n_spin : int
+        Number of spin channels of the density coefficients (1 or 2). With
+        2 the coefficients carry a spin-up and a spin-down channel and the
+        density is their sum (MACE-POLAR style spin-charge structure); the
+        radial response is shared across spins. Default 1 keeps the single
+        (spin-summed) channel.
+    use_field_update : bool
+        Whether to apply the polarisable field update: per-atom Coulomb
+        features built from the monopole charge content of the current
+        coefficients drive an additive l = 0 update and channel gates for
+        l >= 1, iterated ``field_update_iters`` times. Default False keeps
+        the single local prediction.
+    field_update_iters : int
+        Number of field-update iterations (shared weights). Default 1.
+    coulomb_sigma : float
+        Gaussian smearing width of the Coulomb kernel in Angstrom.
+    coulomb_rcut : float
+        Real-space truncation radius of the Coulomb sum in Angstrom.
+    use_charge_equilibration : bool
+        Whether to enforce the zero residual electron count per spin
+        channel after each coefficient prediction, redistributing the
+        deficit with learnable per-atom shares (Fukui equilibration).
+        Requires ``use_delta``.
     latent_lmax : int
         Maximum angular degree of the descriptor's SO(3) latent. Injected
         by the model builder; 0 when ``use_equivariant`` is False.
     latent_channels : int
         Channel count of the descriptor's SO(3) latent. Injected by the
         model builder; 0 when ``use_equivariant`` is False.
+    use_delta : bool
+        Whether to add a frozen superposed-atomic-density (SAD) reference
+        to the density, so the network only learns the residual (delta
+        learning). The reference is a per-element radial table evaluated on
+        the same grid-atom pairs. Default False keeps the raw density
+        expansion and old checkpoints unchanged.
+    reference_density : str, optional
+        Absolute path to an npz file holding the reference radial table
+        (keys ``ref_table`` with ``(ntypes, n_ref)`` rows aligned to
+        ``type_map``, ``r_grid``, and ``type_map``). Only used when
+        ``use_delta`` is True. If the file is unavailable at construction
+        (e.g. when reconstructing a model from a checkpoint on another
+        machine), a zero placeholder is built and the real table is
+        restored from the checkpoint's state dict.
+    reference_table, reference_r_grid : list, optional
+        Inline reference table and grid, embedded by ``serialize()`` so that
+        deserialization never needs the reference file. Take priority over
+        ``reference_density``.
     precision : str
         Numerical precision of the head parameters.
     seed : int, optional
@@ -151,6 +199,12 @@ class DensityBasisHead(Fitting):
 
     # make jit happy with torch 2.0.0
     exclude_types: list[int]
+    # compile-time constants so the optional branches are pruned when
+    # scripting a head built without the corresponding modules
+    use_delta: Final[bool]
+    n_spin: Final[int]
+    use_field_update: Final[bool]
+    use_charge_equilibration: Final[bool]
 
     def __init__(
         self,
@@ -164,6 +218,16 @@ class DensityBasisHead(Fitting):
         use_equivariant: bool = False,
         coef_lmax: int = 2,
         cg_width: int = 8,
+        use_delta: bool = False,
+        reference_density: str | None = None,
+        reference_table: list | None = None,
+        reference_r_grid: list | None = None,
+        n_spin: int = 1,
+        use_field_update: bool = False,
+        field_update_iters: int = 1,
+        coulomb_sigma: float = 1.0,
+        coulomb_rcut: float = 12.0,
+        use_charge_equilibration: bool = False,
         latent_lmax: int = 0,
         latent_channels: int = 0,
         numb_fparam: int = 0,
@@ -202,6 +266,13 @@ class DensityBasisHead(Fitting):
         self.n_radial = int(n_radial)
         self.basis_type = str(basis_type)
         self.radial_neurons = list(radial_neurons)
+        # spin channels of the density coefficients (MACE-POLAR style); the
+        # radial response is shared across spins, and the density is the sum
+        # of the per-spin contributions
+        self.n_spin = int(n_spin)
+        if self.n_spin not in (1, 2):
+            raise ValueError(f"n_spin must be 1 or 2, got {n_spin}")
+        self.channels_total = self.channels * self.n_spin
         self.precision = precision
         self.prec = PRECISION_DICT[precision]
         self.seed = seed
@@ -248,13 +319,30 @@ class DensityBasisHead(Fitting):
         else:
             self.coef_lmax = 0
             self.cg_width = 0
-        # the radial MLP emits one response block per angular degree
+        # the radial MLP emits one response block per angular degree (shared
+        # across spin channels)
         self.radial_out_dim = self.channels * (1 + self.coef_lmax)
+        # polarisable field update (coefficient-space, MACE-POLAR style) and
+        # spin-resolved Fukui charge equilibration; both off by default
+        self.use_field_update = bool(use_field_update)
+        self.field_update_iters = int(field_update_iters)
+        if self.field_update_iters < 1:
+            raise ValueError(
+                f"field_update_iters must be >= 1, got {field_update_iters}"
+            )
+        self.coulomb_sigma = float(coulomb_sigma)
+        if self.coulomb_sigma <= 0.0:
+            raise ValueError(f"coulomb_sigma must be positive, got {coulomb_sigma}")
+        self.coulomb_rcut = float(coulomb_rcut)
+        if self.coulomb_rcut <= 0.0:
+            raise ValueError(f"coulomb_rcut must be positive, got {coulomb_rcut}")
+        self.use_charge_equilibration = bool(use_charge_equilibration)
 
-        # per-atom density coefficients from the scalar descriptor
+        # per-atom density coefficients from the scalar descriptor; carries
+        # channels * n_spin channels (spin axis folded into the channel axis)
         self.coef_proj = MLPLayer(
             self.dim_descrpt,
-            self.channels,
+            self.channels_total,
             bias=True,
             activation_function=None,
             precision=self.precision,
@@ -295,7 +383,7 @@ class DensityBasisHead(Fitting):
             self.coef_proj_so3 = SO3Linear(
                 lmax=self.so3_lmax,
                 in_channels=self.latent_channels,
-                out_channels=self.channels,
+                out_channels=self.channels_total,
                 n_focus=1,
                 dtype=self.prec,
                 mlp_bias=False,
@@ -339,7 +427,7 @@ class DensityBasisHead(Fitting):
                 if self.coef_lmax >= 3:
                     mixes["l3"] = MLPLayer(
                         self.cg_width * self.cg_width,
-                        self.channels,
+                        self.channels_total,
                         bias=False,
                         activation_function=None,
                         precision=self.precision,
@@ -349,7 +437,7 @@ class DensityBasisHead(Fitting):
                 if self.coef_lmax >= 4:
                     mixes["l4"] = MLPLayer(
                         self.cg_width * self.cg_width,
-                        self.channels,
+                        self.channels_total,
                         bias=False,
                         activation_function=None,
                         precision=self.precision,
@@ -358,8 +446,8 @@ class DensityBasisHead(Fitting):
                     )
                 if self.coef_lmax >= 5:
                     mixes["l5"] = MLPLayer(
-                        self.channels * self.cg_width,
-                        self.channels,
+                        self.channels_total * self.cg_width,
+                        self.channels_total,
                         bias=False,
                         activation_function=None,
                         precision=self.precision,
@@ -368,8 +456,8 @@ class DensityBasisHead(Fitting):
                     )
                 if self.coef_lmax >= 6:
                     mixes["l6"] = MLPLayer(
-                        self.channels * self.cg_width,
-                        self.channels,
+                        self.channels_total * self.cg_width,
+                        self.channels_total,
                         bias=False,
                         activation_function=None,
                         precision=self.precision,
@@ -405,8 +493,143 @@ class DensityBasisHead(Fitting):
             exponent=self.CUTOFF_EXPONENT,
             dtype=self.prec,
         )
+        # frozen superposed-atomic-density reference (delta learning); when
+        # off no module is created and the state dict is unchanged
+        self.use_delta = bool(use_delta)
+        self.reference_density_file = reference_density
+        if self.use_delta:
+            table, grid = self._load_reference_table(
+                reference_density, reference_table, reference_r_grid
+            )
+            self.reference_density = RadialReferenceDensity(
+                table, grid, self.rcut, dtype=self.prec
+            )
+        # spin-resolved Fukui charge equilibration requires the SAD reference
+        # (its target is the zero residual electron count); without delta the
+        # target would need a z_valence table, which is not wired yet
+        if self.use_charge_equilibration and not self.use_delta:
+            raise NotImplementedError(
+                "use_charge_equilibration currently requires use_delta=True: "
+                "the equilibration target is the zero residual electron count "
+                "relative to the reference density"
+            )
+        # number of l >= 1 coefficient blocks that receive channel gates from
+        # the field update (the l = 0 coefficients get an additive update)
+        self.n_gate_blocks = self.coef_lmax if self.use_equivariant else 0
+        if self.use_field_update:
+            # additive l = 0 update + per-degree channel gates for l >= 1,
+            # driven by the descriptor and the Coulomb features
+            self.update_mlp = MLPLayer(
+                self.dim_descrpt + self.channels_total + self.n_spin,
+                self.channels_total * (1 + self.n_gate_blocks),
+                bias=True,
+                activation_function=None,
+                precision=self.precision,
+                seed=child_seed(self.seed, 9),
+                trainable=self.trainable,
+            )
+            # smooth truncation of the direct-space Coulomb sum
+            self.coul_envelope = C3CutoffEnvelope(
+                self.coulomb_rcut,
+                exponent=self.CUTOFF_EXPONENT,
+                dtype=self.prec,
+            )
+            # zero-init the update head so the field-update path starts as
+            # the identity: with zero weights the additive l = 0 update is
+            # exactly zero and the gates sit at sigmoid(+3) ~ 0.95, so the
+            # early training dynamics coincide with the scalar/delta model
+            # (a randomly initialized update head instead injects noise into
+            # the coefficients every forward and stalls the shared round-1
+            # modules for a long plateau). The gradient w.r.t. the update
+            # weights is still nonzero, so the update learns from identity.
+            with torch.no_grad():
+                self.update_mlp.matrix.zero_()
+                assert self.update_mlp.bias is not None
+                self.update_mlp.bias.zero_()
+                nct = self.channels_total
+                for ii in range(self.n_gate_blocks):
+                    self.update_mlp.bias[nct * (ii + 1) : nct * (ii + 2)].fill_(3.0)
+        if self.use_charge_equilibration:
+            # learnable per-atom allocation of the charge deficit (the Fukui
+            # features of MACE-POLAR); softplus keeps the shares positive
+            self.fukui_mlp = MLPLayer(
+                self.dim_descrpt,
+                self.n_spin,
+                bias=True,
+                activation_function=None,
+                precision=self.precision,
+                seed=child_seed(self.seed, 10),
+                trainable=self.trainable,
+            )
+        # fixed quadrature for the l = 0 radial charge-content weights;
+        # registered unconditionally so the monopole-charge helpers work on
+        # any head, persistent=False since they are deterministic
+        nquad = 64
+        quad = torch.linspace(
+            0.5 * self.rcut / nquad,
+            self.rcut * (1.0 - 0.5 / nquad),
+            nquad,
+            dtype=self.prec,
+            device=torch.device("cpu"),
+        )
+        self.register_buffer(
+            "quad_r", quad.to(env.DEVICE).reshape(-1, 1), persistent=False
+        )
+        self.register_buffer(
+            "quad_atype",
+            torch.arange(self.ntypes + 1, device=env.DEVICE),
+            persistent=False,
+        )
         for param in self.parameters():
             param.requires_grad = self.trainable
+
+    def _load_reference_table(
+        self,
+        reference_density: str | None,
+        reference_table: list | None,
+        reference_r_grid: list | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Load the reference radial table; inline values take priority.
+
+        Falls back to a zero placeholder (with the correct number of type
+        rows) when the file is unavailable, so that a model can still be
+        constructed from a checkpoint on a machine without the reference
+        file; the real table is then restored from the checkpoint's state
+        dict (the reference module resizes the placeholder on load).
+        """
+        if reference_table is not None and reference_r_grid is not None:
+            table = np.asarray(reference_table, dtype=np.float64)
+            grid = np.asarray(reference_r_grid, dtype=np.float64)
+        elif reference_density is not None and os.path.isfile(reference_density):
+            data = np.load(reference_density)
+            table = np.asarray(data["ref_table"], dtype=np.float64)
+            grid = np.asarray(data["r_grid"], dtype=np.float64)
+            if "type_map" in data and self.type_map is not None:
+                stored = [str(x) for x in data["type_map"].tolist()]
+                if stored != list(self.type_map):
+                    raise ValueError(
+                        "the reference_density type_map does not match the model "
+                        f"type_map: {stored} vs {self.type_map}"
+                    )
+        else:
+            log.warning(
+                "use_delta=True but the reference density table is unavailable "
+                "(file %r missing and no inline table); constructing a ZERO "
+                "reference, valid only when loading a checkpoint that carries "
+                "the real table",
+                reference_density,
+            )
+            table = np.zeros((self.ntypes, 2))
+            grid = np.linspace(0.0, self.rcut, 2)
+        # append the all-zero padding row for the padding type index (ntypes)
+        if table.shape[0] == self.ntypes:
+            table = np.concatenate([table, np.zeros((1, table.shape[1]))], axis=0)
+        elif table.shape[0] != self.ntypes + 1:
+            raise ValueError(
+                f"the reference table has {table.shape[0]} rows, expected "
+                f"ntypes ({self.ntypes}) or ntypes + 1"
+            )
+        return table, grid
 
     def reinit_exclude(
         self,
@@ -437,6 +660,10 @@ class DensityBasisHead(Fitting):
         coef_gather_index: torch.Tensor,
         latent: torch.Tensor | None = None,
         pair_vec: torch.Tensor | None = None,
+        atom_atype: torch.Tensor | None = None,
+        coul_pair_dist: torch.Tensor | None = None,
+        coul_pair_gather: torch.Tensor | None = None,
+        coul_pair_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Evaluate the density on the grid points.
 
@@ -465,6 +692,18 @@ class DensityBasisHead(Fitting):
         pair_vec
             Grid-to-atom vector of every pair. nf x ngrid x nsel x 3.
             Required when ``use_equivariant`` is True.
+        atom_atype
+            Type of every local atom. nf x nloc. Required when
+            ``use_field_update`` or ``use_charge_equilibration`` is True.
+        coul_pair_dist
+            Distance from every local atom to every extended atom.
+            nf x nloc x nall. Required when ``use_field_update`` is True.
+        coul_pair_gather
+            Local-row index of every extended atom (``mapping``), so images
+            share the coefficients of their local row. nf x nloc x nall.
+        coul_pair_mask
+            True for pairs inside ``coulomb_rcut`` (self-pairs excluded).
+            nf x nloc x nall.
 
         Returns
         -------
@@ -472,16 +711,8 @@ class DensityBasisHead(Fitting):
             The density on the grid points. nf x ngrid x 1.
         """
         nf, ngrid, nsel = pair_dist.shape
-        # nf x nloc x channels
+        # nf x nloc x channels_total
         coef = self.coef_proj(descriptor.to(self.prec))
-        # nf x ngrid x nsel x channels
-        coef_pair = torch.gather(
-            coef,
-            1,
-            coef_gather_index.reshape(nf, ngrid * nsel, 1).expand(
-                -1, -1, self.channels
-            ),
-        ).view(nf, ngrid, nsel, self.channels)
         rr = pair_dist.reshape(nf * ngrid * nsel, 1).to(self.prec)
         # npair x n_radial
         rbf = self.radial_basis(rr)
@@ -499,80 +730,130 @@ class DensityBasisHead(Fitting):
         ).view(nf, ngrid, nsel)
         pair_keep = pair_mask & (keep > 0)
         if not self.use_equivariant:
-            radial = radial.view(nf, ngrid, nsel, self.channels)
-            # nf x ngrid x nsel
-            contrib = (coef_pair * radial).sum(dim=-1) * pair_keep.to(self.prec)
+            if self.use_field_update or self.use_charge_equilibration:
+                coef, _ = self._update_coefficients(
+                    descriptor,
+                    coef,
+                    None,
+                    atom_atype,
+                    coul_pair_dist,
+                    coul_pair_gather,
+                    coul_pair_mask,
+                )
+            # nf x ngrid x nsel x channels x n_spin
+            coef_pair = torch.gather(
+                coef,
+                1,
+                coef_gather_index.reshape(nf, ngrid * nsel, 1).expand(
+                    -1, -1, self.channels_total
+                ),
+            ).view(nf, ngrid, nsel, self.channels, self.n_spin)
+            radial = radial.view(nf, ngrid, nsel, self.channels, 1)
+            # nf x ngrid x nsel; the radial response is shared across spins
+            contrib = (coef_pair * radial).sum(dim=(-2, -1)) * pair_keep.to(self.prec)
             # the pairs are grouped by grid point, so the scatter onto the
             # grid is a sum over the neighbor axis
-            return contrib.sum(dim=-1).unsqueeze(-1)
+            out = contrib.sum(dim=-1).unsqueeze(-1)
         # the equivariant branch references modules that only exist when
         # use_equivariant is True; nesting it under is_scripting prunes the
         # whole branch under torch.jit.script (the scalar branch and the
         # error below stay scriptable)
-        if not torch.jit.is_scripting():
-            return self._forward_equivariant(
+        elif not torch.jit.is_scripting():
+            out = self._forward_equivariant(
                 descriptor,
                 radial,
-                coef_pair,
+                coef,
                 pair_keep,
                 coef_gather_index,
                 latent,
                 pair_vec,
+                atom_atype,
+                coul_pair_dist,
+                coul_pair_gather,
+                coul_pair_mask,
             )
-        raise RuntimeError(
-            "density_basis with use_equivariant=True does not support "
-            "torch.jit.script; evaluate the model eagerly"
-        )
+        else:
+            raise RuntimeError(
+                "density_basis with use_equivariant=True does not support "
+                "torch.jit.script; evaluate the model eagerly"
+            )
+        if self.use_delta:
+            # frozen superposed-atomic-density reference (delta learning):
+            # the network only learns the residual on top of it
+            ref = self.reference_density(pair_dist, pair_atype, pair_keep)
+            out = out + ref.sum(dim=-1).unsqueeze(-1)
+        return out
 
     def _forward_equivariant(
         self,
         descriptor: torch.Tensor,
         radial: torch.Tensor,
-        coef_pair: torch.Tensor,
+        coef: torch.Tensor,
         pair_keep: torch.Tensor,
         coef_gather_index: torch.Tensor,
         latent: torch.Tensor | None,
         pair_vec: torch.Tensor | None,
+        atom_atype: torch.Tensor | None,
+        coul_pair_dist: torch.Tensor | None,
+        coul_pair_gather: torch.Tensor | None,
+        coul_pair_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """Equivariant (l >= 1) part of the density expansion; eager-only."""
         if self.coef_lmax > 2:
             return self._forward_equivariant_higher(
                 descriptor,
                 radial,
-                coef_pair,
+                coef,
                 pair_keep,
                 coef_gather_index,
                 latent,
                 pair_vec,
+                atom_atype,
+                coul_pair_dist,
+                coul_pair_gather,
+                coul_pair_mask,
             )
         assert latent is not None, "latent is required when use_equivariant is True"
         assert pair_vec is not None, "pair_vec is required when use_equivariant is True"
         nf, ngrid, nsel = pair_keep.shape
         llmax = self.coef_lmax
         channels = self.channels
+        n_spin = self.n_spin
         nloc = descriptor.shape[1]
         dim_lm = (llmax + 1) * (llmax + 1)
+        # nf x nloc x D x channels_total: per-atom coefficient blocks
+        coef_lm = self.coef_proj_so3(latent[:, :dim_lm].to(self.prec)).view(
+            nf, nloc, dim_lm, self.channels_total
+        )
+        blocks: list[torch.Tensor] = [
+            coef_lm[:, :, ll * ll : (ll + 1) * (ll + 1), :]
+            for ll in range(1, llmax + 1)
+        ]
+        if self.use_field_update or self.use_charge_equilibration:
+            coef, blocks = self._update_coefficients(
+                descriptor,
+                coef,
+                blocks,
+                atom_atype,
+                coul_pair_dist,
+                coul_pair_gather,
+                coul_pair_mask,
+            )
+        # nf x ngrid x nsel x channels x n_spin
+        coef_pair = torch.gather(
+            coef,
+            1,
+            coef_gather_index.reshape(nf, ngrid * nsel, 1).expand(
+                -1, -1, self.channels_total
+            ),
+        ).view(nf, ngrid, nsel, channels, n_spin)
         # nf x ngrid x nsel x (1 + llmax) x channels
         radial = radial.view(nf, ngrid, nsel, 1 + llmax, channels)
         # l = 0: scalar coefficients dotted with the l = 0 radial block
-        contrib = (coef_pair * radial[..., 0, :]).sum(dim=-1)
+        contrib = (coef_pair * radial[..., 0, :, None]).sum(dim=(-2, -1))
         # l >= 1: equivariant coefficients contracted with the direction
         # tensor of the grid-atom direction, both expressed in the SeZM
-        # packed (l, m) basis, so the contraction is exactly invariant
-        # nf x nloc x D x channels
-        coef_lm = self.coef_proj_so3(latent[:, :dim_lm].to(self.prec)).view(
-            nf, nloc, dim_lm, channels
-        )
-        # nf x ngrid x nsel x D x channels
-        coef_lm_pair = torch.gather(
-            coef_lm,
-            1,
-            coef_gather_index.reshape(nf, ngrid * nsel, 1, 1).expand(
-                -1, -1, dim_lm, channels
-            ),
-        ).view(nf, ngrid, nsel, dim_lm, channels)
-        # Cartesian direction tensor, normalized to unit Frobenius norm per
-        # irreducible block; the l = 0 (trace) row vanishes and is unused.
+        # packed (l, m) basis, so the contraction is exactly invariant.
         # Zero-length vectors only occur on masked padding pairs.
         vec = pair_vec.reshape(nf * ngrid * nsel, 3).to(self.prec)
         r_hat = vec / vec.norm(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -582,14 +863,21 @@ class DensityBasisHead(Fitting):
             direction = direction + s0 / math.sqrt(2.0 / 3.0)
         # npair x D: packed direction coefficients in the SeZM basis
         udir = torch.einsum("dij,eij->ed", self.cart_basis, direction).view(
-            nf, ngrid, nsel, dim_lm, 1
+            nf, ngrid, nsel, dim_lm, 1, 1
         )
-        for ll in range(1, llmax + 1):
+        for ii, ll in enumerate(range(1, llmax + 1)):
             ss = ll * ll
             ee = (ll + 1) * (ll + 1)
-            # sum_m c_lm * u_lm -> nf x ngrid x nsel x channels
-            angular = (coef_lm_pair[..., ss:ee, :] * udir[..., ss:ee, :]).sum(dim=-2)
-            contrib = contrib + (radial[..., ll, :] * angular).sum(dim=-1)
+            blk_pair = torch.gather(
+                blocks[ii],
+                1,
+                coef_gather_index.reshape(nf, ngrid * nsel, 1, 1).expand(
+                    -1, -1, 2 * ll + 1, self.channels_total
+                ),
+            ).view(nf, ngrid, nsel, 2 * ll + 1, channels, n_spin)
+            # sum_m c_lm * u_lm -> nf x ngrid x nsel x channels x n_spin
+            angular = (blk_pair * udir[..., ss:ee, :, :]).sum(dim=-3)
+            contrib = contrib + (radial[..., ll, :, None] * angular).sum(dim=(-2, -1))
         contrib = contrib * pair_keep.to(self.prec)
         return contrib.sum(dim=-1).unsqueeze(-1)
 
@@ -611,15 +899,212 @@ class DensityBasisHead(Fitting):
         prod = prod.reshape(prod.shape[0], prod.shape[1], -1)
         return mix(prod)
 
+    def _radial_charge_weights(self) -> torch.Tensor:
+        """Charge-content weights of the l = 0 radial block, per type.
+
+        The electron content of an atom's l = 0 coefficient channel is
+        ``sum_c w[t, c] * c0_c`` with ``w`` the 4 pi r^2 integral of the
+        radial response. Evaluated on a fixed quadrature at every call: the
+        radial MLP changes during training, and the whole expression stays
+        differentiable.
+
+        Returns
+        -------
+        torch.Tensor
+            Weights with shape ``(ntypes + 1, channels)``; the padding type
+            row is zero.
+        """
+        nquad = self.quad_r.shape[0]
+        nt = self.ntypes + 1
+        rr = self.quad_r.repeat(nt, 1)  # (nt * nquad, 1)
+        rbf = self.radial_basis(rr)
+        tebd = self.type_embedding(self.quad_atype)  # (nt, n_radial)
+        tebd = tebd.repeat_interleave(nquad, dim=0)  # (nt * nquad, n_radial)
+        radial = self.radial_mlp(torch.cat([rbf, tebd], dim=-1)) * self.envelope(rr)
+        radial = radial.view(nt, nquad, 1 + self.coef_lmax, self.channels)
+        dr = self.quad_r[1, 0] - self.quad_r[0, 0]
+        r2 = (4.0 * math.pi * rr.view(nt, nquad) ** 2).to(self.prec)
+        return (radial[..., 0, :] * r2.unsqueeze(-1)).sum(dim=1) * dr
+
+    def _monopole_charges(
+        self,
+        coef: torch.Tensor,
+        atom_atype: torch.Tensor,
+        charge_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Monopole charge content of the l = 0 coefficients.
+
+        coef has shape ``(nf, nloc, channels_total)``; the result has shape
+        ``(nf, nloc, n_spin)``. ``charge_weights`` may carry a precomputed
+        :meth:`_radial_charge_weights` result to avoid recomputing the
+        radial branch several times per forward.
+        """
+        nf, nloc, _ = coef.shape
+        coef_s = coef.view(nf, nloc, self.channels, self.n_spin)
+        w = (
+            charge_weights
+            if charge_weights is not None
+            else self._radial_charge_weights()
+        )
+        w_atom = w[atom_atype.clamp(min=0, max=self.ntypes)]
+        # same unit-normalized charge convention as the Fukui equilibration
+        w_hat = w_atom / w_atom.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
+        return (coef_s * w_hat.unsqueeze(-1)).sum(dim=-2)
+
+    def _coulomb_features(
+        self,
+        charges: torch.Tensor,
+        coul_pair_dist: torch.Tensor,
+        coul_pair_gather: torch.Tensor,
+        coul_pair_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Coulomb features v_i from the per-atom monopole charges.
+
+        Direct real-space sum with the Gaussian Coulomb damping
+        ``erf(r / (sqrt(2) sigma)) / r`` (MACE-POLAR Eq. 37), truncated at
+        ``coulomb_rcut``; periodic images share the charges of their local
+        row through the gather indices. The sum is evaluated as one batched
+        matmul over the extended atoms instead of broadcasting per-pair
+        intermediates.
+        """
+        nf, nloc, nspin = charges.shape
+        nj = coul_pair_gather.shape[-1]
+        # charges of the extended atoms: images share their local row (the
+        # gather rows are identical across i, so gather once per frame)
+        q_ext = charges.reshape(nf * nloc, nspin)[coul_pair_gather[:, 0]]
+        r = coul_pair_dist.clamp_min(1e-8)
+        kernel = torch.erf(r / (math.sqrt(2.0) * self.coulomb_sigma)) / r
+        # smooth truncation at coulomb_rcut so that pairs entering or
+        # leaving the truncation sphere perturb the features smoothly
+        kernel = kernel * self.coul_envelope(r.unsqueeze(-1)).squeeze(-1)
+        kernel = kernel * coul_pair_mask.to(charges.dtype)
+        # exclude the central self-pair by identity, not by a distance
+        # threshold: the ghost of an atom in its home cell may sit at a
+        # tiny nonzero distance from floating-point drift, and the kernel
+        # is large and finite there; genuine self-images (same atom,
+        # neighboring cell) are always at least one box vector away
+        self_pair = (
+            coul_pair_gather
+            == torch.arange(nloc, device=charges.device).view(1, nloc, 1)
+        ) & (coul_pair_dist < 1e-4)
+        kernel = kernel * (~self_pair).to(charges.dtype)
+        # v_i = sum_j K_ij q_j as one batched matmul per frame
+        return torch.bmm(kernel.to(charges.dtype), q_ext)
+
+    def _fukui_equilibrate(
+        self,
+        coef: torch.Tensor,
+        descriptor: torch.Tensor,
+        atom_atype: torch.Tensor,
+        charge_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Enforce zero residual electron count per spin channel.
+
+        The residual charge deficit of the frame is redistributed over the
+        atoms with learnable, environment-dependent shares (the Fukui
+        features); each atom's l = 0 coefficients are corrected along the
+        unit-normalized charge-content direction of its type, which keeps
+        the correction (and its gradients) bounded throughout training.
+        """
+        nf, nloc, nct = coef.shape
+        coef_s = coef.view(nf, nloc, self.channels, self.n_spin)
+        w = (
+            charge_weights
+            if charge_weights is not None
+            else self._radial_charge_weights()
+        )
+        w_atom = w[atom_atype.clamp(min=0, max=self.ntypes)]
+        # unit-normalize the charge-content direction: the correction below
+        # moves coefficients ALONG this direction, and with the raw weights
+        # its norm scales like 1/||w||, which explodes early in training when
+        # the radial branch is small — the resulting gradient noise dominates
+        # the clipped step and stalls learning. The constraint sum_i q_i = 0
+        # is unchanged by rescaling w per type.
+        w_hat = w_atom / w_atom.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
+        q = (coef_s * w_hat.unsqueeze(-1)).sum(dim=-2)  # (nf, nloc, n_spin)
+        # the equilibration target is zero residual electrons (the SAD
+        # reference carries the full valence count)
+        deficit = -q.sum(dim=1)  # (nf, n_spin)
+        alloc = F.softplus(self.fukui_mlp(descriptor.to(self.prec)))
+        share = alloc / alloc.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        dc = (
+            share.unsqueeze(-2)
+            * deficit.unsqueeze(1).unsqueeze(-2)
+            * w_hat.unsqueeze(-1)
+        )
+        return coef + dc.reshape(nf, nloc, nct)
+
+    def _update_coefficients(
+        self,
+        descriptor: torch.Tensor,
+        coef: torch.Tensor,
+        blocks: list[torch.Tensor] | None,
+        atom_atype: torch.Tensor | None,
+        coul_pair_dist: torch.Tensor | None,
+        coul_pair_gather: torch.Tensor | None,
+        coul_pair_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Polarisable field update and Fukui equilibration, in coefficient space.
+
+        Mirrors the MACE-POLAR loop: initial Fukui equilibration, then
+        ``field_update_iters`` rounds of (Coulomb features -> additive l = 0
+        update + l >= 1 channel gates -> Fukui equilibration). The density
+        grid is never touched; everything happens on per-atom coefficients.
+        """
+        assert atom_atype is not None, (
+            "atom_atype is required for the field update / charge equilibration"
+        )
+        # the radial charge weights are invariant across the update loop;
+        # evaluate the radial branch once per forward instead of per call
+        charge_weights = self._radial_charge_weights()
+        if self.use_charge_equilibration:
+            coef = self._fukui_equilibrate(coef, descriptor, atom_atype, charge_weights)
+        nct = self.channels_total
+        n_iter = self.field_update_iters if self.use_field_update else 0
+        for _ in range(n_iter):
+            assert coul_pair_dist is not None, (
+                "coul pair tensors are required for the field update"
+            )
+            assert coul_pair_gather is not None, (
+                "coul pair tensors are required for the field update"
+            )
+            assert coul_pair_mask is not None, (
+                "coul pair tensors are required for the field update"
+            )
+            q = self._monopole_charges(coef, atom_atype, charge_weights)
+            v = self._coulomb_features(
+                q, coul_pair_dist, coul_pair_gather, coul_pair_mask
+            )
+            feat = torch.cat([descriptor.to(self.prec), coef, v], dim=-1)
+            upd = self.update_mlp(feat)
+            coef = coef + upd[..., :nct]
+            if blocks is not None:
+                new_blocks: list[torch.Tensor] = []
+                for ii, blk in enumerate(blocks):
+                    gate = torch.sigmoid(
+                        upd[..., nct * (ii + 1) : nct * (ii + 2)]
+                    ).unsqueeze(-2)
+                    new_blocks.append(blk * gate)
+                blocks = new_blocks
+            if self.use_charge_equilibration:
+                coef = self._fukui_equilibrate(
+                    coef, descriptor, atom_atype, charge_weights
+                )
+        return coef, blocks
+
     def _forward_equivariant_higher(
         self,
         descriptor: torch.Tensor,
         radial: torch.Tensor,
-        coef_pair: torch.Tensor,
+        coef: torch.Tensor,
         pair_keep: torch.Tensor,
         coef_gather_index: torch.Tensor,
         latent: torch.Tensor | None,
         pair_vec: torch.Tensor | None,
+        atom_atype: torch.Tensor | None,
+        coul_pair_dist: torch.Tensor | None,
+        coul_pair_gather: torch.Tensor | None,
+        coul_pair_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         """Equivariant expansion for ``coef_lmax > 2``; eager-only.
 
@@ -636,38 +1121,64 @@ class DensityBasisHead(Fitting):
         nf, ngrid, nsel = pair_keep.shape
         llmax = self.coef_lmax
         channels = self.channels
+        n_spin = self.n_spin
         nloc = descriptor.shape[1]
         so3_dim = (self.so3_lmax + 1) * (self.so3_lmax + 1)
         n_at = nf * nloc
-        # per-atom coefficient blocks in the packed convention
+        # per-atom coefficient blocks in the packed convention; blocks[ll-1]
+        # holds the degree-ll block
         coef_lm = self.coef_proj_so3(latent[:, :so3_dim].to(self.prec)).reshape(
-            n_at, so3_dim, channels
+            n_at, so3_dim, self.channels_total
         )
-        blocks: dict[int, torch.Tensor] = {}
-        for ll in range(1, min(self.so3_lmax, llmax) + 1):
-            blocks[ll] = coef_lm[:, ll * ll : (ll + 1) * (ll + 1), :]
+        blocks: list[torch.Tensor] = [
+            coef_lm[:, ll * ll : (ll + 1) * (ll + 1), :]
+            for ll in range(1, min(self.so3_lmax, llmax) + 1)
+        ]
         if llmax > self.so3_lmax:
             cg_feat = self.cg_proj(latent[:, :so3_dim].to(self.prec)).reshape(
                 n_at, so3_dim, self.cg_width
             )
             src1 = cg_feat[:, 1:4, :]
             src2 = cg_feat[:, 4:9, :]
-            if llmax >= 3 and 3 not in blocks:
-                blocks[3] = self._cg_couple(self.cg_123, src1, src2, self.cg_mix["l3"])
-            if llmax >= 4 and 4 not in blocks:
-                blocks[4] = self._cg_couple(self.cg_224, src2, src2, self.cg_mix["l4"])
-            if llmax >= 5 and 5 not in blocks:
-                blocks[5] = self._cg_couple(
-                    self.cg_325, blocks[3], src2, self.cg_mix["l5"]
-                )
-            if llmax >= 6 and 6 not in blocks:
-                blocks[6] = self._cg_couple(
-                    self.cg_426, blocks[4], src2, self.cg_mix["l6"]
-                )
+            while len(blocks) < llmax:
+                l3 = len(blocks) + 1
+                # coupling chain: 3 <- 1 x 2, 4 <- 2 x 2, 5 <- 3 x 2, 6 <- 4 x 2
+                l1, l2 = {3: (1, 2), 4: (2, 2), 5: (3, 2), 6: (4, 2)}[l3]
+                in1 = src1 if l1 == 1 else (src2 if l1 == 2 else blocks[l1 - 1])
+                in2 = src2 if l2 == 2 else blocks[l2 - 1]
+                cg = getattr(self, f"cg_{l1}{l2}{l3}")
+                blocks.append(self._cg_couple(cg, in1, in2, self.cg_mix[f"l{l3}"]))
+        if self.use_field_update or self.use_charge_equilibration:
+            # the update works on framed (nf, nloc) tensors while the CG
+            # chain and the chunk loop below use the flattened layout
+            blocks_framed = [
+                blk.view(nf, nloc, 2 * (ll + 1) + 1, self.channels_total)
+                for ll, blk in enumerate(blocks)
+            ]
+            coef, blocks_framed = self._update_coefficients(
+                descriptor,
+                coef,
+                blocks_framed,
+                atom_atype,
+                coul_pair_dist,
+                coul_pair_gather,
+                coul_pair_mask,
+            )
+            blocks = [
+                blk.reshape(n_at, -1, self.channels_total) for blk in blocks_framed
+            ]
         # l = 0: scalar coefficients dotted with the l = 0 radial block
+        coef_pair = torch.gather(
+            coef,
+            1,
+            coef_gather_index.reshape(nf, ngrid * nsel, 1).expand(
+                -1, -1, self.channels_total
+            ),
+        ).view(nf, ngrid, nsel, channels, n_spin)
         contrib = (
-            coef_pair * radial.view(nf, ngrid, nsel, 1 + llmax, channels)[..., 0, :]
-        ).sum(dim=-1)
+            coef_pair
+            * radial.view(nf, ngrid, nsel, 1 + llmax, channels)[..., 0, :, None]
+        ).sum(dim=(-2, -1))
         # l >= 1: flat-pair chunked contraction with the direction spherical
         # harmonics, both in the SeZM packed basis so the contraction is
         # exactly rotation invariant. Zero-length vectors only occur on
@@ -689,9 +1200,15 @@ class DensityBasisHead(Fitting):
             for ll in range(1, llmax + 1):
                 y_l = y[:, ll * ll : (ll + 1) * (ll + 1)]
                 u_l = y_l @ getattr(self, f"sh_transform_l{ll}").transpose(0, 1)
-                c_l = blocks[ll].index_select(0, idx_flat[sl])
-                angular = (c_l * u_l.unsqueeze(-1)).sum(dim=-2)
-                acc = acc + (radial_flat[sl, ll, :] * angular).sum(dim=-1)
+                c_l = (
+                    blocks[ll - 1]
+                    .index_select(0, idx_flat[sl])
+                    .view(sl.stop - sl.start, 2 * ll + 1, channels, n_spin)
+                )
+                angular = (c_l * u_l.view(sl.stop - sl.start, 2 * ll + 1, 1, 1)).sum(
+                    dim=-3
+                )
+                acc = acc + (radial_flat[sl, ll, :, None] * angular).sum(dim=(-2, -1))
             parts.append(acc)
         contrib = contrib + torch.cat(parts).view(nf, ngrid, nsel)
         contrib = contrib * pair_keep.to(self.prec)
@@ -750,10 +1267,24 @@ class DensityBasisHead(Fitting):
         self.ntypes = len(type_map)
         self.reinit_exclude(map_atom_exclude_types(self.exclude_types, remap_index))
         self.type_embedding.change_type_map(type_map=type_map)
+        if self.use_delta:
+            # remap the reference table rows to the new type order; unseen
+            # types get a zero reference (they carry no prior)
+            old_table = self.reference_density.ref_table
+            new_table = torch.zeros(
+                len(type_map) + 1,
+                old_table.shape[1],
+                dtype=old_table.dtype,
+                device=old_table.device,
+            )
+            for ii, old_idx in enumerate(remap_index):
+                if old_idx >= 0:
+                    new_table[ii] = old_table[old_idx]
+            self.reference_density.ref_table = new_table
 
     def serialize(self) -> dict:
         """Serialize the head to a dict."""
-        return {
+        data = {
             "@class": "Fitting",
             "@version": 1,
             "type": "density_basis",
@@ -767,6 +1298,14 @@ class DensityBasisHead(Fitting):
             "use_equivariant": self.use_equivariant,
             "coef_lmax": self.coef_lmax,
             "cg_width": self.cg_width,
+            "use_delta": self.use_delta,
+            "reference_density": self.reference_density_file,
+            "n_spin": self.n_spin,
+            "use_field_update": self.use_field_update,
+            "field_update_iters": self.field_update_iters,
+            "coulomb_sigma": self.coulomb_sigma,
+            "coulomb_rcut": self.coulomb_rcut,
+            "use_charge_equilibration": self.use_charge_equilibration,
             "latent_lmax": self.latent_lmax,
             "latent_channels": self.latent_channels,
             "precision": self.precision,
@@ -778,6 +1317,16 @@ class DensityBasisHead(Fitting):
                 kk: to_numpy_array(vv) for kk, vv in self.state_dict().items()
             },
         }
+        if self.use_delta:
+            # embed the reference table so that deserialization never needs
+            # the reference density file
+            data["reference_table"] = (
+                self.reference_density.ref_table.detach().cpu().numpy().tolist()
+            )
+            data["reference_r_grid"] = (
+                self.reference_density.r_grid.detach().cpu().numpy().tolist()
+            )
+        return data
 
     @classmethod
     def deserialize(cls, data: dict) -> "DensityBasisHead":

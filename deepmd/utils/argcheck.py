@@ -2893,6 +2893,47 @@ def fitting_density_basis() -> list[Argument]:
         "higher-degree (l >= 3) coefficient coupling. Only used when "
         "coef_lmax > 2."
     )
+    doc_use_delta = (
+        "Whether to add a frozen superposed-atomic-density (SAD) reference to "
+        "the density so the network only learns the residual (delta learning). "
+        "The reference is a per-element radial table evaluated on the same "
+        "grid-atom pairs. Default False keeps the raw density expansion."
+    )
+    doc_reference_density = (
+        "Absolute path to an npz file holding the reference radial table: "
+        "'ref_table' with (ntypes, n_ref) rows aligned to the model type_map, "
+        "'r_grid' with the uniform radial grid, and 'type_map'. Only used when "
+        "use_delta is True. The table is stored in the checkpoint, so the file "
+        "is only needed at construction time during training."
+    )
+    doc_n_spin = (
+        "Number of spin channels of the density coefficients (1 or 2). With 2 "
+        "the coefficients carry a spin-up and a spin-down channel and the "
+        "density is their sum (MACE-POLAR style spin-charge structure); the "
+        "radial response is shared across spins. Default 1."
+    )
+    doc_use_field_update = (
+        "Whether to apply the polarisable field update: per-atom Coulomb "
+        "features built from the monopole charge content of the current "
+        "coefficients drive an additive l = 0 update and channel gates for "
+        "l >= 1, iterated field_update_iters times. Default False."
+    )
+    doc_field_update_iters = (
+        "Number of polarisable field-update iterations (shared weights). "
+        "Default 1; MACE-POLAR uses 2."
+    )
+    doc_coulomb_sigma = (
+        "Gaussian smearing width of the Coulomb kernel in Angstrom. Default 1.0."
+    )
+    doc_coulomb_rcut = (
+        "Real-space truncation radius of the Coulomb sum in Angstrom. Default 12.0."
+    )
+    doc_use_charge_equilibration = (
+        "Whether to enforce the zero residual electron count per spin channel "
+        "after each coefficient prediction, redistributing the deficit with "
+        "learnable per-atom shares (Fukui equilibration). Requires use_delta. "
+        "Default False."
+    )
 
     # numb_fparam/dim_case_embd are only advertised for schema uniformity;
     # the head rejects non-zero values until conditioning is implemented.
@@ -2922,6 +2963,50 @@ def fitting_density_basis() -> list[Argument]:
         ),
         Argument("coef_lmax", int, optional=True, default=2, doc=doc_coef_lmax),
         Argument("cg_width", int, optional=True, default=8, doc=doc_cg_width),
+        Argument("use_delta", bool, optional=True, default=False, doc=doc_use_delta),
+        Argument(
+            "reference_density",
+            [str, None],
+            optional=True,
+            default=None,
+            doc=doc_reference_density,
+        ),
+        Argument("n_spin", int, optional=True, default=1, doc=doc_n_spin),
+        Argument(
+            "use_field_update",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_field_update,
+        ),
+        Argument(
+            "field_update_iters",
+            int,
+            optional=True,
+            default=1,
+            doc=doc_field_update_iters,
+        ),
+        Argument(
+            "coulomb_sigma",
+            float,
+            optional=True,
+            default=1.0,
+            doc=doc_coulomb_sigma,
+        ),
+        Argument(
+            "coulomb_rcut",
+            float,
+            optional=True,
+            default=12.0,
+            doc=doc_coulomb_rcut,
+        ),
+        Argument(
+            "use_charge_equilibration",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_charge_equilibration,
+        ),
         Argument("precision", str, optional=True, default="default", doc=doc_precision),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
         Argument("seed", [int, None], optional=True, doc=doc_seed),

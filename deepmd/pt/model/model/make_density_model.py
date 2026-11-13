@@ -21,6 +21,7 @@ from deepmd.pt.model.model.transform_output import (
 )
 from deepmd.pt.utils.nlist import (
     build_directional_neighbor_list,
+    extend_coord_with_ghosts,
     extend_input_and_build_neighbor_list,
 )
 from deepmd.pt.utils.region import (
@@ -128,6 +129,47 @@ def make_density_model(T_AtomicModel: type[BaseAtomicModel]) -> type[BaseModel]:
                 mixed_types=self.mixed_types(),
                 box=bb,
             )
+            coul_pair_dist: torch.Tensor | None = None
+            coul_pair_gather: torch.Tensor | None = None
+            coul_pair_mask: torch.Tensor | None = None
+            if not torch.jit.is_scripting():
+                # the polarisable field update sums the Coulomb kernel over
+                # every atom within coulomb_rcut; materialize a second,
+                # larger extended region so the sum covers the physical
+                # pair set exactly (a smaller region would leak
+                # frame-dependent truncation artifacts). Eager-only: the
+                # ghost-region builder is not TorchScript-compatible; the
+                # scripted path keeps the (None) defaults, which every
+                # scripted density model accepts
+                if getattr(self.atomic_model.fitting_net, "use_field_update", False):
+                    coul_rcut = float(self.atomic_model.fitting_net.coulomb_rcut)
+                    bb_dev = bb.to(cc.device) if bb is not None else None
+                    coord_norm = (
+                        normalize_coord(
+                            cc.view(cc.shape[0], -1, 3),
+                            bb_dev.reshape(bb_dev.shape[0], 3, 3),
+                        )
+                        if bb_dev is not None
+                        else cc.view(cc.shape[0], -1, 3)
+                    )
+                    (
+                        coul_coord,
+                        coul_atype,
+                        coul_mapping,
+                    ) = extend_coord_with_ghosts(
+                        coord_norm, atype, bb_dev, coul_rcut, bb_dev
+                    )
+                    nf, nloc = atype.shape[:2]
+                    coul_coord = coul_coord.view(nf, -1, 3)
+                    coul_dist = torch.cdist(coul_coord[:, :nloc], coul_coord)
+                    coul_mask = (
+                        (coul_dist < coul_rcut)
+                        & (coul_dist > 1e-8)
+                        & (coul_atype.view(nf, -1) >= 0)[:, None, :]
+                    )
+                    coul_pair_dist = coul_dist
+                    coul_pair_gather = coul_mapping.view(nf, 1, -1).expand(-1, nloc, -1)
+                    coul_pair_mask = coul_mask
             grid_type = torch.full(
                 (gg.shape[0], gg.shape[1]),
                 self.atomic_model.descriptor.get_ntypes() - 1,
@@ -155,6 +197,9 @@ def make_density_model(T_AtomicModel: type[BaseAtomicModel]) -> type[BaseModel]:
                 fparam=fp,
                 aparam=ap,
                 charge_spin=charge_spin,
+                coul_pair_dist=coul_pair_dist,
+                coul_pair_gather=coul_pair_gather,
+                coul_pair_mask=coul_pair_mask,
             )
             model_predict = communicate_extended_output(
                 model_predict_lower,
@@ -181,6 +226,9 @@ def make_density_model(T_AtomicModel: type[BaseAtomicModel]) -> type[BaseModel]:
             grid: torch.Tensor | None = None,
             grid_type: torch.Tensor | None = None,
             grid_nlist: torch.Tensor | None = None,
+            coul_pair_dist: torch.Tensor | None = None,
+            coul_pair_gather: torch.Tensor | None = None,
+            coul_pair_mask: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             """Return model prediction. Lower interface that takes
             extended atomic coordinates and types, nlist, mapping, and the
@@ -239,19 +287,41 @@ def make_density_model(T_AtomicModel: type[BaseAtomicModel]) -> type[BaseModel]:
                 extended_coord, grid=grid, fparam=fparam, aparam=aparam
             )
             del extended_coord, grid, fparam, aparam
-            atomic_ret = self.atomic_model.forward_common_atomic(
-                cc_ext,
-                extended_atype,
-                nlist,
-                mapping=mapping,
-                fparam=fp,
-                aparam=ap,
-                comm_dict=comm_dict,
-                grid=gg,
-                grid_type=grid_type,
-                grid_nlist=grid_nlist,
-                charge_spin=charge_spin,
-            )
+            # pass the Coulomb pair tensors only when they were built
+            # (density_basis with use_field_update); other atomic models do
+            # not accept them. The kwargs branch is pruned under scripting,
+            # where the plain call is always the right one.
+            if not torch.jit.is_scripting() and coul_pair_dist is not None:
+                atomic_ret = self.atomic_model.forward_common_atomic(
+                    cc_ext,
+                    extended_atype,
+                    nlist,
+                    mapping=mapping,
+                    fparam=fp,
+                    aparam=ap,
+                    comm_dict=comm_dict,
+                    grid=gg,
+                    grid_type=grid_type,
+                    grid_nlist=grid_nlist,
+                    charge_spin=charge_spin,
+                    coul_pair_dist=coul_pair_dist,
+                    coul_pair_gather=coul_pair_gather,
+                    coul_pair_mask=coul_pair_mask,
+                )
+            else:
+                atomic_ret = self.atomic_model.forward_common_atomic(
+                    cc_ext,
+                    extended_atype,
+                    nlist,
+                    mapping=mapping,
+                    fparam=fp,
+                    aparam=ap,
+                    comm_dict=comm_dict,
+                    grid=gg,
+                    grid_type=grid_type,
+                    grid_nlist=grid_nlist,
+                    charge_spin=charge_spin,
+                )
             model_predict = fit_output_to_model_output(
                 atomic_ret,
                 self.atomic_output_def(),

@@ -112,6 +112,9 @@ class DensityBasisAtomicModel(DPAtomicModel):
         grid_type: torch.Tensor | None = None,
         grid_nlist: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
+        coul_pair_dist: torch.Tensor | None = None,
+        coul_pair_gather: torch.Tensor | None = None,
+        coul_pair_mask: torch.Tensor | None = None,
         return_atomic_feature: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Return the density prediction on the grid points.
@@ -239,6 +242,26 @@ class DensityBasisAtomicModel(DPAtomicModel):
             nframes, ngrid, nsel
         )
 
+        # inputs for the polarisable field update / Fukui equilibration
+        atom_atype = None
+        if (
+            self.fitting_net.use_field_update
+            or self.fitting_net.use_charge_equilibration
+        ):
+            if comm_dict is not None:
+                raise NotImplementedError(
+                    "density_basis with use_field_update / "
+                    "use_charge_equilibration does not support the parallel "
+                    "comm_dict path yet"
+                )
+            atom_atype = extended_atype[:, : nlist.shape[1]]
+        if self.fitting_net.use_field_update and coul_pair_dist is None:
+            raise RuntimeError(
+                "density_basis with use_field_update requires the Coulomb "
+                "pair tensors built by the model's forward_common; direct "
+                "calls to forward_atomic are not supported"
+            )
+
         density = self.fitting_net(
             descriptor,
             pair_atype=pair_atype,
@@ -247,6 +270,10 @@ class DensityBasisAtomicModel(DPAtomicModel):
             coef_gather_index=coef_gather_index,
             latent=latent,
             pair_vec=pair_vec,
+            atom_atype=atom_atype,
+            coul_pair_dist=coul_pair_dist,
+            coul_pair_gather=coul_pair_gather,
+            coul_pair_mask=coul_pair_mask,
         )
         return {"density": density}
 
@@ -263,6 +290,9 @@ class DensityBasisAtomicModel(DPAtomicModel):
         grid_type: torch.Tensor | None = None,
         grid_nlist: torch.Tensor | None = None,
         charge_spin: torch.Tensor | None = None,
+        coul_pair_dist: torch.Tensor | None = None,
+        coul_pair_gather: torch.Tensor | None = None,
+        coul_pair_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Common interface for atomic inference.
 
@@ -344,6 +374,9 @@ class DensityBasisAtomicModel(DPAtomicModel):
             grid_type=grid_type,
             grid_nlist=grid_nlist,
             charge_spin=charge_spin,
+            coul_pair_dist=coul_pair_dist,
+            coul_pair_gather=coul_pair_gather,
+            coul_pair_mask=coul_pair_mask,
         )
         ret_dict = self.apply_out_stat(ret_dict, grid_type)
 
