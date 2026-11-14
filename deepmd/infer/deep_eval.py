@@ -420,6 +420,25 @@ class DeepEvalBackend(ABC):
         """Check if the model has efield."""
         return False
 
+    def get_efield_mode(self) -> str | None:
+        """How an external electric field enters the model, if at all.
+
+        Returns
+        -------
+        str or None
+            ``"atomic"`` -- the model requires a per-atom external field
+            input of shape ``(nframes, natoms, 3)`` (the TensorFlow
+            ``se_a_ef`` descriptor convention). ``"uniform_fparam"`` -- a
+            long-range plugin reads a uniform per-frame field from
+            ``fparam[:, :3]`` (the pt_expt latent-multipole convention).
+            ``None`` -- the model has no external-field input.
+
+        The default maps the historical per-atom convention onto
+        :meth:`get_has_efield`; backends with another transport override
+        this together with :meth:`get_has_efield`.
+        """
+        return "atomic" if self.get_has_efield() else None
+
     def get_has_spin(self) -> bool:
         """Check if the model has spin atom types."""
         return False
@@ -954,6 +973,10 @@ class DeepEval(ABC):
             cells = cells.reshape(nframes, 3, 3)
         if fparam is not None:
             fdim = self.get_dim_fparam()
+            if fdim == 0 and self.deep_eval.get_efield_mode() == "uniform_fparam":
+                # The external field rides fparam[:, :3] for efield-enabled
+                # long-range plugins whose own dim_fparam is 0.
+                fdim = 3
             if fparam.size == nframes * fdim:
                 fparam = np.reshape(fparam, [nframes, fdim])
             elif fparam.size == fdim:
@@ -992,6 +1015,14 @@ class DeepEval(ABC):
     def has_efield(self) -> bool:
         """Check if the model has efield."""
         return self.deep_eval.get_has_efield()
+
+    @property
+    def efield_mode(self) -> str | None:
+        """How an external electric field enters the model, if at all.
+
+        See :meth:`DeepEvalBackend.get_efield_mode` for the values.
+        """
+        return self.deep_eval.get_efield_mode()
 
     @property
     def has_spin(self) -> bool:

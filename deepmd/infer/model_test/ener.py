@@ -399,7 +399,8 @@ class EnerTester(ModelTester):
         data.add("force", 3, atomic=True, must=False, high_prec=False)
         data.add("atom_pref", 1, atomic=True, must=False, high_prec=False, repeat=3)
         data.add("virial", 9, atomic=False, must=False, high_prec=False)
-        if dp.has_efield:
+        efield_mode = getattr(dp, "efield_mode", None)
+        if efield_mode == "atomic":
             data.add("efield", 3, atomic=True, must=True, high_prec=False)
         if self.atomic:
             data.add("atom_ener", 1, atomic=True, must=True, high_prec=False)
@@ -411,6 +412,12 @@ class EnerTester(ModelTester):
                 must=not dp.has_default_fparam(),
                 high_prec=False,
             )
+        elif efield_mode == "uniform_fparam":
+            # An efield-enabled long-range plugin reads the uniform field
+            # from fparam[:, :3] even though the model's own dim_fparam is
+            # 0. Optional: a zero-field system without fparam.npy still
+            # tests (the model sees a zero field).
+            data.add("fparam", 3, atomic=False, must=False, high_prec=False)
         if dp.get_dim_aparam() > 0:
             data.add(
                 "aparam", dp.get_dim_aparam(), atomic=True, must=True, high_prec=False
@@ -448,7 +455,12 @@ class EnerTester(ModelTester):
 
         coord = test_data["coord"].reshape([nframes, -1])
         box = test_data["box"] if data.pbc else None
-        efield = test_data["efield"].reshape([nframes, -1]) if dp.has_efield else None
+        efield_mode = getattr(dp, "efield_mode", None)
+        efield = (
+            test_data["efield"].reshape([nframes, -1])
+            if efield_mode == "atomic"
+            else None
+        )
         spin = test_data["spin"].reshape([nframes, -1]) if dp.has_spin else None
         if mixed_type:
             atype = test_data["type"].reshape([nframes, -1])
@@ -456,7 +468,8 @@ class EnerTester(ModelTester):
             atype = test_data["type"][0]
         fparam = (
             test_data["fparam"]
-            if dp.get_dim_fparam() > 0 and test_data["find_fparam"] != 0.0
+            if (dp.get_dim_fparam() > 0 or efield_mode == "uniform_fparam")
+            and test_data.get("find_fparam", 0.0) != 0.0
             else None
         )
         aparam = test_data["aparam"] if dp.get_dim_aparam() > 0 else None

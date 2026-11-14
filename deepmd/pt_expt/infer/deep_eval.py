@@ -1233,8 +1233,24 @@ class DeepEval(DeepEvalBackend):
         )
 
     def get_has_efield(self) -> bool:
-        """Check if the model has efield."""
+        """Check if the model has efield.
+
+        True when the reconstructed model's long-range plugin consumes a
+        uniform external field, read from ``fparam[:, :3]``. Metadata-only
+        mode (``.pt2``/``.pte`` without a model record) cannot reconstruct
+        the plugin and reports False; the exported artifacts do not carry
+        the field transport yet.
+        """
+        if self._dpmodel is not None:
+            atomic_model = getattr(self._dpmodel, "atomic_model", None)
+            has_efield = getattr(atomic_model, "has_efield", None)
+            if has_efield is not None:
+                return bool(has_efield())
         return False
+
+    def get_efield_mode(self) -> str | None:
+        """The plugin's uniform field rides ``fparam[:, :3]``."""
+        return "uniform_fparam" if self.get_has_efield() else None
 
     def get_has_spin(self) -> bool:
         """Check if the model has spin atom types."""
@@ -1734,9 +1750,14 @@ class DeepEval(DeepEvalBackend):
                 atype_t,
             )
 
+        dim_fparam = self.get_dim_fparam()
+        if dim_fparam == 0 and self.get_has_efield():
+            # The external field rides fparam[:, :3]; see
+            # ``_prepare_optional_lower_inputs``.
+            dim_fparam = 3
         if fparam is not None:
             fparam_t = torch.tensor(
-                fparam.reshape(nframes, self.get_dim_fparam()),
+                fparam.reshape(nframes, dim_fparam),
                 dtype=torch.float64,
                 device=DEVICE,
             )
@@ -1912,9 +1933,16 @@ class DeepEval(DeepEvalBackend):
         device: torch.device,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Prepare optional frame and atomic parameters for lower interfaces."""
+        dim_fparam = self.get_dim_fparam()
+        if dim_fparam == 0 and self.get_has_efield():
+            # The external field rides fparam[:, :3] for efield-enabled
+            # long-range plugins even though the model's own dim_fparam is
+            # 0 (mirrors the training-side requirement in
+            # ``pt_expt/train/training.py``).
+            dim_fparam = 3
         if fparam is not None:
             fparam_t = torch.tensor(
-                fparam.reshape(nframes, self.get_dim_fparam()),
+                fparam.reshape(nframes, dim_fparam),
                 dtype=torch.float64,
                 device=device,
             )

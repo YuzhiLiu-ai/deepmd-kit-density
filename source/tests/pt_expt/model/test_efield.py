@@ -19,8 +19,8 @@ from deepmd.pt_expt.model.get_model import get_model
 from deepmd.pt_expt.utils import env
 
 
-def _model(efield: bool, steps: int = 2, seed: int = 17):
-    cfg = {
+def _model_config(efield: bool, steps: int = 2, seed: int = 17) -> dict:
+    return {
         "type_map": ["A", "B"],
         "descriptor": {
             "type": "dpa4",
@@ -50,7 +50,10 @@ def _model(efield: bool, steps: int = 2, seed: int = 17):
             "efield": efield,
         },
     }
-    return get_model(cfg).to(env.DEVICE).eval()
+
+
+def _model(efield: bool, steps: int = 2, seed: int = 17):
+    return get_model(_model_config(efield, steps, seed)).to(env.DEVICE).eval()
 
 
 def _batch(seed: int = 0):
@@ -463,3 +466,108 @@ class TestEfieldFparamTransport:
         #    charges sum to the target.
         q_sum = out["latent_charge"].sum(dim=1).squeeze(-1)  # (nf,)
         torch.testing.assert_close(q_sum, fp[:, 3], rtol=1e-8, atol=1e-8)
+
+
+class TestEfieldInference:
+    """dp test / DeepEval transport the field via fparam[:, :3]."""
+
+    @staticmethod
+    def _save_ckpt(tmp_path) -> str:
+        from deepmd.pt_expt.train.wrapper import ModelWrapper
+
+        cfg = _model_config(efield=True, steps=2)
+        model = get_model(cfg).to(env.DEVICE).eval()
+        wrapper = ModelWrapper(model, model_params=cfg)
+        ckpt = str(tmp_path / "model.pt")
+        torch.save({"model": wrapper.state_dict()}, ckpt)
+        return ckpt
+
+    def test_deep_eval_transports_fparam_field(self, tmp_path) -> None:
+        """The report's minimum regression: eval responds to fparam[:, :3]."""
+        from deepmd.infer.deep_eval import DeepEval
+
+        ckpt = self._save_ckpt(tmp_path)
+        dp = DeepEval(ckpt)
+        assert dp.has_efield is True
+        assert dp.efield_mode == "uniform_fparam"
+        assert dp.get_dim_fparam() == 0
+
+        coord, atype, _ = _batch()
+        coord_np = coord.detach().cpu().numpy()
+        atype_np = atype[0].detach().cpu().numpy().astype(np.int32)
+        field = np.zeros((2, 3))
+        field[:, 2] = 0.5
+        out0 = dp.eval(coord_np, None, atype_np, fparam=np.zeros((2, 3)))
+        out1 = dp.eval(coord_np, None, atype_np, fparam=field)
+        assert not np.allclose(out0[0], out1[0])  # energy responds
+        assert not np.allclose(out0[1], out1[1])  # force responds
+        # And a zero-field evaluation without fparam still works.
+        out2 = dp.eval(coord_np, None, atype_np)
+        np.testing.assert_allclose(out2[0], out0[0], rtol=1e-10, atol=1e-10)
+
+    @staticmethod
+    def _write_system(root, field_value: float) -> None:
+        import pathlib
+
+        root = pathlib.Path(root)
+        (root / "set.000").mkdir(parents=True, exist_ok=True)
+        coord, atype, _ = _batch()
+        coord_np = coord.detach().cpu().numpy()
+        atype_np = atype[0].detach().cpu().numpy()
+        nf = coord_np.shape[0]
+        (root / "type.raw").write_text(" ".join(str(int(t)) for t in atype_np))
+        np.save(root / "set.000" / "coord.npy", coord_np.reshape(nf, -1))
+        np.save(root / "set.000" / "box.npy", np.zeros((nf, 9)))
+        np.save(root / "set.000" / "energy.npy", np.zeros((nf, 1)))
+        np.save(root / "set.000" / "force.npy", np.zeros_like(coord_np).reshape(nf, -1))
+        fparam = np.zeros((nf, 3))
+        fparam[:, 2] = field_value
+        np.save(root / "set.000" / "fparam.npy", fparam)
+
+    def test_dp_test_end_to_end_field_response(self, tmp_path) -> None:
+        """detail.f.out of a zero-field and a field system must differ."""
+        from deepmd.entrypoints.test import test as dp_test
+
+        ckpt = self._save_ckpt(tmp_path)
+        outs = {}
+        for name, e in (("zero", 0.0), ("field", 0.5)):
+            sys_dir = tmp_path / name
+            self._write_system(sys_dir, e)
+            detail = str(tmp_path / f"detail_{name}")
+            dp_test(
+                model=ckpt,
+                system=str(sys_dir),
+                datafile=None,
+                set_prefix="set",
+                numb_test=0,
+                rand_seed=None,
+                shuffle_test=False,
+                detail_file=detail,
+                atomic=False,
+            )
+            outs[name] = np.loadtxt(detail + ".f.out")
+        assert not np.allclose(outs["zero"], outs["field"])
+
+    def test_dp_test_without_fparam_file(self, tmp_path) -> None:
+        """A zero-field system without fparam.npy still tests (optional)."""
+        import os
+
+        from deepmd.entrypoints.test import test as dp_test
+
+        ckpt = self._save_ckpt(tmp_path)
+        sys_dir = tmp_path / "zero_nofile"
+        self._write_system(sys_dir, 0.0)
+        os.remove(sys_dir / "set.000" / "fparam.npy")
+        detail = str(tmp_path / "detail_nofile")
+        dp_test(
+            model=ckpt,
+            system=str(sys_dir),
+            datafile=None,
+            set_prefix="set",
+            numb_test=0,
+            rand_seed=None,
+            shuffle_test=False,
+            detail_file=detail,
+            atomic=False,
+        )
+        assert os.path.exists(detail + ".f.out")

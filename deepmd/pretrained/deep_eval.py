@@ -170,6 +170,9 @@ class PretrainedDeepEvalBackend(DeepEvalBackend):
     def get_has_efield(self) -> bool:
         return self._backend.get_has_efield()
 
+    def get_efield_mode(self) -> str | None:
+        return self._backend.get_efield_mode()
+
     def get_has_spin(self) -> bool:
         return self._backend.get_has_spin()
 
