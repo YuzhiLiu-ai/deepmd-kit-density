@@ -204,3 +204,84 @@ def test_factory_constructs_registered_plugin() -> None:
     model = get_standard_model(config)
     assert isinstance(model.atomic_model.long_range, SkeletonLongRange)
     assert model.atomic_model.long_range.scale == 3.0
+
+
+def test_lef_dipole_field_matches_energy_gradient() -> None:
+    """The LEF dipole field must be dU/dp with ONE consistent sign convention.
+
+    Regression for a sign inconsistency: the direct pair sum
+    (``_pair_potential_field``, inherited from the legacy DPA4C-LR
+    recurrence) carries dU/dp = -E, while the k-space/PME generalized force
+    (+dE/dp) was SUBTRACTED and the external field was ADDED as a physical
+    E -- so the periodic LEF update mixed the two conventions.  The field
+    assembled exactly as in ``LatentMultipoleLongRange.call_graph`` is
+    compared against finite differences of the total (pair + k-space)
+    energy.
+    """
+    from deepmd.dpmodel.long_range.kernel import (
+        COULOMB_CONSTANT,
+    )
+    from deepmd.dpmodel.long_range.latent_multipole import (
+        LatentMultipoleLongRange,
+    )
+    from deepmd.dpmodel.long_range.reciprocal import (
+        kspace_multipole_energy,
+        kspace_multipole_potential_field,
+    )
+    from deepmd.dpmodel.utils.neighbor_graph.reciprocal_graph import (
+        build_k_grid,
+    )
+
+    rng = np.random.default_rng(20261115)
+    natoms = 4
+    box = np.eye(3)[None] * 6.0
+    coord = rng.uniform(1.0, 5.0, (natoms, 3))
+    n_node = np.array([natoms])
+    q = rng.normal(0.0, 0.4, (natoms, 1))
+    q = q - q.mean()
+    p = rng.normal(0.0, 0.15, (natoms, 3))
+    kernel = LESKernel(alpha=0.9)
+
+    src, dst = np.triu_indices(natoms, k=1)
+    vec = coord[dst] - coord[src]
+    mask = np.ones(len(src), dtype=bool)
+    r_sq = np.sum(vec * vec, axis=-1)
+    k_val, a_coeff, c_coeff = kernel.evaluate_multipole(r_sq, kernel.coefficients(r_sq))
+
+    def pair_energy(pp: np.ndarray) -> float:
+        p_src, p_dst = pp[src], pp[dst]
+        psr = np.sum(p_src * vec, axis=-1)
+        pdr = np.sum(p_dst * vec, axis=-1)
+        qs, qd = q[src, 0], q[dst, 0]
+        u = (
+            qs * qd * k_val
+            + (qs * pdr - qd * psr) * a_coeff
+            - a_coeff * np.sum(p_src * p_dst, axis=-1)
+            - c_coeff * psr * pdr
+        )
+        return float(np.sum(u) * COULOMB_CONSTANT)
+
+    k_grid = build_k_grid(box, 3.0, coord, n_node)
+
+    def total_energy(pp: np.ndarray) -> float:
+        return pair_energy(pp) + float(
+            np.sum(kspace_multipole_energy(q, pp, k_grid, kernel))
+        )
+
+    # Assemble the LEF field exactly like LatentMultipoleLongRange.call_graph.
+    _, field = LatentMultipoleLongRange._pair_potential_field(
+        None, q, p, vec, mask, k_val, a_coeff, c_coeff, src, dst, natoms, np
+    )
+    _, force_k = kspace_multipole_potential_field(q, p, k_grid, kernel)
+    field = field * COULOMB_CONSTANT + force_k  # all in the dU/dp convention
+
+    eps = 1e-5
+    numeric = np.zeros_like(p)
+    for i in range(natoms):
+        for d in range(3):
+            dp_fd = np.zeros_like(p)
+            dp_fd[i, d] = eps
+            numeric[i, d] = (total_energy(p + dp_fd) - total_energy(p - dp_fd)) / (
+                2 * eps
+            )
+    np.testing.assert_allclose(field, numeric, rtol=1e-4, atol=1e-6)

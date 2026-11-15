@@ -303,6 +303,12 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                 # Fukui weights instead of a uniform shift.
                 q_target = segment_sum(q, frame_id, n_node.shape[0])
             for _ in range(self.charge_net.lr_update_steps):
+                # Convention note: the LEF drives the dipole update with the
+                # GENERALIZED FORCE dU/dp (= -E), the convention of the
+                # direct pair sum (`_pair_potential_field`, inherited from
+                # the legacy DPA4C-LR recurrence).  The reciprocal-space
+                # helpers return +dE/dp and the external field is a physical
+                # E, so both enter with the opposite sign below.
                 potential, field = self._pair_potential_field(
                     q,
                     p,
@@ -317,23 +323,25 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     xp,
                 )
                 if k_grid is not None:
-                    # The electric field of the k-space sum is -dE/dp.
+                    # force_k = dE_k/dp; the direct part carries dU/dp = -E,
+                    # so the k-space sum enters with a PLUS here.
                     phi_k, force_k = kspace_multipole_potential_field(
                         q, p, k_grid, self.kernel
                     )
                     potential = potential + phi_k
-                    field = field - force_k
+                    field = field + force_k
                 if mesh is not None:
                     phi_m, force_m = mesh_multipole_potential_field(
                         q, p, mesh, frame_id, self.kernel, self.pme_order
                     )
                     potential = potential + phi_m
-                    field = field - force_m
+                    field = field + force_m
                 if efield_node is not None:
                     # External field enters the latent electrostatic feedback:
                     # the update sees the total field (system + applied), so
-                    # the dipoles/charges polarize self-consistently.
-                    field = field + xp.astype(efield_node, field.dtype)
+                    # the dipoles/charges polarize self-consistently.  With
+                    # the dU/dp = -E convention the applied field is SUBTRACTED.
+                    field = field - xp.astype(efield_node, field.dtype)
                 if sezm_fukui:
                     q, p, fukui = self.charge_net.update_polar_state(
                         update_descriptor,
