@@ -87,6 +87,17 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         )
         self.use_self_pol = bool(use_self_pol)
         self.efield = bool(efield)
+        if not self.use_self_pol:
+            # alpha_pol is only consumed by the self-polarization energy; with
+            # use_self_pol=False it stays a registered trainable tensor that
+            # no forward reads, which breaks DDP reduction ("parameters that
+            # were not used in producing loss").  Freeze it instead -- it
+            # remains a parameter in the state dict, so serialization and
+            # checkpoints are unchanged.  Backends without autograd
+            # parameters (numpy) skip the duck-typed call.
+            alpha_pol_param = getattr(self.charge_net, "alpha_pol", None)
+            if hasattr(alpha_pol_param, "requires_grad_"):
+                alpha_pol_param.requires_grad_(False)
 
     @property
     def multipole_net(self) -> LatentMultipoleFitting:

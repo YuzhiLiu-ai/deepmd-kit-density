@@ -1511,3 +1511,35 @@ def test_update_mesh_stat_fixes_pme_mesh_from_data(tmp_path) -> None:
     assert list(mesh) == list(expected)
     # Stable across the run: serialized into the dumped config.
     json.dumps(config)
+
+
+def test_multipole_alpha_pol_frozen_when_self_pol_disabled() -> None:
+    """use_self_pol=False must not leave alpha_pol as an unused parameter.
+
+    DDP's reducer raises "parameters that were not used in producing loss"
+    for such tensors, so the plugin freezes alpha_pol in this configuration.
+    """
+    model = get_model(_multipole_config(steps=1, use_self_pol=False)).to(env.DEVICE)
+    alpha_pol = model.atomic_model.long_range.charge_net.alpha_pol
+    assert alpha_pol.requires_grad is False
+
+    # Every remaining trainable parameter participates in the loss (the DDP
+    # reducer contract).
+    model.train()
+    coord, atype = _batch((4, 3), seed=41)
+    result = model(coord, atype)
+    (result["energy"].square().sum() + result["force"].square().sum()).backward()
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None, name
+
+
+def test_multipole_alpha_pol_trained_when_self_pol_enabled() -> None:
+    """With self-polarization on, alpha_pol is trainable and receives grad."""
+    model = _multipole_model(steps=0, train=True)
+    alpha_pol = model.atomic_model.long_range.charge_net.alpha_pol
+    assert alpha_pol.requires_grad
+    coord, atype = _batch((4, 3), seed=43)
+    result = model(coord, atype)
+    (result["energy"].square().sum() + result["force"].square().sum()).backward()
+    assert alpha_pol.grad is not None
