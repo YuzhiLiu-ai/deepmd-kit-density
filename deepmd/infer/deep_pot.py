@@ -144,6 +144,7 @@ class DeepPot(DeepEval):
         fparam: np.ndarray | None = None,
         aparam: np.ndarray | None = None,
         mixed_type: bool = False,
+        extra_outputs: list[str] | None = None,
         **kwargs: Any,
     ) -> tuple[np.ndarray, ...]:
         """Evaluate energy, force, and virial. If atomic is True,
@@ -167,6 +168,10 @@ class DeepPot(DeepEval):
             The atomic parameters, by default None.
         mixed_type : bool, optional
             Whether the atom_types is mixed type, by default False.
+        extra_outputs : list[str], optional
+            Additional per-atom output names to append to the returned tuple
+            (e.g. ``["latent_charge", "latent_dipole"]`` of a long-range
+            plugin). Requires ``atomic=True``.
         **kwargs : dict[str, Any]
             Keyword arguments.
 
@@ -194,6 +199,10 @@ class DeepPot(DeepEval):
         # finetune: +mixed_type
         # dpdata
         # ase
+        if extra_outputs and not atomic:
+            raise ValueError(
+                "extra_outputs are per-atom quantities; request them with atomic=True"
+            )
         (
             coords,
             cells,
@@ -251,6 +260,13 @@ class DeepPot(DeepEval):
                 nframes, 3 * natoms, 3 * natoms
             )
             result = (*list(result), hessian)
+        for name in extra_outputs or []:
+            if name not in results:
+                raise ValueError(
+                    f"the model does not provide an output named {name!r}; "
+                    f"available outputs: {sorted(results)}"
+                )
+            result = (*result, results[name])
         return result
 
 

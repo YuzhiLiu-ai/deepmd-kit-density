@@ -416,6 +416,34 @@ class DeepEval(DeepEvalBackend):
             self._model_output_def = ModelOutputDef(FittingOutputDef(fitting_defs))
         else:
             self._model_output_def = ModelOutputDef(self._dpmodel.atomic_output_def())
+        self._extend_output_def_with_aux()
+
+    def _extend_output_def_with_aux(self) -> None:
+        """Expose the long-range plugin's latent outputs to ``eval``.
+
+        The high-level interface hands this evaluator a fixed energy-only
+        output def, so auxiliary per-atom outputs the plugin computes anyway
+        (``latent_charge``/``latent_dipole``) are never requested -- and the
+        category-based graph key mapping would silently alias them onto
+        ``atom_energy``.  Rebuild the def from the reconstructed model and
+        remember the aux names: they are served only under ``atomic=True``
+        and keep their declared trailing dims in ``_get_output_shape``.
+        """
+        self._aux_output_names: set[str] = set()
+        if self._dpmodel is None or self._is_spin:
+            return
+        aux = [
+            vdef
+            for name, vdef in self._dpmodel.atomic_output_def().get_data().items()
+            if name not in self.output_def.var_defs
+            and name not in ("energy", "mask")
+            and vdef.category == OutputVariableCategory.OUT
+        ]
+        if not aux:
+            return
+        self._aux_output_names = {v.name for v in aux}
+        defs = [*self.output_def.def_outp.get_data().values(), *aux]
+        self.output_def = ModelOutputDef(FittingOutputDef(defs))
 
     def _init_from_metadata(self) -> None:
         """Initialize DeepEval from ``metadata.json`` alone.
@@ -691,6 +719,7 @@ class DeepEval(DeepEvalBackend):
             )
         else:
             self._model_output_def = ModelOutputDef(model.atomic_output_def())
+        self._extend_output_def_with_aux()
         self._model_def_script = model_params
         # Populate metadata so eval helpers (e.g. default_fparam fallback)
         # behave the same as the .pt2/.pte path.  Mirrors the fields that
@@ -1371,6 +1400,7 @@ class DeepEval(DeepEvalBackend):
         if atomic:
             return list(self.output_def.var_defs.values())
         else:
+            aux = getattr(self, "_aux_output_names", set())
             return [
                 x
                 for x in self.output_def.var_defs.values()
@@ -1381,6 +1411,7 @@ class DeepEval(DeepEvalBackend):
                     OutputVariableCategory.DERV_R,
                     OutputVariableCategory.DERV_C_REDU,
                 )
+                and x.name not in aux
             ]
 
     def _eval_func(self, inner_func: Callable, numb_test: int, natoms: int) -> Callable:
@@ -2638,7 +2669,15 @@ class DeepEval(DeepEvalBackend):
         results = []
         for odef in request_defs:
             shape = self._get_output_shape(odef, nframes, natoms)
-            gkey = _GRAPH_CATEGORY_TO_KEY.get(odef.category)
+            if odef.category == OutputVariableCategory.OUT and odef.name in getattr(
+                self, "_aux_output_names", set()
+            ):
+                # Auxiliary per-atom outputs (latent fields) keep their own
+                # names in the graph lower; the category table would alias
+                # them onto atom_energy.
+                gkey = odef.name
+            else:
+                gkey = _GRAPH_CATEGORY_TO_KEY.get(odef.category)
             val = model_ret.get(gkey) if gkey is not None else None
             if val is not None:
                 results.append(val.detach().cpu().numpy().reshape(shape))
@@ -2874,6 +2913,10 @@ class DeepEval(DeepEvalBackend):
             return [nframes, *odef.shape[:-1], natoms, 3]
         elif odef.category == OutputVariableCategory.OUT:
             # atom_energy, atom_tensor
+            if odef.name in getattr(self, "_aux_output_names", set()):
+                # Auxiliary per-atom outputs (the long-range plugin's latent
+                # fields) keep their declared trailing dims; no extra axis.
+                return [nframes, natoms, *odef.shape]
             return [nframes, natoms, *odef.shape, 1]
         elif odef.category == OutputVariableCategory.DERV_R_DERV_R:
             # hessian

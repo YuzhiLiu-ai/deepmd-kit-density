@@ -571,3 +571,52 @@ class TestEfieldInference:
             atomic=False,
         )
         assert os.path.exists(detail + ".f.out")
+
+    def test_eval_exposes_latent_outputs(self, tmp_path) -> None:
+        """dp.eval surfaces latent_charge/latent_dipole with correct shapes."""
+        from deepmd.infer.deep_eval import DeepEval
+
+        ckpt = self._save_ckpt(tmp_path)
+        dp = DeepEval(ckpt)
+        coord, atype, _ = _batch()
+        # The non-mixed-type eval interface shares one atype across frames;
+        # align the reference forward to that convention.
+        atype = atype[0:1].repeat(2, 1)
+        coord_np = coord.detach().cpu().numpy()
+        atype_np = atype[0].detach().cpu().numpy().astype(np.int32)
+
+        # Backend eval dict carries the latent outputs under atomic=True,
+        # with the declared shapes.
+        out = dp.deep_eval.eval(coord_np, None, atype_np, atomic=True)
+        assert out["latent_charge"].shape == (2, 5, 1)
+        assert out["latent_dipole"].shape == (2, 5, 3)
+
+        # They match the direct model forward exactly.
+        m = dp.deep_eval._dpmodel.eval()
+        ref = m(coord, atype)
+        np.testing.assert_allclose(
+            out["latent_charge"],
+            ref["latent_charge"].detach().cpu().numpy(),
+            rtol=1e-8,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            out["latent_dipole"],
+            ref["latent_dipole"].detach().cpu().numpy(),
+            rtol=1e-8,
+            atol=1e-10,
+        )
+
+        # atomic=False keeps the standard output set.
+        out_na = dp.deep_eval.eval(coord_np, None, atype_np, atomic=False)
+        assert "latent_dipole" not in out_na
+
+        # High-level passthrough appends the requested outputs.
+        res = dp.eval(
+            coord_np, None, atype_np, atomic=True, extra_outputs=["latent_dipole"]
+        )
+        np.testing.assert_allclose(res[-1], out["latent_dipole"], rtol=1e-10)
+
+        # extra_outputs require atomic=True.
+        with pytest.raises(ValueError, match="atomic=True"):
+            dp.eval(coord_np, None, atype_np, extra_outputs=["latent_dipole"])
