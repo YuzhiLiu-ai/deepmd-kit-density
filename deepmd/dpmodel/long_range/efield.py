@@ -101,7 +101,9 @@ def build_efield_coordinate(
         # Orthorhombicity gate on the host array (a validation, not part of
         # the differentiable graph): the jump plane must be perpendicular to
         # a lattice vector.
-        box_np = np.asarray(box.detach().cpu() if hasattr(box, "detach") else box)
+        box_np = np.asarray(
+            box.detach().cpu() if hasattr(box, "detach") else box
+        ).reshape(-1, 3, 3)
         if float(np.max(np.abs(box_np * (1.0 - np.eye(3))))) > 1e-8:
             raise NotImplementedError(
                 "the sawtooth efield potential requires an orthorhombic cell: "
