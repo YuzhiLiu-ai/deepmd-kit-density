@@ -494,6 +494,7 @@ def build_synthetic_graph_inputs(
     want_aparam: bool = True,
     want_charge_spin: bool = True,
     want_spin: bool = False,
+    want_efield_coord: bool = False,
     canonicalize: bool = True,
 ) -> tuple[torch.Tensor | None, ...]:
     """Build a synthetic carry-all ``NeighborGraph`` for graph-lower tracing.
@@ -579,6 +580,13 @@ def build_synthetic_graph_inputs(
     rcut = model.get_rcut()
     ntypes = len(model.get_type_map())
     dim_fparam = model.get_dim_fparam()
+    if dim_fparam == 0:
+        # An efield-enabled long-range plugin reads the field from
+        # fparam[:, :3] even though the model's own dim_fparam is 0
+        # (mirrors the training-side requirement in pt_expt/train/training.py).
+        _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
+        if getattr(_lr, "efield", False):
+            dim_fparam = 3
     dim_aparam = model.get_dim_aparam()
     dim_chg_spin = model.get_dim_chg_spin()
 
@@ -657,7 +665,7 @@ def build_synthetic_graph_inputs(
         if (want_charge_spin and dim_chg_spin > 0)
         else None
     )
-    return (
+    inputs = (
         atype_t.reshape(-1),
         graph.n_node,
         n_local,
@@ -672,6 +680,19 @@ def build_synthetic_graph_inputs(
         aparam,
         charge_spin,
     )
+    if want_efield_coord:
+        # Sawtooth efield ABI: the gauge-fixed coordinates ride as the last
+        # conditioning input, (N, 3) on the flat node axis (like aparam).
+        from deepmd.dpmodel.long_range.efield import build_efield_coordinate
+
+        _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
+        _periodic = bool(getattr(_lr, "periodic", False))
+        _box = box_t.reshape(nframes, 3, 3) if _periodic else None
+        coord_ec = build_efield_coordinate(
+            coord_t.reshape(-1, 3), graph.n_node, _box, periodic=_periodic
+        )
+        inputs = (*inputs, coord_ec)
+    return inputs
 
 
 def build_synthetic_topologies(
@@ -2216,6 +2237,11 @@ def _trace_and_export_impl(
                 if metadata["graph_edge_dtype"] == "float32"
                 else torch.float64
             )
+            _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
+            _want_ec = bool(
+                getattr(_lr, "efield", False)
+                and getattr(_lr, "efield_potential", "force_only") == "sawtooth"
+            )
             sample_inputs = build_synthetic_graph_inputs(
                 model,
                 e_max=e_sample,
@@ -2225,6 +2251,7 @@ def _trace_and_export_impl(
                 edge_dtype=edge_dtype,
                 device=torch.device("cpu"),
                 want_spin=is_native_spin,
+                want_efield_coord=_want_ec,
             )
             if is_native_spin:
                 # Native-spin ABI (NativeSpinEnergyModel.forward_lower_graph_exportable):
@@ -2250,6 +2277,7 @@ def _trace_and_export_impl(
                     aparam=sample_inputs[11],
                     do_atomic_virial=do_atomic_virial,
                     charge_spin=sample_inputs[12],
+                    efield_coord=sample_inputs[13] if _want_ec else None,
                     destination_sorted=True,
                     tracing_mode="symbolic",
                     _allow_non_fake_inputs=True,

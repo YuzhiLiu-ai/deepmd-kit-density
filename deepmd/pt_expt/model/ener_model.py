@@ -632,6 +632,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         aparam: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
+        efield_coord: torch.Tensor | None = None,
         destination_sorted: bool = False,
         **make_fx_kwargs: Any,
     ) -> torch.nn.Module:
@@ -698,6 +699,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam=fparam,
             aparam=aparam,
             charge_spin=charge_spin,
+            efield_coord=efield_coord,
             do_atomic_virial=do_atomic_virial,
             destination_sorted=destination_sorted,
             **make_fx_kwargs,
@@ -722,6 +724,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam: torch.Tensor | None,
             aparam: torch.Tensor | None,
             charge_spin: torch.Tensor | None,
+            efield_coord: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             model_ret = traced(
                 atype,
@@ -737,6 +740,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                 fparam,
                 aparam,
                 charge_spin,
+                efield_coord,
             )
             return _translate_energy_keys(
                 model_ret,
@@ -760,6 +764,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam,
             aparam,
             charge_spin,
+            efield_coord,
         )
 
     def forward_lower_graph_exportable_with_comm(

@@ -795,7 +795,11 @@ class TestEfieldSawtooth:
         restored = LatentMultipoleLongRangeDP.deserialize(data)
         assert restored.efield_potential == "force_only"
 
-    def test_compiled_model_rejects_sawtooth(self) -> None:
+    def test_compiled_model_matches_eager(self, tmp_path) -> None:
+        """The sawtooth path is compile-safe: compiled energy/force/gradients
+        match eager to machine precision (the trace sample must carry the
+        field's fparam even though dim_fparam is 0).
+        """
         from deepmd.pt_expt.train.training import _CompiledModel
 
         m = self._model()
@@ -803,8 +807,28 @@ class TestEfieldSawtooth:
         compiled.train()
         coord, atype, cs = _batch()
         fp = self._field(0.1, nf=2)
-        with pytest.raises(NotImplementedError, match="sawtooth"):
-            compiled(coord, atype, None, charge_spin=cs, fparam=fp)
+        zero = torch.zeros((2, 3), dtype=torch.float64, device=env.DEVICE)
+
+        out_c = compiled(coord, atype, None, charge_spin=cs, fparam=fp)
+        m.train()
+        out_e = m(coord, atype, charge_spin=cs, fparam=fp)
+        torch.testing.assert_close(
+            out_c["energy"], out_e["energy"], rtol=1e-10, atol=1e-10
+        )
+        torch.testing.assert_close(
+            out_c["force"], out_e["force"], rtol=1e-10, atol=1e-10
+        )
+
+        # A zero-field batch through the same compiled graph matches too.
+        out_c0 = compiled(coord, atype, None, charge_spin=cs, fparam=zero)
+        out_e0 = m(coord, atype, charge_spin=cs, fparam=zero)
+        torch.testing.assert_close(
+            out_c0["energy"], out_e0["energy"], rtol=1e-10, atol=1e-10
+        )
+
+        # Training gradients flow through the compiled graph.
+        (out_c["energy"].square().sum() + out_c["force"].square().sum()).backward()
+        assert all(p.grad is not None for p in compiled.parameters() if p.requires_grad)
 
     def test_sawtooth_has_no_manual_side_output(self) -> None:
         """Sawtooth force is fully autograd (coordinate leaf); only the legacy

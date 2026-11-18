@@ -944,6 +944,7 @@ def _trace_and_compile_graph(
         want_aparam=aparam is not None,
         want_charge_spin=charge_spin is not None,
         want_spin=spin is not None,
+        want_efield_coord=_model_efield_sawtooth(model),
         canonicalize=False,
     )
     (
@@ -962,7 +963,8 @@ def _trace_and_compile_graph(
     # The synthetic native-spin ABI puts spin before the optional conditioning
     # tensors, while forward_common_lower_graph takes it after them.
     s_spin = s_conditioning.pop(0) if spin is not None else None
-    s_fparam, s_aparam, s_charge_spin = s_conditioning
+    s_fparam, s_aparam, s_charge_spin = s_conditioning[:3]
+    s_efield_coord = s_conditioning[3] if len(s_conditioning) > 3 else None
 
     # Build a synthetic long-range all-pairs graph for models that consume one
     # (e.g. DPA4C-LR).  The exact coordinates do not matter for shape tracing;
@@ -1013,6 +1015,7 @@ def _trace_and_compile_graph(
         aparam: torch.Tensor | None,
         charge_spin: torch.Tensor | None,
         spin: torch.Tensor | None,
+        efield_coord: torch.Tensor | None,
         lr_edge_index: torch.Tensor,
         lr_edge_vec: torch.Tensor,
         lr_edge_mask: torch.Tensor,
@@ -1062,6 +1065,7 @@ def _trace_and_compile_graph(
                 aparam=aparam,
                 charge_spin=charge_spin,
                 spin=spin,
+                efield_coord=efield_coord,
                 topologies=topologies,
                 **legacy_lr_kwargs,
             )
@@ -1110,6 +1114,7 @@ def _trace_and_compile_graph(
         s_aparam,
         s_charge_spin,
         s_spin,
+        s_efield_coord,
         s_lr_graph.edge_index,
         s_lr_graph.edge_vec,
         s_lr_graph.edge_mask,
@@ -1337,15 +1342,6 @@ class _CompiledModel(torch.nn.Module):
                 "the external electric field (efield) is not yet supported "
                 "with enable_compile; train with enable_compile=false or run "
                 "the eager evaluation"
-            )
-        if _model_efield_sawtooth(self.original_model):
-            # The sawtooth potential adds a wrapped-coordinate external
-            # potential to the LEF/energy path; like the explicit field
-            # input, it needs a traced ABI slot that is not threaded yet.
-            raise NotImplementedError(
-                "the sawtooth efield potential (efield_potential='sawtooth') "
-                "is not yet supported with enable_compile; train with "
-                "enable_compile=false"
             )
 
         from deepmd.dpmodel.utils.nlist import (
@@ -1833,6 +1829,20 @@ class _CompiledModel(torch.nn.Module):
             atype=atype_flat,
             pair_excl=pair_excl,
         )
+        # Sawtooth efield: the gauge-fixed coordinates ride as an extra
+        # conditioning input (always a tensor for such models, so the traced
+        # branch is stable across batches, including zero-field ones).
+        efield_coord = None
+        if _model_efield_sawtooth(_model):
+            from deepmd.dpmodel.long_range.efield import build_efield_coordinate
+
+            _lr = _model.atomic_model.long_range
+            efield_coord = build_efield_coordinate(
+                coord_3d if ragged else coord_3d.reshape(n_padded, 3)[node_index],
+                ng.n_node,
+                None if box_flat is None else box_flat.reshape(nframes, 3, 3),
+                periodic=_lr.periodic,
+            )
 
         # Lazy compile of the GRAPH lower (cached per structure key and mode).
         compiled_lower = self._compiled_lower_by_mode.get(self.training)
@@ -1902,6 +1912,7 @@ class _CompiledModel(torch.nn.Module):
                 aparam,
                 charge_spin,
                 spin,
+                efield_coord,
                 lr_edge_index,
                 lr_edge_vec,
                 lr_edge_mask,

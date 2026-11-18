@@ -1391,6 +1391,7 @@ def make_model(
             do_atomic_virial: bool = False,
             charge_spin: torch.Tensor | None = None,
             spin: torch.Tensor | None = None,
+            efield_coord: torch.Tensor | None = None,
             destination_sorted: bool = False,
             topologies: dict[str, Any] | None = None,
             **make_fx_kwargs: Any,
@@ -1461,6 +1462,68 @@ def make_model(
 
             if topologies:
                 topology_names = tuple(topologies)
+
+                if efield_coord is not None:
+                    # Sawtooth efield ABI: the gauge-fixed coordinates ride as
+                    # an extra (N, 3) conditioning input before the flattened
+                    # topologies (the graph lower rebuilds the potential from
+                    # them on a differentiable leaf).
+                    def fn_topologies_ec(
+                        atype: torch.Tensor,
+                        n_node: torch.Tensor,
+                        n_local: torch.Tensor,
+                        edge_index: torch.Tensor,
+                        edge_vec: torch.Tensor,
+                        edge_mask: torch.Tensor,
+                        destination_order: torch.Tensor | None,
+                        destination_row_ptr: torch.Tensor | None,
+                        source_order: torch.Tensor | None,
+                        source_row_ptr: torch.Tensor | None,
+                        fparam: torch.Tensor | None,
+                        aparam: torch.Tensor | None,
+                        charge_spin: torch.Tensor | None,
+                        efield_coord: torch.Tensor | None,
+                        *topology_vals: torch.Tensor,
+                    ) -> dict[str, torch.Tensor]:
+                        return model.forward_common_lower_graph(
+                            atype,
+                            n_node,
+                            n_local,
+                            edge_index,
+                            edge_vec,
+                            edge_mask,
+                            destination_order,
+                            destination_row_ptr,
+                            source_order,
+                            source_row_ptr,
+                            destination_sorted=destination_sorted,
+                            do_atomic_virial=do_atomic_virial,
+                            fparam=fparam,
+                            aparam=aparam,
+                            charge_spin=charge_spin,
+                            efield_coord=efield_coord,
+                            topologies=unflatten_topologies(
+                                topology_names, topology_vals
+                            ),
+                        )
+
+                    return make_fx(fn_topologies_ec, **make_fx_kwargs)(
+                        atype,
+                        n_node,
+                        n_local,
+                        edge_index,
+                        edge_vec,
+                        edge_mask,
+                        destination_order,
+                        destination_row_ptr,
+                        source_order,
+                        source_row_ptr,
+                        fparam,
+                        aparam,
+                        charge_spin,
+                        efield_coord,
+                        *flatten_topologies(topologies),
+                    )
 
                 def fn_topologies(
                     atype: torch.Tensor,
