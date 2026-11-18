@@ -19,6 +19,10 @@ from deepmd.dpmodel.utils.seed import child_seed
 from deepmd.utils.version import check_version_compatibility
 
 from .base_long_range import BaseLongRange
+from .efield import (
+    EFIELD_POTENTIAL_MODES,
+    resolve_efield_frame,
+)
 from .kernel import COULOMB_CONSTANT, BaseInteractionKernel
 from .latent_charge import (
     CHARGE_NET_NEURON,
@@ -50,6 +54,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         charge_constraint: dict | None = None,
         use_self_pol: bool = True,
         efield: bool = False,
+        efield_potential: str = "force_only",
         periodic: bool = False,
         kspace_tolerance: float = 1e-8,
         k_grid_mode: str = "kgrid",
@@ -87,6 +92,12 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         )
         self.use_self_pol = bool(use_self_pol)
         self.efield = bool(efield)
+        if efield_potential not in EFIELD_POTENTIAL_MODES:
+            raise ValueError(
+                f"`efield_potential` must be one of {EFIELD_POTENTIAL_MODES}, "
+                f"got {efield_potential!r}"
+            )
+        self.efield_potential = str(efield_potential)
         if not self.use_self_pol:
             # alpha_pol is only consumed by the self-polarization energy; with
             # use_self_pol=False it stays a registered trainable tensor that
@@ -192,6 +203,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             config.get("charge_constraint"),
             bool(config.get("use_self_pol", True)),
             efield=bool(config.get("efield", False)),
+            efield_potential=str(config.get("efield_potential", "force_only")),
             periodic=bool(config.get("periodic", False)),
             kspace_tolerance=float(config.get("kspace_tolerance", 1e-8)),
             k_grid_mode=str(config.get("k_grid_mode", "kgrid")),
@@ -210,6 +222,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         aparam: Array | None = None,
         charge_spin: Array | None = None,
         efield: Array | None = None,
+        efield_ext_pot: Array | None = None,
         descriptor_context: dict[str, Array] | None = None,
     ) -> dict[str, Array]:
         xp = array_api_compat.array_namespace(descriptor)
@@ -243,21 +256,17 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         # part of the traced ABI. With fparam as the transport the charge net
         # (built for the model's own numb_fparam, 0 in this configuration)
         # must NOT see it as conditioning, so it receives None below.
-        efield_frame = None
-        if self.efield:
-            if efield is not None:
-                efield_frame = efield
-            elif fparam is not None:
-                if fparam.shape[-1] < 3:
-                    raise ValueError(
-                        "`efield` reads the external field from fparam[:, :3], "
-                        f"but the given fparam has dimension "
-                        f"{fparam.shape[-1]} (< 3)."
-                    )
-                efield_frame = fparam[:, :3]
+        efield_frame = resolve_efield_frame(self.efield, efield, fparam)
         efield_node = (
             None if efield_frame is None else xp.take(efield_frame, frame_id, axis=0)
         )
+        sawtooth = self.efield_potential == "sawtooth"
+        if sawtooth and efield_node is not None and efield_ext_pot is None:
+            raise ValueError(
+                "the sawtooth efield potential requires the wrapped-coordinate "
+                "external potential (`efield_ext_pot`), which is built by the "
+                "model wrapper from the wrapped coordinates and the cell"
+            )
         charge_net_fparam = (
             fparam_node if int(getattr(self.charge_net, "numb_fparam", 0)) > 0 else None
         )
@@ -347,6 +356,11 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     )
                     potential = potential + phi_m
                     field = field + force_m
+                if efield_ext_pot is not None:
+                    # The sawtooth charge potential drives the charge
+                    # equilibration physically: the LEF's QEq-like response
+                    # to the applied field is no longer purely learned.
+                    potential = potential + xp.astype(efield_ext_pot, potential.dtype)
                 if efield_node is not None:
                     # External field enters the latent electrostatic feedback:
                     # the update sees the total field (system + applied), so
@@ -406,11 +420,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             )
         frame_energy = frame_energy * COULOMB_CONSTANT
         if efield_node is not None:
-            # Dipole-field interaction energy -E . (sum_i p_i). The charge-field
-            # potential -E . (sum_i q_i r_i) is omitted: it is not translation
-            # invariant and the model carries no absolute coordinates (geometry
-            # enters only through relative pair vectors). Its gradient, the
-            # uniform per-atom force q_i E, is added directly by the wrapper.
+            # Dipole-field interaction energy -E . (sum_i p_i).
             mu_frame = segment_sum(
                 xp.astype(p, frame_energy.dtype), frame_id, n_node.shape[0]
             )
@@ -420,6 +430,12 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
+        if efield_ext_pot is not None:
+            # Sawtooth charge-field energy sum_i q_i phi_ext(r_i), attributed
+            # per node directly (q in e, phi_ext in V, so already eV).
+            energy = energy + xp.reshape(q, (n,)) * xp.reshape(
+                xp.astype(efield_ext_pot, energy.dtype), (n,)
+            )
         if k_grid is not None:
             # The k-space energy is attributed per atom as (q phi + p . F) / 2.
             energy = energy + kspace_multipole_energy(q, p, k_grid, self.kernel)
@@ -432,11 +448,14 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "latent_charge": q,
             "latent_dipole": p,
         }
-        if efield_node is not None:
-            # Uniform field force q_i E on each real atom (translation
-            # invariant). Returned as a side output for the model wrapper to
-            # ADD to the autograd force; not a fitting output, so the wrapper
-            # pops it before the output reduction.
+        if efield_node is not None and not sawtooth:
+            # ``force_only`` mode: the uniform field force q_i E on each real
+            # atom rides as a side output for the model wrapper to ADD to the
+            # autograd-assembled force; the charge-field potential is then
+            # omitted.  In ``sawtooth`` mode the potential is part of the
+            # energy and its force contribution (explicit slope + charge
+            # relaxation) comes from differentiating the energy w.r.t. the
+            # coordinate leaf inside the model lower.
             ret["efield_force"] = (
                 xp.astype(q, efield_node.dtype) * efield_node * node_mask[:, None]
             )
@@ -529,6 +548,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         }
         if self.efield:
             data["efield"] = True
+            if self.efield_potential != "force_only":
+                data["efield_potential"] = self.efield_potential
         if self.periodic:
             data["periodic"] = True
             data["kspace_tolerance"] = self.kspace_tolerance
@@ -550,6 +571,9 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             data["charge_constraint"],
             data["use_self_pol"],
             efield=bool(data.get("efield", False)),
+            # Records without the key predate the sawtooth potential and
+            # keep the legacy force-only charge coupling.
+            efield_potential=str(data.get("efield_potential", "force_only")),
             periodic=periodic,
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),
             # A periodic record that names no mode predates the mesh and

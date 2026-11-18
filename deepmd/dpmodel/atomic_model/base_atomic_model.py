@@ -531,6 +531,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
         charge_spin: Array | None = None,
         spin: Array | None = None,
         efield: Array | None = None,
+        efield_ext_pot: Array | None = None,
         comm_dict: dict | None = None,
         topologies: dict[str, Any] | None = None,
     ) -> dict:
@@ -590,6 +591,7 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
             charge_spin=charge_spin,
             spin=spin,
             efield=efield,
+            efield_ext_pot=efield_ext_pot,
             comm_dict=comm_dict,
             **long_range_kwargs,
         )

@@ -620,3 +620,211 @@ class TestEfieldInference:
         # extra_outputs require atomic=True.
         with pytest.raises(ValueError, match="atomic=True"):
             dp.eval(coord_np, None, atype_np, extra_outputs=["latent_dipole"])
+
+
+class TestEfieldSawtooth:
+    """The sawtooth charge-field potential: conservative, periodic, labeled."""
+
+    @staticmethod
+    def _model(
+        efield_potential: str = "sawtooth", periodic: bool = False, steps: int = 2
+    ):
+        cfg = _model_config(efield=True, steps=steps)
+        cfg["long_range"]["efield_potential"] = efield_potential
+        if periodic:
+            cfg["long_range"]["periodic"] = True
+            cfg["long_range"]["k_grid_mode"] = "kgrid"
+        return get_model(cfg).to(env.DEVICE).eval()
+
+    @staticmethod
+    def _field(value, nf=1):
+        return torch.tensor(
+            [[0.0, 0.0, float(value)]] * nf, dtype=torch.float64, device=env.DEVICE
+        )
+
+    def test_conservative_finite_difference(self) -> None:
+        """Sawtooth force = autograd energy gradient + the explicit q_i E side
+        output (the potential's explicit derivative, unreachable from the
+        edge-vector leaf).
+        """
+        m = self._model()
+        coord, atype, cs = _batch()
+        fp = self._field(0.1, nf=2)
+        coord = coord.requires_grad_(True)
+        out = m(coord, atype, charge_spin=cs, fparam=fp)
+        # Finite differences of the energy match the model force.
+        eps = 1e-6
+        for f in range(2):
+            for i in range(5):
+                for d in range(3):
+                    dp = torch.zeros_like(coord)
+                    dp[f, i, d] = eps
+                    e_plus = m(coord.detach() + dp, atype, charge_spin=cs, fparam=fp)[
+                        "energy"
+                    ]
+                    e_minus = m(coord.detach() - dp, atype, charge_spin=cs, fparam=fp)[
+                        "energy"
+                    ]
+                    fd = -(e_plus - e_minus).flatten()[f] / (2 * eps)
+                    assert abs(fd.item() - out["force"][f, i, d].item()) < 1e-5, (
+                        f"frame {f} atom {i} dim {d}: FD {fd.item():.6e} vs "
+                        f"force {out['force'][f, i, d].item():.6e}"
+                    )
+
+    def test_translation_invariant_when_neutral(self) -> None:
+        """For the neutral constraint the sawtooth energy is translation invariant."""
+        m = self._model()
+        coord, atype, cs = _batch()
+        fp = self._field(0.1, nf=2)
+        shift = torch.tensor([1.3, -2.1, 0.7], dtype=torch.float64, device=env.DEVICE)
+        e0 = m(coord, atype, charge_spin=cs, fparam=fp)["energy"]
+        e1 = m(coord + shift, atype, charge_spin=cs, fparam=fp)["energy"]
+        torch.testing.assert_close(e0, e1, rtol=1e-8, atol=1e-8)
+
+    def test_response_linear_in_field(self) -> None:
+        """The sawtooth coupling is linear in E: dF(2E) = 2 dF(E)."""
+        m = self._model()
+        coord, atype, cs = _batch()
+        zero = torch.zeros((2, 3), dtype=torch.float64, device=env.DEVICE)
+        f0 = m(coord, atype, charge_spin=cs, fparam=zero)["force"]
+        # Dominated by the linear q*E term; the LEF relaxation is mildly
+        # nonlinear in the field, so judge the whole-response norm in the
+        # linear-response regime (small fields).
+        d_half = (
+            m(coord, atype, charge_spin=cs, fparam=self._field(0.05, nf=2))["force"]
+            - f0
+        )
+        d_full = (
+            m(coord, atype, charge_spin=cs, fparam=self._field(0.1, nf=2))["force"] - f0
+        )
+        rel = (d_full - 2 * d_half).norm() / (2 * d_half).norm()
+        assert rel < 0.05, rel
+
+    def test_sawtooth_energy_enters(self) -> None:
+        """With the sawtooth potential the energy responds to the field even
+        when the LEF state barely moves (direct check the term is present).
+        """
+        m = self._model(steps=1)
+        coord, atype, cs = _batch()
+        zero = torch.zeros((2, 3), dtype=torch.float64, device=env.DEVICE)
+        e0 = m(coord, atype, charge_spin=cs, fparam=zero)["energy"]
+        e1 = m(coord, atype, charge_spin=cs, fparam=self._field(0.1, nf=2))["energy"]
+        assert not torch.allclose(e0, e1)
+
+    def test_periodic_boundary_energy_jump(self) -> None:
+        """Crossing the wrap plane jumps the energy by the analytic amount."""
+        m = self._model(periodic=True)
+        L = 8.0
+        box = (torch.eye(3, dtype=torch.float64, device=env.DEVICE) * L)[None]
+        # Two atoms near the boundary, close via the minimum image.
+        coord = torch.tensor(
+            [[[2.0, 4.0, 0.05 * L], [2.0, 4.0, 0.50 * L]]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        atype = torch.tensor([[0, 1]], dtype=torch.int64, device=env.DEVICE)
+        cs = torch.tensor([[0.0, 1.0]], dtype=torch.float64, device=env.DEVICE)
+        E = 0.1
+        fp = self._field(E)
+        e_a = m(coord, atype, charge_spin=cs, fparam=fp, box=box)["energy"]
+        # Move atom 0 across the boundary: z = 0.05L -> -0.05L (wraps to 0.95L).
+        # The internal (MIC) geometry is unchanged, so the difference is purely
+        # the sawtooth term: dE = -E * q0 * (wrap(-0.05L) - wrap(0.05L)).
+        coord_b = coord.clone()
+        coord_b[0, 0, 2] = -0.05 * L
+        e_b = m(coord_b, atype, charge_spin=cs, fparam=fp, box=box)["energy"]
+        q0 = m(coord, atype, charge_spin=cs, fparam=fp, box=box)["latent_charge"][
+            0, 0, 0
+        ]
+        d_wrap = (0.95 - 0.05) * L
+        expected = -E * q0 * d_wrap
+        # The dominant term is the sawtooth quantum; the LEF state also
+        # relaxes slightly between the two configurations (q changes), which
+        # adds a small relaxation energy on top.
+        torch.testing.assert_close(
+            (e_b - e_a).flatten()[0], expected, rtol=0.05, atol=1e-3
+        )
+
+    def test_periodic_conservative_finite_difference(self) -> None:
+        """Periodic sawtooth forces are the exact energy gradient away from
+        the wrap plane (the jump itself is a physical discontinuity).
+        """
+        m = self._model(periodic=True)
+        L = 8.0
+        box = (torch.eye(3, dtype=torch.float64, device=env.DEVICE) * L)[None]
+        # Atoms well away from the wrap plane so the FD stays on a smooth
+        # branch of the sawtooth.
+        coord = torch.tensor(
+            [[[2.0, 4.0, 0.45 * L], [2.5, 4.0, 0.55 * L]]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        atype = torch.tensor([[0, 1]], dtype=torch.int64, device=env.DEVICE)
+        cs = torch.tensor([[0.0, 1.0]], dtype=torch.float64, device=env.DEVICE)
+        fp = self._field(0.1)
+        out = m(coord, atype, charge_spin=cs, fparam=fp, box=box)
+        eps = 1e-6
+        for i in range(2):
+            for d in range(3):
+                dp = torch.zeros_like(coord)
+                dp[0, i, d] = eps
+                e_plus = m(coord + dp, atype, charge_spin=cs, fparam=fp, box=box)[
+                    "energy"
+                ]
+                e_minus = m(coord - dp, atype, charge_spin=cs, fparam=fp, box=box)[
+                    "energy"
+                ]
+                fd = -(e_plus - e_minus).flatten()[0] / (2 * eps)
+                assert abs(fd.item() - out["force"][0, i, d].item()) < 1e-5, (
+                    f"atom {i} dim {d}: FD {fd.item():.6e} vs force "
+                    f"{out['force'][0, i, d].item():.6e}"
+                )
+
+    def test_serialization_round_trip(self) -> None:
+        m = self._model()
+        data = m.atomic_model.long_range.serialize()
+        assert data["efield_potential"] == "sawtooth"
+        restored = LatentMultipoleLongRangeDP.deserialize(data)
+        assert restored.efield_potential == "sawtooth"
+
+    def test_legacy_record_defaults_to_force_only(self) -> None:
+        """Records without the key predate the sawtooth potential."""
+        m = self._model(efield_potential="force_only")
+        data = m.atomic_model.long_range.serialize()
+        data.pop("efield_potential", None)
+        restored = LatentMultipoleLongRangeDP.deserialize(data)
+        assert restored.efield_potential == "force_only"
+
+    def test_compiled_model_rejects_sawtooth(self) -> None:
+        from deepmd.pt_expt.train.training import _CompiledModel
+
+        m = self._model()
+        compiled = _CompiledModel(m, structure_key=(0,))
+        compiled.train()
+        coord, atype, cs = _batch()
+        fp = self._field(0.1, nf=2)
+        with pytest.raises(NotImplementedError, match="sawtooth"):
+            compiled(coord, atype, None, charge_spin=cs, fparam=fp)
+
+    def test_sawtooth_has_no_manual_side_output(self) -> None:
+        """Sawtooth force is fully autograd (coordinate leaf); only the legacy
+        ``force_only`` coupling emits the q*E side output for the wrapper.
+        """
+        captured = {}
+        for potential, expected in (("sawtooth", False), ("force_only", True)):
+            m = self._model(efield_potential=potential)
+            plugin = m.atomic_model.long_range
+            orig = plugin.call_graph
+
+            def hook(*a, **k):
+                ret = orig(*a, **k)
+                captured["has_force"] = "efield_force" in ret
+                return ret
+
+            plugin.call_graph = hook
+            try:
+                coord, atype, cs = _batch()
+                m(coord, atype, charge_spin=cs, fparam=self._field(0.1, nf=2))
+            finally:
+                plugin.call_graph = orig
+            assert captured["has_force"] is expected, potential

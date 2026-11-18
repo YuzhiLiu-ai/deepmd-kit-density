@@ -402,6 +402,21 @@ def _model_has_efield(_model: Any) -> bool:
     return bool(has_efield is not None and has_efield())
 
 
+def _model_efield_sawtooth(_model: Any) -> bool:
+    """Whether the model's long-range plugin uses the sawtooth efield potential.
+
+    The sawtooth coupling consumes a wrapped-coordinate external potential
+    that is not threaded through the traced ABI yet (the efield kwarg or the
+    fparam transport alone is not enough), so the compiled path rejects it.
+    """
+    _am = getattr(_model, "atomic_model", None)
+    _lr = getattr(_am, "long_range", None)
+    return bool(
+        getattr(_lr, "efield", False)
+        and getattr(_lr, "efield_potential", "force_only") == "sawtooth"
+    )
+
+
 def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
     additional_data_requirement: list[DataRequirementItem] = []
     if _model.get_dim_fparam() > 0:
@@ -1322,6 +1337,15 @@ class _CompiledModel(torch.nn.Module):
                 "the external electric field (efield) is not yet supported "
                 "with enable_compile; train with enable_compile=false or run "
                 "the eager evaluation"
+            )
+        if _model_efield_sawtooth(self.original_model):
+            # The sawtooth potential adds a wrapped-coordinate external
+            # potential to the LEF/energy path; like the explicit field
+            # input, it needs a traced ABI slot that is not threaded yet.
+            raise NotImplementedError(
+                "the sawtooth efield potential (efield_potential='sawtooth') "
+                "is not yet supported with enable_compile; train with "
+                "enable_compile=false"
             )
 
         from deepmd.dpmodel.utils.nlist import (
@@ -3165,8 +3189,9 @@ class Trainer(AbstractTrainer):
 
         if not self.sharding.shards_parameters:
             # Multi-task uses only one fitting_net per step, so unused
-            # parameters exist in the graph. Single-task doesn't need this.
-            kwargs: dict[str, Any] = {"find_unused_parameters": self.multi_task}
+            # parameters exist in the graph. Latent-multipole long range with
+            # `use_self_pol: false` likewise never touches `alpha_pol`.
+            kwargs: dict[str, Any] = {"find_unused_parameters": True}
             if local_rank is not None:
                 kwargs |= {"device_ids": [local_rank], "output_device": local_rank}
             self.wrapper = torch.nn.parallel.DistributedDataParallel(

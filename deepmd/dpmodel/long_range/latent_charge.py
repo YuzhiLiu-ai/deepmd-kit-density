@@ -259,6 +259,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
         aparam: Array | None = None,
         charge_spin: Array | None = None,
         efield: Array | None = None,
+        efield_ext_pot: Array | None = None,
         descriptor_context: dict[str, Array] | None = None,
     ) -> dict[str, Array]:
         if efield is not None:
@@ -266,6 +267,11 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
                 "an external electric field (`efield`) requires the latent "
                 "electrostatic feedback of the multipole plugin; the charge-only "
                 "long-range plugin does not support it"
+            )
+        if efield_ext_pot is not None:
+            raise ValueError(
+                "the sawtooth efield potential requires the latent-multipole "
+                "plugin; the charge-only long-range plugin does not support it"
             )
         xp = array_api_compat.array_namespace(descriptor)
         n = descriptor.shape[0]

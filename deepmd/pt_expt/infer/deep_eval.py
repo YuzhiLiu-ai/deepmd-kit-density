@@ -840,6 +840,7 @@ class DeepEval(DeepEvalBackend):
                     lr_edge_vec: torch.Tensor | None = None,
                     lr_edge_mask: torch.Tensor | None = None,
                     topologies: dict | None = None,
+                    efield_coord: torch.Tensor | None = None,
                 ) -> dict[str, torch.Tensor]:
                     long_range_kwargs = {}
                     if needs_long_range_edges:
@@ -865,6 +866,7 @@ class DeepEval(DeepEvalBackend):
                         aparam=aparam,
                         charge_spin=charge_spin,
                         topologies=topologies,
+                        efield_coord=efield_coord,
                         **long_range_kwargs,
                     )
                     return _translate_energy_keys(
@@ -2661,6 +2663,24 @@ class DeepEval(DeepEvalBackend):
                 box_t,
                 atype=atype_t,
             )
+            # Sawtooth efield: pass the gauge-fixed coordinates (wrapped for
+            # periodic) so the lower rebuilds the external potential on a
+            # differentiable leaf; the .pt2 ABI does not thread this input yet.
+            _lr = getattr(atomic_model, "long_range", None)
+            if (
+                not self._is_pt2
+                and _lr is not None
+                and getattr(_lr, "efield", False)
+                and getattr(_lr, "efield_potential", "force_only") == "sawtooth"
+            ):
+                from deepmd.dpmodel.long_range.efield import build_efield_coordinate
+
+                runner_kwargs["efield_coord"] = build_efield_coordinate(
+                    coord_flat_t,
+                    n_node_t,
+                    box_t.reshape(nframes, 3, 3) if box_t is not None else None,
+                    periodic=_lr.periodic,
+                )
         if self._is_pt2:
             model_ret = self._pt2_runner(*model_inputs)
         else:

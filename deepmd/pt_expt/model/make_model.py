@@ -626,6 +626,7 @@ def make_model(
             charge_spin: torch.Tensor | None = None,
             spin: torch.Tensor | None = None,
             efield: torch.Tensor | None = None,
+            efield_coord: torch.Tensor | None = None,
             comm_dict: dict | None = None,
             topologies: dict[str, Any] | None = None,
         ) -> dict[str, torch.Tensor]:
@@ -767,6 +768,30 @@ def make_model(
             # An external field adds a non-autograd force correction (q_i E) in
             # the autograd lower below, which the fused custom-op pipeline does
             # not assemble -- so a field request bypasses the fused path.
+            # Sawtooth efield: rebuild the external potential INSIDE the
+            # lower from a gauge-fixed coordinate leaf, so the sawtooth force
+            # (explicit slope + charge relaxation) is autograd-exact.  A
+            # potential computed outside would be a constant on the
+            # edge-vector leaf and its force would be lost.
+            ext_pot_leaf = None
+            efield_ext_pot = None
+            if efield_coord is not None:
+                _lr = getattr(self.atomic_model, "long_range", None)
+                if _lr is not None and getattr(_lr, "efield", False):
+                    from deepmd.dpmodel.long_range.efield import (
+                        efield_potential_from_coordinate,
+                        resolve_efield_frame,
+                    )
+
+                    _efield_frame = resolve_efield_frame(True, efield, fparam)
+                    if _efield_frame is not None:
+                        ext_pot_leaf = efield_coord.detach().requires_grad_(True)
+                        efield_ext_pot = efield_potential_from_coordinate(
+                            ext_pot_leaf,
+                            n_node,
+                            _efield_frame,
+                            center=not _lr.periodic,
+                        )
             if not self.training and efield is None and fused_energy_force_enabled():
                 fused = _fused_energy_force_graph(
                     self, graph, atype, do_atomic_virial, spin
@@ -781,12 +806,14 @@ def make_model(
                 charge_spin=charge_spin,
                 spin=spin,
                 efield=efield,
+                efield_ext_pot=efield_ext_pot,
                 comm_dict=comm_dict,
                 topologies=topologies,
             )
-            # Uniform-field force q_i E rides as a side output (not a fitting
-            # output): keep it out of the output reduction and add it to the
-            # autograd-assembled force below.
+            # Uniform-field force q_i E rides as a side output (the explicit
+            # derivative of the external potential; the relaxation part comes
+            # from the autograd energy in the sawtooth coupling).  The wrapper
+            # adds it to the autograd-assembled force below.
             efield_force = atomic_ret.pop("efield_force", None)
             # ``forward_common_atomic_graph`` returns flat ``(N, *)`` output.
             # Pass directly to the flat-N transform; no rectangular reshape needed.
@@ -815,6 +842,21 @@ def make_model(
                 model_predict["energy_derv_r"] = force + efield_force.reshape(
                     force.shape
                 )
+            if ext_pot_leaf is not None and "energy_derv_r" in model_predict:
+                # Sawtooth force from the coordinate leaf: the explicit ramp
+                # slope AND the charge-relaxation path, both exact.  The
+                # gradient is dE/dr; energy_derv_r carries the force
+                # convention (-dE/dr), hence the negation.  In training the
+                # gradient keeps its graph for the force loss.
+                coord_grad = torch.autograd.grad(
+                    model_predict["energy_redu"].sum(),
+                    ext_pot_leaf,
+                    retain_graph=True,
+                    create_graph=self.training,
+                )[0]
+                model_predict["energy_derv_r"] = model_predict[
+                    "energy_derv_r"
+                ] - coord_grad.reshape(model_predict["energy_derv_r"].shape)
             return model_predict
 
         def _resolve_graph_method(
@@ -955,6 +997,7 @@ def make_model(
                 atype=atype,
                 pair_excl=pair_excl,
             )
+            efield_coord = self._efield_coordinate(coord, graph.n_node, box)
             predict = self.forward_common_lower_graph(
                 atype,
                 graph.n_node,
@@ -973,6 +1016,7 @@ def make_model(
                 charge_spin=charge_spin,
                 spin=spin,
                 efield=efield,
+                efield_coord=efield_coord,
                 topologies=topologies,
             )
             # The per-atom mask a rectangular batch carries is what tells the
@@ -980,6 +1024,35 @@ def make_model(
             # counts are stated outright instead.
             predict["n_node"] = graph.n_node
             return predict
+
+        def _efield_coordinate(
+            self,
+            coord_flat: torch.Tensor,
+            n_node: torch.Tensor,
+            box: torch.Tensor | None,
+        ) -> torch.Tensor | None:
+            """Gauge-fixed coordinates for a sawtooth efield plugin.
+
+            Built eagerly from the coordinates and the cell (the periodic case
+            wraps the coordinates into the orthorhombic cell first, where the
+            wrap discontinuity IS the physical sawtooth jump); ``None`` when
+            the plugin does not use the sawtooth coupling.  The model lower
+            rebuilds the external potential from these coordinates on a
+            differentiable leaf.  See
+            :func:`deepmd.dpmodel.long_range.efield.build_efield_coordinate`.
+            """
+            lr = getattr(self.atomic_model, "long_range", None)
+            if (
+                lr is None
+                or not getattr(lr, "efield", False)
+                or getattr(lr, "efield_potential", "force_only") != "sawtooth"
+            ):
+                return None
+            from deepmd.dpmodel.long_range.efield import build_efield_coordinate
+
+            return build_efield_coordinate(
+                coord_flat, n_node, box, periodic=lr.periodic
+            )
 
         def _call_common_graph(
             self,
@@ -1086,6 +1159,9 @@ def make_model(
                 atype=atype_flat,
                 pair_excl=pair_excl,
             )
+            efield_coord = self._efield_coordinate(
+                cc.reshape(-1, 3)[node_index], ng.n_node, bb
+            )
             model_predict = self.forward_common_lower_graph(
                 atype_flat,
                 ng.n_node,
@@ -1104,6 +1180,7 @@ def make_model(
                 spin=spin_flat,
                 charge_spin=charge_spin,
                 efield=efield,
+                efield_coord=efield_coord,
                 topologies=topologies,
             )
             # ``forward_common_lower_graph`` returns flat ``(N, *)`` per-atom
