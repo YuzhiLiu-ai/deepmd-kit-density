@@ -270,7 +270,7 @@ class LatentChargeLongRange(NativeOP, BaseLongRange):
             )
         if efield_ext_pot is not None:
             raise ValueError(
-                "the sawtooth efield potential requires the latent-multipole "
+                "the 'branch' efield potential requires the latent-multipole "
                 "plugin; the charge-only long-range plugin does not support it"
             )
         xp = array_api_compat.array_namespace(descriptor)

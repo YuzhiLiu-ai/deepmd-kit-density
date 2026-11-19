@@ -1,29 +1,31 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """External-field helpers for the long-range plugins.
 
-The physical coupling of a uniform applied field to the latent charges is
-the sawtooth (Umari--Pasquarello) potential: inside the cell it is a plain
-ramp ``phi_ext(r) = -E . r`` and it jumps by the polarization quantum
-``-E . L`` at the cell boundary, so it is periodic.  With coordinates
-wrapped into the cell the ramp is just the wrapped coordinate itself; the
-jump is implicit at the wrap plane and contributes no force (the ramp's
-slope is the uniform field everywhere).
+The physical coupling of a uniform applied field follows the modern
+(Berry-phase) theory of polarization in its classical limit: the field
+enters the enthalpy through the cell dipole on a CONTINUOUS branch,
 
-The potential is computed INSIDE the model lower from a coordinate leaf so
-that the sawtooth force is autograd-exact (the charge-relaxation path
-``sum_i phi_ext d q_i / d r`` is only visible when ``phi_ext`` is a
-differentiable function of the geometry).  The caller therefore passes
-GAUGE-FIXED coordinates:
+    U_field = -E . (sum_i q_i r_i + sum_i p_i),
 
-- non-periodic: per-frame mean-subtracted coordinates (the mean drops out
-  of the energy for the neutral charge constraint, and the subtraction
-  makes the coupling exactly translation invariant);
-- periodic: coordinates wrapped into the (orthorhombic) cell, where the
-  wrap discontinuity IS the physical sawtooth jump.
+with the coordinates taken UNWRAPPED -- no cell wrapping anywhere in the
+field path.  This is the classical counterpart of the Berry-phase
+finite-field functional ``F(E) = E_0 - Omega E . P`` used by CP2K's
+``PERIODIC_EFIELD`` (which is a Berry-phase implementation, not a
+sawtooth potential).  Keeping the branch continuous makes the field
+response conservative across cell crossings: translating an atom or a
+whole neutral molecule by a lattice vector changes ``U_field``
+continuously, and the force stays the uniform ``q_i E`` everywhere --
+no sawtooth discontinuity, no polarization-quantum bookkeeping in the
+dynamics, and no artificial dipoles when a neutral molecule straddles
+the cell edge (per-atom wrapping would create ``-q_i E L`` energy
+spikes for partial crossings).
 
-For non-periodic neutral frames this is the pair-vector identity
-``sum_i q_i r_i = (1/N) sum_{i<k} (q_i - q_k)(r_i - r_k)`` evaluated in the
-centered frame.
+For a neutral frame (``sum q = 0``, enforced by the charge constraint)
+the total is invariant under a global translation; for a charged frame
+the coupling is the physical origin-dependent dipole term.  Only the
+LEF's charge-equilibration input is gauge-fixed (per-frame mean
+removed): a constant potential shift does not change the QEq driving,
+and the small values keep the update net responsive.
 """
 
 from typing import (
@@ -38,7 +40,29 @@ from deepmd.dpmodel.utils.neighbor_graph import (
 )
 
 #: Modes for the charge-field coupling of ``latent_multipole``.
-EFIELD_POTENTIAL_MODES = ("force_only", "sawtooth")
+#: "branch" couples the field through the charge potential on the
+#: continuous polarization branch; "force_only" is the legacy coupling
+#: that only adds the uniform force q_i E.
+EFIELD_POTENTIAL_MODES = ("force_only", "branch")
+
+
+def normalize_efield_potential(mode: str) -> str:
+    """Map deprecated mode names to their modern spelling.
+
+    "sawtooth" was the original name of the potential coupling, when the
+    coordinates were still wrapped into the cell (Umari-Pasquarello
+    sawtooth).  The physics is now the continuous polarization branch on
+    unwrapped coordinates; the old name remains accepted for backward
+    compatibility of serialized records and configs.
+    """
+    if mode == "sawtooth":
+        return "branch"
+    return mode
+
+
+def uses_efield_potential(mode: str) -> bool:
+    """Whether the mode couples the field through the charge potential."""
+    return normalize_efield_potential(mode) == "branch"
 
 
 def resolve_efield_frame(efield_flag: bool, efield: Any, fparam: Any) -> Any:
@@ -62,91 +86,32 @@ def resolve_efield_frame(efield_flag: bool, efield: Any, fparam: Any) -> Any:
     return None
 
 
-def build_efield_coordinate(
-    coord: Any,
-    n_node: Any,
-    box: Any,
-    *,
-    periodic: bool,
-) -> Any:
-    """Gauge-fixed coordinates for the sawtooth potential.
+def efield_potential_from_coordinate(coord: Any, n_node: Any, efield_frame: Any) -> Any:
+    """Charge-field potential ``phi_ext = -E . coord`` per node, ``(N, 1)``.
 
-    Parameters
-    ----------
-    coord
-        Node coordinates with shape ``(N, 3)``, frame-major over ``n_node``.
-    n_node
-        Per-frame node counts with shape ``(nf,)``.
-    box
-        Simulation cells with shape ``(nf, 3, 3)`` (rows are the lattice
-        vectors), or ``None`` for non-periodic frames.
-    periodic
-        Whether the frames are periodic (wrap into the cell) or isolated
-        (subtract the per-frame centroid).
-
-    Returns
-    -------
-    Array
-        The gauge-fixed coordinates with shape ``(N, 3)``.
-    """
-    import numpy as np
-
-    xp = array_api_compat.array_namespace(coord)
-    frame_id = frame_id_from_n_node(n_node, n_total=coord.shape[0])
-    if periodic:
-        if box is None:
-            raise ValueError(
-                "the sawtooth efield potential requires the simulation cell"
-            )
-        # Orthorhombicity gate on the host array (a validation, not part of
-        # the differentiable graph): the jump plane must be perpendicular to
-        # a lattice vector.
-        box_np = np.asarray(
-            box.detach().cpu() if hasattr(box, "detach") else box
-        ).reshape(-1, 3, 3)
-        if float(np.max(np.abs(box_np * (1.0 - np.eye(3))))) > 1e-8:
-            raise NotImplementedError(
-                "the sawtooth efield potential requires an orthorhombic cell: "
-                "the jump plane must be perpendicular to a lattice vector; "
-                "general triclinic cells are not supported"
-            )
-        length = xp.reshape(box, (box.shape[0], 9))[:, ::4]
-        bcast = xp.reshape(xp.take(length, frame_id, axis=0), (coord.shape[0], 3))
-        # The wrap discontinuity IS the physical sawtooth jump; its Jacobian
-        # is the identity almost everywhere (the floor is piecewise constant),
-        # so no further gauge fixing is applied here.
-        return coord - xp.floor(coord / bcast) * bcast
-    # Non-periodic: raw coordinates.  The per-frame centroid is subtracted
-    # INSIDE the model lower (on the differentiable leaf) -- doing it here on
-    # the data would hide the centroid's Jacobian (I - 1/N) from the force.
-    return coord
-
-
-def efield_potential_from_coordinate(
-    coord: Any,
-    n_node: Any,
-    efield_frame: Any,
-    *,
-    center: bool,
-) -> Any:
-    """Sawtooth potential ``phi_ext = -E . coord`` per node, shape ``(N, 1)``.
-
-    ``coord`` must be the gauge-fixed coordinates from
-    :func:`build_efield_coordinate` (wrapped for periodic).  With
-    ``center=True`` (non-periodic) the per-frame centroid is subtracted ON
-    THE GRAPH, which makes the coupling exactly translation invariant and
-    keeps the centroid's Jacobian inside the autograd force.  ``phi_ext`` in
-    volts times a charge in electrons is an energy in eV.
+    ``coord`` is the coordinates AS PROVIDED (unwrapped, any branch --
+    for the neutral constraint the energy is branch-independent, and a
+    global translation only shifts it by ``-E . t * Q``).  ``phi_ext``
+    in volts times a charge in electrons is an energy in eV.
     """
     xp = array_api_compat.array_namespace(coord)
     frame_id = frame_id_from_n_node(n_node, n_total=coord.shape[0])
-    if center:
-        centroid = (
-            segment_sum(coord, frame_id, n_node.shape[0])
-            / xp.astype(n_node, coord.dtype)[:, None]
-        )
-        coord = coord - xp.take(centroid, frame_id, axis=0)
     field_node = xp.take(efield_frame, frame_id, axis=0)
     return -xp.sum(
         xp.astype(coord, efield_frame.dtype) * field_node, axis=-1, keepdims=True
     )
+
+
+def center_efield_potential(potential: Any, frame_id: Any, n_node: Any, xp: Any) -> Any:
+    """Per-frame gauge fixing for the LEF input: remove the frame mean.
+
+    A constant potential shift does not change the QEq driving (only
+    differences matter), and the smaller values keep the update net
+    responsive.  The ENERGY term uses the uncentered potential, so this
+    is purely an input-conditioning choice.
+    """
+    n_total = potential.shape[0]
+    mean = segment_sum(
+        xp.reshape(potential, (n_total,)), frame_id, n_node.shape[0]
+    ) / xp.astype(n_node, potential.dtype)
+    return potential - xp.reshape(xp.take(mean, frame_id, axis=0), (n_total, 1))

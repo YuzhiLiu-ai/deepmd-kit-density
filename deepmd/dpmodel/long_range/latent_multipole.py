@@ -21,7 +21,10 @@ from deepmd.utils.version import check_version_compatibility
 from .base_long_range import BaseLongRange
 from .efield import (
     EFIELD_POTENTIAL_MODES,
+    center_efield_potential,
+    normalize_efield_potential,
     resolve_efield_frame,
+    uses_efield_potential,
 )
 from .kernel import COULOMB_CONSTANT, BaseInteractionKernel
 from .latent_charge import (
@@ -92,6 +95,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         )
         self.use_self_pol = bool(use_self_pol)
         self.efield = bool(efield)
+        efield_potential = normalize_efield_potential(str(efield_potential))
         if efield_potential not in EFIELD_POTENTIAL_MODES:
             raise ValueError(
                 f"`efield_potential` must be one of {EFIELD_POTENTIAL_MODES}, "
@@ -260,12 +264,12 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         efield_node = (
             None if efield_frame is None else xp.take(efield_frame, frame_id, axis=0)
         )
-        sawtooth = self.efield_potential == "sawtooth"
-        if sawtooth and efield_node is not None and efield_ext_pot is None:
+        branch_mode = uses_efield_potential(self.efield_potential)
+        if branch_mode and efield_node is not None and efield_ext_pot is None:
             raise ValueError(
-                "the sawtooth efield potential requires the wrapped-coordinate "
-                "external potential (`efield_ext_pot`), which is built by the "
-                "model wrapper from the wrapped coordinates and the cell"
+                "the 'branch' charge-field potential requires the coordinate "
+                "potential input (`efield_ext_pot`), which the model wrapper "
+                "builds from the as-provided coordinates"
             )
         charge_net_fparam = (
             fparam_node if int(getattr(self.charge_net, "numb_fparam", 0)) > 0 else None
@@ -292,6 +296,14 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         kernel, a_coeff, c_coeff = self._radial_coefficients(r_sq, src, n)
 
         if self.charge_net.lr_update_steps > 0:
+            # The LEF's QEq input uses the gauge-fixed potential (frame mean
+            # removed): a constant shift does not change the driving, and the
+            # energy term below consumes the uncentered potential directly.
+            efield_pot_lef = (
+                None
+                if efield_ext_pot is None
+                else center_efield_potential(efield_ext_pot, frame_id, n_node, xp)
+            )
             update_dtype = get_xp_precision(xp, self.charge_net.precision)
             q = xp.astype(q, update_dtype)
             p = xp.astype(p, update_dtype)
@@ -356,11 +368,11 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
                     )
                     potential = potential + phi_m
                     field = field + force_m
-                if efield_ext_pot is not None:
-                    # The sawtooth charge potential drives the charge
+                if efield_pot_lef is not None:
+                    # The external potential drives the charge
                     # equilibration physically: the LEF's QEq-like response
                     # to the applied field is no longer purely learned.
-                    potential = potential + xp.astype(efield_ext_pot, potential.dtype)
+                    potential = potential + xp.astype(efield_pot_lef, potential.dtype)
                 if efield_node is not None:
                     # External field enters the latent electrostatic feedback:
                     # the update sees the total field (system + applied), so
@@ -431,8 +443,9 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
         if efield_ext_pot is not None:
-            # Sawtooth charge-field energy sum_i q_i phi_ext(r_i), attributed
-            # per node directly (q in e, phi_ext in V, so already eV).
+            # Charge-field energy sum_i q_i phi_ext(r_i) on the continuous
+            # polarization branch, attributed per node directly (q in e,
+            # phi_ext in V, so already eV).
             energy = energy + xp.reshape(q, (n,)) * xp.reshape(
                 xp.astype(efield_ext_pot, energy.dtype), (n,)
             )
@@ -448,11 +461,11 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "latent_charge": q,
             "latent_dipole": p,
         }
-        if efield_node is not None and not sawtooth:
+        if efield_node is not None and not branch_mode:
             # ``force_only`` mode: the uniform field force q_i E on each real
             # atom rides as a side output for the model wrapper to ADD to the
             # autograd-assembled force; the charge-field potential is then
-            # omitted.  In ``sawtooth`` mode the potential is part of the
+            # omitted.  In ``branch`` mode the potential is part of the
             # energy and its force contribution (explicit slope + charge
             # relaxation) comes from differentiating the energy w.r.t. the
             # coordinate leaf inside the model lower.
@@ -571,8 +584,8 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             data["charge_constraint"],
             data["use_self_pol"],
             efield=bool(data.get("efield", False)),
-            # Records without the key predate the sawtooth potential and
-            # keep the legacy force-only charge coupling.
+            # Records without the key predate the charge-potential coupling
+            # and keep the legacy force-only charge coupling.
             efield_potential=str(data.get("efield_potential", "force_only")),
             periodic=periodic,
             kspace_tolerance=data.get("kspace_tolerance", 1e-8),

@@ -4146,17 +4146,20 @@ def long_range_latent_multipole() -> list[Argument]:
             "efield_potential",
             str,
             optional=True,
-            default="sawtooth",
-            doc="Charge-field coupling for `efield: true` models. 'sawtooth' "
-            "(default) adds the Umari-Pasquarello sawtooth potential "
-            "`sum_i q_i phi_ext(r_i)` with `phi_ext = -E . r` on coordinates "
-            "wrapped into the (orthorhombic) cell: conservative forces, the "
-            "LEF charge equilibration sees the applied potential, and the "
-            "energy matches the periodic DFT labels. It requires the eager "
-            "path (compiled training/eval raises). 'force_only' is the "
-            "legacy coupling: the uniform force q_i E is added directly and "
-            "the charge-field potential is omitted. Records without this "
-            "key always read as 'force_only'.",
+            default="branch",
+            doc="Charge-field coupling for `efield: true` models. 'branch' "
+            "(default) adds the charge-field potential "
+            "`sum_i q_i phi_ext(r_i)` with `phi_ext = -E . r` on the "
+            "coordinates AS PROVIDED (unwrapped, no cell wrapping) -- the "
+            "continuous polarization branch, the classical counterpart of "
+            "the Berry-phase finite-field functional: conservative forces, "
+            "the LEF charge equilibration sees the applied potential, and "
+            "the energy is continuous across cell crossings (for a neutral "
+            "frame it is invariant under a global translation). 'sawtooth' "
+            "is accepted as a deprecated alias for 'branch'. 'force_only' "
+            "is the legacy coupling: the uniform force q_i E is added "
+            "directly and the charge-field potential is omitted. Records "
+            "without this key always read as 'force_only'.",
         ),
         Argument("lr_update_steps", int, optional=True, default=0),
         Argument(

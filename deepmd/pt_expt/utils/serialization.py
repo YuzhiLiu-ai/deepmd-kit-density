@@ -681,17 +681,10 @@ def build_synthetic_graph_inputs(
         charge_spin,
     )
     if want_efield_coord:
-        # Sawtooth efield ABI: the gauge-fixed coordinates ride as the last
-        # conditioning input, (N, 3) on the flat node axis (like aparam).
-        from deepmd.dpmodel.long_range.efield import build_efield_coordinate
-
-        _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
-        _periodic = bool(getattr(_lr, "periodic", False))
-        _box = box_t.reshape(nframes, 3, 3) if _periodic else None
-        coord_ec = build_efield_coordinate(
-            coord_t.reshape(-1, 3), graph.n_node, _box, periodic=_periodic
-        )
-        inputs = (*inputs, coord_ec)
+        # Continuous-polarization-branch efield ABI: the coordinates ride as
+        # the last conditioning input, (N, 3) on the flat node axis (like
+        # aparam), unwrapped and cell-free.
+        inputs = (*inputs, coord_t.reshape(-1, 3))
     return inputs
 
 
@@ -2237,10 +2230,14 @@ def _trace_and_export_impl(
                 if metadata["graph_edge_dtype"] == "float32"
                 else torch.float64
             )
+            from deepmd.dpmodel.long_range.efield import uses_efield_potential
+
             _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
             _want_ec = bool(
                 getattr(_lr, "efield", False)
-                and getattr(_lr, "efield_potential", "force_only") == "sawtooth"
+                and uses_efield_potential(
+                    getattr(_lr, "efield_potential", "force_only")
+                )
             )
             sample_inputs = build_synthetic_graph_inputs(
                 model,

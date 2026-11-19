@@ -769,7 +769,7 @@ def make_model(
             # the autograd lower below, which the fused custom-op pipeline does
             # not assemble -- so a field request bypasses the fused path.
             # Sawtooth efield: rebuild the external potential INSIDE the
-            # lower from a gauge-fixed coordinate leaf, so the sawtooth force
+            # lower from an as-provided coordinate leaf, so the branch force
             # (explicit slope + charge relaxation) is autograd-exact.  A
             # potential computed outside would be a constant on the
             # edge-vector leaf and its force would be lost.
@@ -787,10 +787,7 @@ def make_model(
                     if _efield_frame is not None:
                         ext_pot_leaf = efield_coord.detach().requires_grad_(True)
                         efield_ext_pot = efield_potential_from_coordinate(
-                            ext_pot_leaf,
-                            n_node,
-                            _efield_frame,
-                            center=not _lr.periodic,
+                            ext_pot_leaf, n_node, _efield_frame
                         )
             if not self.training and efield is None and fused_energy_force_enabled():
                 fused = _fused_energy_force_graph(
@@ -812,7 +809,7 @@ def make_model(
             )
             # Uniform-field force q_i E rides as a side output (the explicit
             # derivative of the external potential; the relaxation part comes
-            # from the autograd energy in the sawtooth coupling).  The wrapper
+            # from the autograd energy in the branch coupling).  The wrapper
             # adds it to the autograd-assembled force below.
             efield_force = atomic_ret.pop("efield_force", None)
             # ``forward_common_atomic_graph`` returns flat ``(N, *)`` output.
@@ -997,7 +994,7 @@ def make_model(
                 atype=atype,
                 pair_excl=pair_excl,
             )
-            efield_coord = self._efield_coordinate(coord, graph.n_node, box)
+            efield_coord = self._efield_coordinate(coord)
             predict = self.forward_common_lower_graph(
                 atype,
                 graph.n_node,
@@ -1028,31 +1025,27 @@ def make_model(
         def _efield_coordinate(
             self,
             coord_flat: torch.Tensor,
-            n_node: torch.Tensor,
-            box: torch.Tensor | None,
         ) -> torch.Tensor | None:
-            """Gauge-fixed coordinates for a sawtooth efield plugin.
+            """As-provided coordinates for a 'branch' efield plugin.
 
-            Built eagerly from the coordinates and the cell (the periodic case
-            wraps the coordinates into the orthorhombic cell first, where the
-            wrap discontinuity IS the physical sawtooth jump); ``None`` when
-            the plugin does not use the sawtooth coupling.  The model lower
-            rebuilds the external potential from these coordinates on a
-            differentiable leaf.  See
-            :func:`deepmd.dpmodel.long_range.efield.build_efield_coordinate`.
+            The continuous polarization branch consumes the coordinates as
+            given (unwrapped, no cell); the model lower rebuilds the external
+            potential from them on a differentiable leaf.  ``None`` when the
+            plugin does not use the potential coupling.  See
+            :func:`deepmd.dpmodel.long_range.efield.efield_potential_from_coordinate`.
             """
+            from deepmd.dpmodel.long_range.efield import uses_efield_potential
+
             lr = getattr(self.atomic_model, "long_range", None)
             if (
                 lr is None
                 or not getattr(lr, "efield", False)
-                or getattr(lr, "efield_potential", "force_only") != "sawtooth"
+                or not uses_efield_potential(
+                    getattr(lr, "efield_potential", "force_only")
+                )
             ):
                 return None
-            from deepmd.dpmodel.long_range.efield import build_efield_coordinate
-
-            return build_efield_coordinate(
-                coord_flat, n_node, box, periodic=lr.periodic
-            )
+            return coord_flat
 
         def _call_common_graph(
             self,
@@ -1159,9 +1152,7 @@ def make_model(
                 atype=atype_flat,
                 pair_excl=pair_excl,
             )
-            efield_coord = self._efield_coordinate(
-                cc.reshape(-1, 3)[node_index], ng.n_node, bb
-            )
+            efield_coord = self._efield_coordinate(cc.reshape(-1, 3)[node_index])
             model_predict = self.forward_common_lower_graph(
                 atype_flat,
                 ng.n_node,

@@ -402,18 +402,19 @@ def _model_has_efield(_model: Any) -> bool:
     return bool(has_efield is not None and has_efield())
 
 
-def _model_efield_sawtooth(_model: Any) -> bool:
-    """Whether the model's long-range plugin uses the sawtooth efield potential.
+def _model_efield_branch(_model: Any) -> bool:
+    """Whether the model's long-range plugin uses the branch efield potential.
 
-    The sawtooth coupling consumes a wrapped-coordinate external potential
-    that is not threaded through the traced ABI yet (the efield kwarg or the
-    fparam transport alone is not enough), so the compiled path rejects it.
+    The branch coupling consumes the as-provided (unwrapped) coordinates as
+    an extra traced input, so the compiled path threads them explicitly.
     """
+    from deepmd.dpmodel.long_range.efield import uses_efield_potential
+
     _am = getattr(_model, "atomic_model", None)
     _lr = getattr(_am, "long_range", None)
     return bool(
         getattr(_lr, "efield", False)
-        and getattr(_lr, "efield_potential", "force_only") == "sawtooth"
+        and uses_efield_potential(getattr(_lr, "efield_potential", "force_only"))
     )
 
 
@@ -944,7 +945,7 @@ def _trace_and_compile_graph(
         want_aparam=aparam is not None,
         want_charge_spin=charge_spin is not None,
         want_spin=spin is not None,
-        want_efield_coord=_model_efield_sawtooth(model),
+        want_efield_coord=_model_efield_branch(model),
         canonicalize=False,
     )
     (
@@ -1829,19 +1830,13 @@ class _CompiledModel(torch.nn.Module):
             atype=atype_flat,
             pair_excl=pair_excl,
         )
-        # Sawtooth efield: the gauge-fixed coordinates ride as an extra
-        # conditioning input (always a tensor for such models, so the traced
-        # branch is stable across batches, including zero-field ones).
+        # Continuous-polarization-branch efield: the coordinates ride as an
+        # extra conditioning input (always a tensor for such models, so the
+        # traced branch is stable across batches, including zero-field ones).
         efield_coord = None
-        if _model_efield_sawtooth(_model):
-            from deepmd.dpmodel.long_range.efield import build_efield_coordinate
-
-            _lr = _model.atomic_model.long_range
-            efield_coord = build_efield_coordinate(
-                coord_3d if ragged else coord_3d.reshape(n_padded, 3)[node_index],
-                ng.n_node,
-                None if box_flat is None else box_flat.reshape(nframes, 3, 3),
-                periodic=_lr.periodic,
+        if _model_efield_branch(_model):
+            efield_coord = (
+                coord_3d if ragged else coord_3d.reshape(n_padded, 3)[node_index]
             )
 
         # Lazy compile of the GRAPH lower (cached per structure key and mode).
