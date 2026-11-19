@@ -15,18 +15,19 @@ class LatentMultipoleFitting(LatentMultipoleFittingDP):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        value = self.alpha_pol
+        value = self.pol_stiffness
         if not isinstance(value, torch.nn.Parameter):
             tensor = (
                 value.detach().clone()
                 if isinstance(value, torch.Tensor)
                 else torch.as_tensor(value)
             )
-            if "alpha_pol" in self._buffers:
-                del self._buffers["alpha_pol"]
+            if "pol_stiffness" in self._buffers:
+                del self._buffers["pol_stiffness"]
             trainable = self.trainable
             if isinstance(trainable, list):
                 trainable = all(trainable)
             self.register_parameter(
-                "alpha_pol", torch.nn.Parameter(tensor, requires_grad=bool(trainable))
+                "pol_stiffness",
+                torch.nn.Parameter(tensor, requires_grad=bool(trainable)),
             )

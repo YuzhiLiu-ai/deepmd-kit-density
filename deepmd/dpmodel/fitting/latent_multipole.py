@@ -49,6 +49,7 @@ class LatentMultipoleFitting(LatentChargeFitting):
         *args: Any,
         use_glu: bool = True,
         embedding_width: int = 0,
+        pol_stiffness: float | list[float] | None = None,
         alpha_pol: float | list[float] | None = None,
         lr_update_steps: int = 0,
         lr_update_neuron: list[int] | None = None,
@@ -142,21 +143,41 @@ class LatentMultipoleFitting(LatentChargeFitting):
             )
         else:
             self.polar_update_net = None
-        if alpha_pol is None:
-            alpha_pol_array = np.ones(self.ntypes, dtype=self.prec)
-        else:
+        # Self-polarization stiffness, stored as the raw per-type parameter
+        # theta whose SQUARE is the dipole spring constant:
+        # U_self = 0.5 * theta^2 * |p|^2.  Multiplication only -- no division
+        # by a trainable quantity anywhere in the energy graph (the legacy
+        # polarizability form |p|^2 / (2 alpha^2) is exactly recovered with
+        # theta = 1 / alpha, and is kept as a load-time conversion path).
+        if pol_stiffness is not None and alpha_pol is not None:
+            raise ValueError(
+                "`pol_stiffness` and the legacy `alpha_pol` are mutually "
+                "exclusive ways to set the self-polarization stiffness"
+            )
+        if pol_stiffness is None and alpha_pol is not None:
             alpha_pol_array = np.asarray(alpha_pol, dtype=self.prec).reshape(-1)
-            if alpha_pol_array.size == 1:
-                alpha_pol_array = np.full(
-                    self.ntypes, alpha_pol_array[0], dtype=self.prec
+            if not np.all(np.isfinite(alpha_pol_array)) or np.any(
+                alpha_pol_array <= 0.0
+            ):
+                raise ValueError("legacy `alpha_pol` must be finite and positive")
+            # theta = 1 / alpha keeps 0.5 * theta^2 * |p|^2 == |p|^2 / (2 alpha^2)
+            # (the conversion happens once, outside the energy graph).
+            pol_stiffness = (1.0 / alpha_pol_array).tolist()
+        if pol_stiffness is None:
+            stiffness_array = np.ones(self.ntypes, dtype=self.prec)
+        else:
+            stiffness_array = np.asarray(pol_stiffness, dtype=self.prec).reshape(-1)
+            if stiffness_array.size == 1:
+                stiffness_array = np.full(
+                    self.ntypes, stiffness_array[0], dtype=self.prec
                 )
-            if alpha_pol_array.size != self.ntypes:
+            if stiffness_array.size != self.ntypes:
                 raise ValueError(
-                    "`alpha_pol` must be scalar or have one value per type"
+                    "`pol_stiffness` must be scalar or have one value per type"
                 )
-        if not np.all(np.isfinite(alpha_pol_array)) or np.any(alpha_pol_array <= 0.0):
-            raise ValueError("`alpha_pol` must contain finite positive values")
-        self.alpha_pol = alpha_pol_array
+        if not np.all(np.isfinite(stiffness_array)):
+            raise ValueError("`pol_stiffness` must contain finite values")
+        self.pol_stiffness = stiffness_array
 
     def _parameter_array(self, name: str, like: Any) -> Any:
         """Return a parameter in the input namespace without detaching autograd."""
@@ -305,16 +326,18 @@ class LatentMultipoleFitting(LatentChargeFitting):
 
         assert self.type_map is not None
         remap_index, has_new_type = get_index_between_two_maps(self.type_map, type_map)
-        xp = array_api_compat.array_namespace(self.alpha_pol)
-        alpha_pol = self.alpha_pol
+        xp = array_api_compat.array_namespace(self.pol_stiffness)
+        pol_stiffness = self.pol_stiffness
         if has_new_type:
             extended = xp.ones(
                 (len(type_map),),
-                dtype=alpha_pol.dtype,
-                device=array_api_compat.device(alpha_pol),
+                dtype=pol_stiffness.dtype,
+                device=array_api_compat.device(pol_stiffness),
             )
-            alpha_pol = xp.concat([alpha_pol, extended[len(self.ntypes) :]], axis=0)
-        self.alpha_pol = alpha_pol[remap_index]
+            pol_stiffness = xp.concat(
+                [pol_stiffness, extended[len(self.ntypes) :]], axis=0
+            )
+        self.pol_stiffness = pol_stiffness[remap_index]
         super().change_type_map(type_map, model_with_new_type_stat)
 
     def serialize(self) -> dict:
@@ -344,16 +367,20 @@ class LatentMultipoleFitting(LatentChargeFitting):
                 ),
             }
         )
-        data["@variables"]["alpha_pol"] = to_numpy_array(self.alpha_pol)
+        data["@variables"]["pol_stiffness"] = to_numpy_array(self.pol_stiffness)
         return data
 
     @classmethod
     def deserialize(cls, data: dict) -> "LatentMultipoleFitting":
         data = data.copy()
         variables = data["@variables"].copy()
+        pol_stiffness = variables.pop("pol_stiffness", None)
         alpha_pol = variables.pop("alpha_pol", None)
         data["@variables"] = variables
-        if alpha_pol is not None:
+        if pol_stiffness is not None:
+            data["pol_stiffness"] = np.asarray(pol_stiffness).reshape(-1).tolist()
+        elif alpha_pol is not None:
+            # Legacy records store the polarizability; convert at load time.
             data["alpha_pol"] = np.asarray(alpha_pol).reshape(-1).tolist()
         dipole_weight_net = data.pop("dipole_weight_net", None)
         dipole_proj = data.pop("dipole_proj", None)

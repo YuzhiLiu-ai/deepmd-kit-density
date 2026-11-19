@@ -103,16 +103,16 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             )
         self.efield_potential = str(efield_potential)
         if not self.use_self_pol:
-            # alpha_pol is only consumed by the self-polarization energy; with
+            # pol_stiffness is only consumed by the self-polarization energy; with
             # use_self_pol=False it stays a registered trainable tensor that
             # no forward reads, which breaks DDP reduction ("parameters that
             # were not used in producing loss").  Freeze it instead -- it
             # remains a parameter in the state dict, so serialization and
             # checkpoints are unchanged.  Backends without autograd
             # parameters (numpy) skip the duck-typed call.
-            alpha_pol_param = getattr(self.charge_net, "alpha_pol", None)
-            if hasattr(alpha_pol_param, "requires_grad_"):
-                alpha_pol_param.requires_grad_(False)
+            stiffness_param = getattr(self.charge_net, "pol_stiffness", None)
+            if hasattr(stiffness_param, "requires_grad_"):
+                stiffness_param.requires_grad_(False)
 
     @property
     def multipole_net(self) -> LatentMultipoleFitting:
@@ -194,6 +194,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             mixed_types=descriptor.mixed_types(),
             type_map=fitting.get_type_map(),
             dipole_mode=dipole_mode,
+            pol_stiffness=config.get("pol_stiffness"),
             alpha_pol=config.get("alpha_pol"),
             lr_update_steps=int(config.get("lr_update_steps", 0)),
             lr_update_neuron=config.get("lr_update_neuron"),
@@ -420,11 +421,16 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         pair_frame = xp.take(frame_id, dst, axis=0)
         frame_energy = segment_sum(pair_energy, pair_frame, n_node.shape[0])
         if self.use_self_pol:
-            alpha_pol = self.charge_net._parameter_array("alpha_pol", pairs.vec)
-            alpha_pol_atom = xp.take(alpha_pol, atype, axis=0) ** 2
+            # Self-polarization spring energy 0.5 * theta^2 * |p|^2 with the
+            # per-type raw stiffness theta (theta^2 is the spring constant,
+            # so the energy is quadratic in theta and never divides by a
+            # trainable quantity).
+            stiffness = self.charge_net._parameter_array("pol_stiffness", pairs.vec)
+            stiffness_atom = xp.take(stiffness, atype, axis=0) ** 2
             self_pol = (
-                xp.sum(xp.astype(p, pairs.vec.dtype) ** 2, axis=-1)
-                / (2.0 * alpha_pol_atom)
+                0.5
+                * stiffness_atom
+                * xp.sum(xp.astype(p, pairs.vec.dtype) ** 2, axis=-1)
                 * xp.astype(node_mask, pairs.vec.dtype)
             )
             frame_energy = frame_energy + segment_sum(

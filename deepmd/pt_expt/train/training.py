@@ -3196,7 +3196,7 @@ class Trainer(AbstractTrainer):
         if not self.sharding.shards_parameters:
             # Multi-task uses only one fitting_net per step, so unused
             # parameters exist in the graph. Latent-multipole long range with
-            # `use_self_pol: false` likewise never touches `alpha_pol`.
+            # `use_self_pol: false` likewise never touches `pol_stiffness`.
             kwargs: dict[str, Any] = {"find_unused_parameters": True}
             if local_rank is not None:
                 kwargs |= {"device_ids": [local_rank], "output_device": local_rank}

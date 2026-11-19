@@ -4122,9 +4122,28 @@ def long_range_latent_multipole() -> list[Argument]:
         ),
         Argument("embedding_width", int, optional=True, default=0),
         Argument(
-            "alpha_pol", [float, list[float], type(None)], optional=True, default=None
+            "pol_stiffness",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc="Raw per-type parameter of the dipole self-polarization spring "
+            "energy 0.5 * pol_stiffness^2 * |p|^2 (multiplication only; "
+            "the squared value is the spring constant, so it stays "
+            "positive). A scalar is broadcast to all elements. The legacy "
+            "`alpha_pol` (polarizability in |p|^2 / (2 alpha^2)) is still "
+            "accepted and converted as 1 / alpha.",
         ),
         Argument("use_self_pol", bool, optional=True, default=True),
+        Argument(
+            "alpha_pol",
+            [float, list[float], type(None)],
+            optional=True,
+            default=None,
+            doc="Deprecated alias kept for backward compatibility: the "
+            "polarizability of the legacy |p|^2 / (2 alpha^2) self-energy, "
+            "converted to `pol_stiffness` as 1 / alpha. Mutually exclusive "
+            "with `pol_stiffness`.",
+        ),
         Argument(
             "efield",
             bool,

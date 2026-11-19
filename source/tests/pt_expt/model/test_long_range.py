@@ -488,8 +488,8 @@ def _old_and_new_multipole_models(steps: int):
         new.atomic_model.long_range.charge_net.bias_atom_e.copy_(
             old.atomic_model.fitting_net.bias_atom_q
         )
-        new.atomic_model.long_range.charge_net.alpha_pol.copy_(
-            old.atomic_model.fitting_net.alpha_pol
+        new.atomic_model.long_range.charge_net.pol_stiffness.copy_(
+            1.0 / old.atomic_model.fitting_net.alpha_pol
         )
         new.atomic_model.long_range.kernel.log_alpha.copy_(
             old.atomic_model.fitting_net.les_alpha.log()
@@ -912,7 +912,7 @@ def _periodic_multipole_model(
 
 
 def _kspace_multipole_reference(
-    coord, cell, charge, dipole, kernel, alpha_pol
+    coord, cell, charge, dipole, kernel, pol_stiffness
 ) -> float:
     """Structure-factor reference of the periodic multipole energy."""
     import math
@@ -955,7 +955,7 @@ def _kspace_multipole_reference(
         0.5 * (kernel_hat(k2) * np.abs(struct) ** 2).sum() / volume
         - 0.5 * contact * (charge[:, 0] ** 2).sum()
         + 0.5 * dipole_contact * (dipole * dipole).sum()
-        + ((dipole * dipole).sum(-1) / (2 * alpha_pol**2)).sum()
+        + 0.5 * (pol_stiffness**2 * (dipole * dipole).sum(-1)).sum()
     )
 
 
@@ -963,7 +963,7 @@ def _sr_multipole_twin(model):
     """A copy with the charge/dipole readout zeroed: the short-range part."""
     twin = BaseModel.deserialize(model.serialize()).to(env.DEVICE).eval()
     for name, parameter in twin.atomic_model.long_range.charge_net.named_parameters():
-        if "alpha_pol" in name:
+        if "pol_stiffness" in name:
             continue
         parameter.detach().zero_()
     return twin
@@ -983,8 +983,8 @@ def test_periodic_multipole_energy_matches_reference(steps, kernel) -> None:
     coord_np = coord.cpu().numpy()
     cells = box.cpu().numpy()
     kernel_obj = model.atomic_model.long_range.kernel
-    alpha_pol = (
-        model.atomic_model.long_range.charge_net.alpha_pol.detach().cpu().numpy()
+    pol_stiffness = (
+        model.atomic_model.long_range.charge_net.pol_stiffness.detach().cpu().numpy()
     )
     for f, n in enumerate((5, 4)):
         reference = _kspace_multipole_reference(
@@ -993,7 +993,7 @@ def test_periodic_multipole_energy_matches_reference(steps, kernel) -> None:
             charge[f, :n],
             dipole[f, :n],
             kernel_obj,
-            alpha_pol[atype[f, :n].cpu().numpy()],
+            pol_stiffness[atype[f, :n].cpu().numpy()],
         )
         np.testing.assert_allclose(lr_energy[f], reference, rtol=1e-9, atol=1e-9)
 
@@ -1513,15 +1513,15 @@ def test_update_mesh_stat_fixes_pme_mesh_from_data(tmp_path) -> None:
     json.dumps(config)
 
 
-def test_multipole_alpha_pol_frozen_when_self_pol_disabled() -> None:
-    """use_self_pol=False must not leave alpha_pol as an unused parameter.
+def test_multipole_pol_stiffness_frozen_when_self_pol_disabled() -> None:
+    """use_self_pol=False must not leave pol_stiffness as an unused parameter.
 
     DDP's reducer raises "parameters that were not used in producing loss"
-    for such tensors, so the plugin freezes alpha_pol in this configuration.
+    for such tensors, so the plugin freezes pol_stiffness in this configuration.
     """
     model = get_model(_multipole_config(steps=1, use_self_pol=False)).to(env.DEVICE)
-    alpha_pol = model.atomic_model.long_range.charge_net.alpha_pol
-    assert alpha_pol.requires_grad is False
+    pol_stiffness = model.atomic_model.long_range.charge_net.pol_stiffness
+    assert pol_stiffness.requires_grad is False
 
     # Every remaining trainable parameter participates in the loss (the DDP
     # reducer contract).
@@ -1534,12 +1534,69 @@ def test_multipole_alpha_pol_frozen_when_self_pol_disabled() -> None:
             assert parameter.grad is not None, name
 
 
-def test_multipole_alpha_pol_trained_when_self_pol_enabled() -> None:
-    """With self-polarization on, alpha_pol is trainable and receives grad."""
+def test_multipole_pol_stiffness_trained_when_self_pol_enabled() -> None:
+    """With self-polarization on, pol_stiffness is trainable and receives grad."""
     model = _multipole_model(steps=0, train=True)
-    alpha_pol = model.atomic_model.long_range.charge_net.alpha_pol
-    assert alpha_pol.requires_grad
+    pol_stiffness = model.atomic_model.long_range.charge_net.pol_stiffness
+    assert pol_stiffness.requires_grad
     coord, atype = _batch((4, 3), seed=43)
     result = model(coord, atype)
     (result["energy"].square().sum() + result["force"].square().sum()).backward()
-    assert alpha_pol.grad is not None
+    assert pol_stiffness.grad is not None
+
+
+def test_pol_stiffness_matches_legacy_alpha_pol() -> None:
+    """0.5 * theta^2 |p|^2 must reproduce the legacy |p|^2 / (2 alpha^2) with
+    theta = 1 / alpha (load-time conversion, no division in the graph).
+    """
+    alpha = [0.8, 1.4]
+    cfg_legacy = _multipole_config(steps=1)
+    cfg_legacy["long_range"]["alpha_pol"] = alpha
+    cfg_new = _multipole_config(steps=1)
+    cfg_new["long_range"]["pol_stiffness"] = [1.0 / a for a in alpha]
+    m_legacy = get_model(cfg_legacy).to(env.DEVICE).eval()
+    m_new = get_model(cfg_new).to(env.DEVICE).eval()
+    # Same network draw: copy every other parameter over.
+    m_new.load_state_dict(m_legacy.state_dict(), strict=False)
+    theta = m_new.atomic_model.long_range.charge_net.pol_stiffness
+    np.testing.assert_allclose(
+        theta.detach().cpu().numpy(), [1.0 / a for a in alpha], rtol=1e-12
+    )
+    coord, atype = _batch((4, 3), seed=47)
+    out_legacy = m_legacy(coord, atype)
+    out_new = m_new(coord, atype)
+    torch.testing.assert_close(
+        out_new["energy"], out_legacy["energy"], rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(
+        out_new["force"], out_legacy["force"], rtol=1e-10, atol=1e-10
+    )
+
+
+def test_pol_stiffness_serialization_and_legacy_record() -> None:
+    """New records store pol_stiffness; legacy records with alpha_pol convert."""
+    m = _multipole_model(steps=1)
+    data = m.atomic_model.long_range.charge_net.serialize()
+    assert "pol_stiffness" in data["@variables"]
+    assert "alpha_pol" not in data["@variables"]
+    from deepmd.pt_expt.fitting.latent_multipole import (
+        LatentMultipoleFitting as PtLatentMultipoleFitting,
+    )
+
+    restored = PtLatentMultipoleFitting.deserialize(data)
+    np.testing.assert_allclose(
+        restored.pol_stiffness.detach().cpu().numpy(),
+        np.ones(len(restored.type_map)),
+        rtol=1e-12,
+    )
+    # Legacy record: polarizability 2.0 reads back as stiffness 0.5.
+    legacy = data.copy()
+    legacy["@variables"] = data["@variables"].copy()
+    legacy["@variables"].pop("pol_stiffness")
+    legacy["@variables"]["alpha_pol"] = np.full(len(restored.type_map), 2.0).tolist()
+    migrated = PtLatentMultipoleFitting.deserialize(legacy)
+    np.testing.assert_allclose(
+        migrated.pol_stiffness.detach().cpu().numpy(),
+        np.full(len(restored.type_map), 0.5),
+        rtol=1e-12,
+    )
