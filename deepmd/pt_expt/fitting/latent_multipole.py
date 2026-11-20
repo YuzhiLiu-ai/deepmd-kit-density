@@ -31,3 +31,23 @@ class LatentMultipoleFitting(LatentMultipoleFittingDP):
                 "pol_stiffness",
                 torch.nn.Parameter(tensor, requires_grad=bool(trainable)),
             )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        legacy_key = prefix + "alpha_pol"
+        if legacy_key in state_dict:
+            # Checkpoints written before the stiffness reparameterization
+            # store the polarizability ``alpha_pol`` (energy |p|^2 / (2
+            # alpha^2)); the spring form 0.5 * theta^2 * |p|^2 is exactly
+            # recovered with theta = 1 / alpha.  Convert once here so old
+            # checkpoints load without Missing/Unexpected key errors.
+            value = state_dict.pop(legacy_key)
+            state_dict[prefix + "pol_stiffness"] = (
+                torch.reciprocal(value) if torch.is_tensor(value) else 1.0 / value
+            )
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)

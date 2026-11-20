@@ -1545,6 +1545,35 @@ def test_multipole_pol_stiffness_trained_when_self_pol_enabled() -> None:
     assert pol_stiffness.grad is not None
 
 
+def test_pol_stiffness_loads_legacy_alpha_pol_checkpoint() -> None:
+    """Checkpoints written before the stiffness reparameterization store
+    ``alpha_pol`` (polarizability).  ``load_state_dict`` must remap the key
+    to ``pol_stiffness`` with the reciprocal value, so old checkpoints load
+    strictly and reproduce the model exactly.
+    """
+    m = _multipole_model(steps=1, train=False)
+    theta_ref = m.atomic_model.long_range.charge_net.pol_stiffness
+    with torch.no_grad():
+        theta_ref.copy_(torch.as_tensor([0.8, 1.4], dtype=theta_ref.dtype, device=env.DEVICE))
+    legacy: dict[str, torch.Tensor] = {}
+    for name, value in m.state_dict().items():
+        if name.endswith("pol_stiffness"):
+            legacy[name[: -len("pol_stiffness")] + "alpha_pol"] = 1.0 / value
+        else:
+            legacy[name] = value
+    fresh = _multipole_model(steps=1, train=False)
+    # strict=True: no Missing pol_stiffness / Unexpected alpha_pol errors.
+    fresh.load_state_dict(legacy, strict=True)
+    torch.testing.assert_close(
+        fresh.atomic_model.long_range.charge_net.pol_stiffness,
+        m.atomic_model.long_range.charge_net.pol_stiffness,
+    )
+    coord, atype = _batch((4, 3), seed=53)
+    torch.testing.assert_close(
+        fresh(coord, atype)["energy"], m(coord, atype)["energy"], rtol=1e-12, atol=1e-12
+    )
+
+
 def test_pol_stiffness_matches_legacy_alpha_pol() -> None:
     """0.5 * theta^2 |p|^2 must reproduce the legacy |p|^2 / (2 alpha^2) with
     theta = 1 / alpha (load-time conversion, no division in the graph).
