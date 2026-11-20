@@ -41,9 +41,14 @@ from deepmd.dpmodel.utils.neighbor_graph import (
 
 #: Modes for the charge-field coupling of ``latent_multipole``.
 #: "branch" couples the field through the charge potential on the
-#: continuous polarization branch; "force_only" is the legacy coupling
-#: that only adds the uniform force q_i E.
-EFIELD_POTENTIAL_MODES = ("force_only", "branch")
+#: continuous polarization branch (conservative, needs unwrapped
+#: coordinates); "bec" adds NO charge-field energy and instead injects
+#: the Born-effective-charge force -- the rigid q_i E plus the local
+#: (qNEP-style) charge response (1/2)(E . r_ij) d(q_i - q_j)/d r_ij --
+#: which is branch-free but NOT the gradient of the reported energy;
+#: "force_only" is the legacy coupling that only adds the uniform
+#: force q_i E.
+EFIELD_POTENTIAL_MODES = ("force_only", "branch", "bec")
 
 
 def normalize_efield_potential(mode: str) -> str:
@@ -61,7 +66,12 @@ def normalize_efield_potential(mode: str) -> str:
 
 
 def uses_efield_potential(mode: str) -> bool:
-    """Whether the mode couples the field through the charge potential."""
+    """Whether the mode couples the field through the charge potential.
+
+    Only ``branch`` does (and hence needs the unwrapped-coordinate
+    conditioning input); ``bec`` computes the field force from pair
+    geometry alone.
+    """
     return normalize_efield_potential(mode) == "branch"
 
 

@@ -266,6 +266,7 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             None if efield_frame is None else xp.take(efield_frame, frame_id, axis=0)
         )
         branch_mode = uses_efield_potential(self.efield_potential)
+        bec_mode = self.efield_potential == "bec"
         if branch_mode and efield_node is not None and efield_ext_pot is None:
             raise ValueError(
                 "the 'branch' charge-field potential requires the coordinate "
@@ -445,6 +446,26 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             frame_energy = frame_energy - xp.sum(
                 xp.astype(efield_frame, frame_energy.dtype) * mu_frame, axis=-1
             )
+        if efield_node is not None and bec_mode:
+            # BEC (Born-effective-charge) charge response, injected as a
+            # numerically-ZERO quasi-energy: the factor (dq - dq.detach())
+            # vanishes at evaluation, so the energy is unchanged, while its
+            # edge-leaf gradient is exactly the local (qNEP) charge-response
+            # force (1/2)(E . r_ij) d(q_i - q_j)/d r_ij with the rigid part
+            # cancelled.  Only relative pair geometry enters, so no unwrapped
+            # coordinates are needed; the trade-off is that the external
+            # force is NOT the gradient of the reported energy (no global
+            # scalar field energy exists), and the response is truncated to
+            # the pair set (cutoff-local, qNEP-style).
+            s_e = xp.sum(xp.take(efield_node, dst, axis=0) * pairs.vec, axis=-1)
+            q_flat = xp.reshape(q, (n,))
+            dq_pair = q_flat[src] - q_flat[dst]
+            dq_const = dq_pair.detach() if hasattr(dq_pair, "detach") else dq_pair
+            bec_pair = 0.5 * xp.astype(s_e, frame_energy.dtype) * (dq_pair - dq_const)
+            bec_pair = xp.where(pairs.mask, bec_pair, xp.zeros_like(bec_pair))
+            frame_energy = frame_energy + segment_sum(
+                xp.astype(bec_pair, frame_energy.dtype), pair_frame, n_node.shape[0]
+            )
         count = xp.astype(n_node, frame_energy.dtype)
         count = xp.maximum(count, xp.ones_like(count))
         energy = xp.take(frame_energy / count, frame_id, axis=0)
@@ -468,13 +489,15 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
             "latent_dipole": p,
         }
         if efield_node is not None and not branch_mode:
-            # ``force_only`` mode: the uniform field force q_i E on each real
-            # atom rides as a side output for the model wrapper to ADD to the
-            # autograd-assembled force; the charge-field potential is then
-            # omitted.  In ``branch`` mode the potential is part of the
-            # energy and its force contribution (explicit slope + charge
-            # relaxation) comes from differentiating the energy w.r.t. the
-            # coordinate leaf inside the model lower.
+            # ``force_only``/``bec`` modes: the uniform field force q_i E on
+            # each real atom rides as a side output for the model wrapper to
+            # ADD to the autograd-assembled force; the charge-field
+            # potential is omitted from the energy.  ``bec`` additionally
+            # injects the local charge-response force through the zero
+            # quasi-energy above.  In ``branch`` mode the potential is part
+            # of the energy and its force contribution (explicit slope +
+            # charge relaxation) comes from differentiating the energy
+            # w.r.t. the coordinate leaf inside the model lower.
             ret["efield_force"] = (
                 xp.astype(q, efield_node.dtype) * efield_node * node_mask[:, None]
             )

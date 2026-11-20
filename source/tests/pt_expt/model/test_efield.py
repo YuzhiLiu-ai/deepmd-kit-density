@@ -923,3 +923,137 @@ class TestEfieldBranch:
             finally:
                 plugin.call_graph = orig
             assert captured["has_force"] is expected, potential
+
+
+class TestEfieldBec:
+    """The BEC (Born-effective-charge) field coupling: branch-free forces
+    (rigid q_i E + local charge response + dipole response) that are NOT the
+    gradient of the reported energy -- the deployment trade-off for periodic
+    MD without unwrapped-coordinate tracking.
+    """
+
+    @staticmethod
+    def _model(periodic: bool = False, steps: int = 2):
+        cfg = _model_config(efield=True, steps=steps)
+        cfg["long_range"]["efield_potential"] = "bec"
+        if periodic:
+            cfg["long_range"]["periodic"] = True
+            cfg["long_range"]["k_grid_mode"] = "kgrid"
+        return get_model(cfg).to(env.DEVICE).eval()
+
+    @staticmethod
+    def _field(value, nf=1):
+        return torch.tensor(
+            [[0.0, 0.0, float(value)]] * nf, dtype=torch.float64, device=env.DEVICE
+        )
+
+    def test_bec_force_matches_effective_energy_fd_on_dimer(self) -> None:
+        """Decisive machinery test: on a neutral dimer the BEC force equals
+        finite differences of the effective energy
+        ``U_eff = U_model - E * q_1 * (r_12 . e_E)``.
+
+        (For a dimer the local pair form IS the exact molecular dipole), so
+        signs, factors, scattering and the nested edge gradient are all
+        locked to FD precision.
+        """
+        m = self._model()
+        E = 0.1
+        fp = self._field(E)
+        coord = torch.tensor(
+            [[[1.0, 1.0, 1.0], [1.8, 1.2, 1.1]]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        atype = torch.tensor([[0, 1]], dtype=torch.int64, device=env.DEVICE)
+        cs = torch.tensor([[0.0, 1.0]], dtype=torch.float64, device=env.DEVICE)
+
+        def u_eff(cc):
+            out = m(cc, atype, charge_spin=cs, fparam=fp)
+            q1 = out["latent_charge"][0, 0, 0]
+            r12_z = (cc[0, 0] - cc[0, 1])[2]
+            # U_model already carries -E . sum(mu); add the dimer
+            # charge-dipole term -E * q1 * r12 (M = q1 r12 for a neutral
+            # dimer), which the BEC force approximates exactly here.
+            return out["energy"].flatten()[0] - E * q1 * r12_z
+
+        out = m(coord, atype, charge_spin=cs, fparam=fp)
+        eps = 1e-6
+        for i in range(2):
+            for d in range(3):
+                dp = torch.zeros_like(coord)
+                dp[0, i, d] = eps
+                fd = -(u_eff(coord + dp) - u_eff(coord - dp)).item() / (2 * eps)
+                assert abs(fd - out["force"][0, i, d].item()) < 1e-5, (
+                    f"atom {i} dim {d}: FD {fd:.6e} vs force "
+                    f"{out['force'][0, i, d].item():.6e}"
+                )
+
+    def test_bec_energy_excludes_charge_field(self) -> None:
+        """BEC must not receive the coordinate potential (no q . phi in the
+        energy), and the rigid q_i E force still rides the side output.
+        """
+        m = self._model()
+        plugin = m.atomic_model.long_range
+        orig = plugin.call_graph
+        captured = {}
+
+        def hook(*a, **k):
+            captured["ext_pot"] = k.get("efield_ext_pot", "ABSENT")
+            ret = orig(*a, **k)
+            captured["has_force"] = "efield_force" in ret
+            return ret
+
+        plugin.call_graph = hook
+        try:
+            coord, atype, cs = _batch()
+            m(coord, atype, charge_spin=cs, fparam=self._field(0.1, nf=2))
+        finally:
+            plugin.call_graph = orig
+        assert captured["ext_pot"] in (None, "ABSENT")
+        assert captured["has_force"] is True
+
+    def test_bec_force_branch_point_invariant(self) -> None:
+        """Branch-freedom made concrete: two configurations related by
+        wrapping one atom by a lattice vector have the SAME MIC geometry and
+        hence exactly the same BEC forces (the branch energy differs by
+        q E L, the BEC force does not care).
+        """
+        m = self._model(periodic=True)
+        L = 8.0
+        box = (torch.eye(3, dtype=torch.float64, device=env.DEVICE) * L)[None]
+        coord_a = torch.tensor(
+            [[[2.0, 4.0, 0.05 * L], [2.0, 4.0, 0.50 * L]]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        atype = torch.tensor([[0, 1]], dtype=torch.int64, device=env.DEVICE)
+        cs = torch.tensor([[0.0, 1.0]], dtype=torch.float64, device=env.DEVICE)
+        fp = self._field(0.1)
+        coord_b = coord_a.clone()
+        coord_b[0, 0, 2] += L  # same MIC image, other side of the boundary
+        fa = m(coord_a, atype, charge_spin=cs, fparam=fp, box=box)["force"]
+        fb = m(coord_b, atype, charge_spin=cs, fparam=fp, box=box)["force"]
+        torch.testing.assert_close(fa, fb, rtol=1e-10, atol=1e-10)
+
+    def test_bec_training_gradients_flow(self) -> None:
+        """The force loss is differentiable through the zero quasi-energy
+        (second-order path): every trainable parameter receives a grad.
+        """
+        m = self._model(steps=1)
+        m.train()
+        coord, atype, cs = _batch()
+        out = m(coord, atype, charge_spin=cs, fparam=self._field(0.1, nf=2))
+        (out["energy"].square().sum() + out["force"].square().sum()).backward()
+        missing = [
+            name
+            for name, par in m.named_parameters()
+            if par.requires_grad and par.grad is None
+        ]
+        assert not missing, missing
+
+    def test_bec_serialization_round_trip(self) -> None:
+        m = self._model()
+        data = m.atomic_model.long_range.serialize()
+        assert data["efield_potential"] == "bec"
+        restored = LatentMultipoleLongRangeDP.deserialize(data)
+        assert restored.efield_potential == "bec"
