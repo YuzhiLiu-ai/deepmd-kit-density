@@ -1833,11 +1833,28 @@ class _CompiledModel(torch.nn.Module):
         # Continuous-polarization-branch efield: the coordinates ride as an
         # extra conditioning input (always a tensor for such models, so the
         # traced branch is stable across batches, including zero-field ones).
+        # For periodic molecular systems the coordinates are first unwrapped
+        # WHOLE-MOLECULE (nearest-image per fragment, home-cell re-centred),
+        # so a molecule crossing the cell never develops an artificial
+        # dipole; systems without detectable bonded fragments keep the
+        # as-provided coordinates.
         efield_coord = None
         if _model_efield_branch(_model):
             efield_coord = (
                 coord_3d if ragged else coord_3d.reshape(n_padded, 3)[node_index]
             )
+            if box_flat is not None:
+                from deepmd.dpmodel.long_range.efield import (
+                    maybe_unwrap_molecules,
+                )
+
+                efield_coord = maybe_unwrap_molecules(
+                    efield_coord,
+                    ng.n_node,
+                    box_flat.reshape(nframes, 3, 3),
+                    atype_flat,
+                    _model.get_type_map(),
+                )
 
         # Lazy compile of the GRAPH lower (cached per structure key and mode).
         compiled_lower = self._compiled_lower_by_mode.get(self.training)

@@ -994,7 +994,7 @@ def make_model(
                 atype=atype,
                 pair_excl=pair_excl,
             )
-            efield_coord = self._efield_coordinate(coord)
+            efield_coord = self._efield_coordinate(coord, graph.n_node, box, atype)
             predict = self.forward_common_lower_graph(
                 atype,
                 graph.n_node,
@@ -1025,13 +1025,20 @@ def make_model(
         def _efield_coordinate(
             self,
             coord_flat: torch.Tensor,
+            n_node: torch.Tensor | None = None,
+            box: torch.Tensor | None = None,
+            atype: torch.Tensor | None = None,
         ) -> torch.Tensor | None:
-            """As-provided coordinates for a 'branch' efield plugin.
+            """Field-coupling coordinates for a 'branch' efield plugin.
 
-            The continuous polarization branch consumes the coordinates as
-            given (unwrapped, no cell); the model lower rebuilds the external
-            potential from them on a differentiable leaf.  ``None`` when the
-            plugin does not use the potential coupling.  See
+            For periodic molecular systems the coordinates are unwrapped
+            WHOLE-MOLECULE first (nearest image per bonded fragment,
+            home-cell re-centred), so a molecule crossing the cell never
+            develops an artificial dipole; systems without detectable
+            bonded fragments keep the as-provided coordinates.  The model
+            lower rebuilds the external potential from these coordinates on
+            a differentiable leaf.  ``None`` when the plugin does not use
+            the potential coupling.  See
             :func:`deepmd.dpmodel.long_range.efield.efield_potential_from_coordinate`.
             """
             from deepmd.dpmodel.long_range.efield import uses_efield_potential
@@ -1045,6 +1052,18 @@ def make_model(
                 )
             ):
                 return None
+            if box is not None and n_node is not None and atype is not None:
+                from deepmd.dpmodel.long_range.efield import (
+                    maybe_unwrap_molecules,
+                )
+
+                return maybe_unwrap_molecules(
+                    coord_flat,
+                    n_node,
+                    box,
+                    atype,
+                    self.atomic_model.get_type_map(),
+                )
             return coord_flat
 
         def _call_common_graph(
@@ -1152,7 +1171,9 @@ def make_model(
                 atype=atype_flat,
                 pair_excl=pair_excl,
             )
-            efield_coord = self._efield_coordinate(cc.reshape(-1, 3)[node_index])
+            efield_coord = self._efield_coordinate(
+                cc.reshape(-1, 3)[node_index], ng.n_node, bb, atype_flat
+            )
             model_predict = self.forward_common_lower_graph(
                 atype_flat,
                 ng.n_node,

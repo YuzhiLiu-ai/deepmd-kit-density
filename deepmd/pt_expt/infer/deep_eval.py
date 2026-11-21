@@ -2663,10 +2663,10 @@ class DeepEval(DeepEvalBackend):
                 box_t,
                 atype=atype_t,
             )
-            # Continuous-branch efield: pass the coordinates as given
-            # (unwrapped, no cell) so the lower rebuilds the external
-            # potential on a differentiable leaf; the .pt2 ABI does not
-            # thread this input yet.
+            # Continuous-branch efield: pass the coordinates (for periodic
+            # molecular systems: whole-molecule unwrapped first) so the lower
+            # rebuilds the external potential on a differentiable leaf; the
+            # .pt2 ABI does not thread this input yet.
             _lr = getattr(atomic_model, "long_range", None)
             from deepmd.dpmodel.long_range.efield import uses_efield_potential
 
@@ -2678,7 +2678,20 @@ class DeepEval(DeepEvalBackend):
                     getattr(_lr, "efield_potential", "force_only")
                 )
             ):
-                runner_kwargs["efield_coord"] = coord_flat_t
+                _efield_coord = coord_flat_t
+                if box_t is not None:
+                    from deepmd.dpmodel.long_range.efield import (
+                        maybe_unwrap_molecules,
+                    )
+
+                    _efield_coord = maybe_unwrap_molecules(
+                        coord_flat_t,
+                        n_node_t,
+                        box_t.reshape(nframes, 3, 3),
+                        atype_t,
+                        atomic_model.get_type_map(),
+                    )
+                runner_kwargs["efield_coord"] = _efield_coord
         if self._is_pt2:
             model_ret = self._pt2_runner(*model_inputs)
         else:

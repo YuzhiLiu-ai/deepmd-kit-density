@@ -1093,3 +1093,174 @@ class TestEfieldBec:
         assert data["efield_potential"] == "bec"
         restored = LatentMultipoleLongRangeDP.deserialize(data)
         assert restored.efield_potential == "bec"
+
+
+class TestMolecularUnwrap:
+    """Whole-molecule unwrapping for the periodic branch efield coupling."""
+
+    L = 8.0
+
+    def _box(self):
+        return (torch.eye(3, dtype=torch.float64, device=env.DEVICE) * self.L)[None]
+
+    def _straddling_water(self):
+        """Two water molecules; molecule 0 straddles the z boundary."""
+        coord = torch.tensor(
+            [
+                [2.0, 4.0, 0.05 * self.L],
+                [2.0, 4.9, -0.02 * self.L],
+                [1.2, 3.7, -0.03 * self.L],
+                [5.0, 5.0, 4.0],
+                [5.0, 5.9, 4.05],
+                [4.2, 4.7, 4.1],
+            ],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        atype = torch.tensor([0, 1, 1, 0, 1, 1], dtype=torch.int64, device=env.DEVICE)
+        return coord, atype
+
+    def test_infer_molecule_ids(self) -> None:
+        from deepmd.dpmodel.long_range.efield import infer_molecule_ids
+
+        coord, atype = self._straddling_water()
+        mol = infer_molecule_ids(
+            coord, torch.tensor([6], device=env.DEVICE), self._box(), atype, ["O", "H"]
+        )
+        assert mol.tolist() == [0, 0, 0, 1, 1, 1]
+
+    def test_unwrap_boundary_consistency(self) -> None:
+        """A molecule translated by a lattice vector unwraps identically."""
+        from deepmd.dpmodel.long_range.efield import (
+            infer_molecule_ids,
+            unwrap_molecules,
+        )
+
+        coord, atype = self._straddling_water()
+        n_node = torch.tensor([6], device=env.DEVICE)
+        box = self._box()
+        ru = unwrap_molecules(
+            coord,
+            n_node,
+            box,
+            infer_molecule_ids(coord, n_node, box, atype, ["O", "H"]),
+        )
+        coord2 = coord.clone()
+        coord2[:3, 2] += self.L
+        ru2 = unwrap_molecules(
+            coord2,
+            n_node,
+            box,
+            infer_molecule_ids(coord2, n_node, box, atype, ["O", "H"]),
+        )
+        torch.testing.assert_close(ru, ru2, rtol=1e-12, atol=1e-12)
+
+    def test_unwrap_preserves_intramolecular_geometry(self) -> None:
+        from deepmd.dpmodel.long_range.efield import (
+            infer_molecule_ids,
+            unwrap_molecules,
+        )
+
+        coord, atype = self._straddling_water()
+        n_node = torch.tensor([6], device=env.DEVICE)
+        box = self._box()
+        ru = unwrap_molecules(
+            coord,
+            n_node,
+            box,
+            infer_molecule_ids(coord, n_node, box, atype, ["O", "H"]),
+        )
+        # O-H distances must equal the unwrapped (physical) bond lengths:
+        # the straddling bond (z=0.4 vs z=-0.16, delta z=0.56) is already
+        # short, while the y/z-wrapped alternative is longer; the unwrap
+        # must reproduce the MIC distance.
+        d_mic = min(
+            (coord[0] - coord[1]).norm().item(),
+            (coord[0] - coord[1] + torch.tensor([0, 0, self.L], device=env.DEVICE))
+            .norm()
+            .item(),
+        )
+        assert abs((ru[0] - ru[1]).norm().item() - d_mic) < 1e-10
+
+    def test_guard_raises_on_oversized_molecule(self) -> None:
+        from deepmd.dpmodel.long_range.efield import unwrap_molecules
+
+        coord, _ = self._straddling_water()
+        with pytest.raises(ValueError, match=r"cocycle|half the cell"):
+            unwrap_molecules(
+                coord,
+                torch.tensor([6], device=env.DEVICE),
+                self._box(),
+                torch.zeros(6, dtype=torch.int64, device=env.DEVICE),
+            )
+
+
+class TestEfieldBranchMolecular:
+    """End-to-end: periodic branch efield model with whole-molecule unwrap."""
+
+    @staticmethod
+    def _model(steps: int = 2):
+        cfg = _model_config(efield=True, steps=steps)
+        cfg["long_range"]["efield_potential"] = "branch"
+        cfg["long_range"]["periodic"] = True
+        cfg["long_range"]["k_grid_mode"] = "kgrid"
+        cfg["type_map"] = ["O", "H"]
+        return get_model(cfg).to(env.DEVICE).eval()
+
+    @staticmethod
+    def _field(value, nf=1):
+        return torch.tensor(
+            [[0.0, 0.0, float(value)]] * nf, dtype=torch.float64, device=env.DEVICE
+        )
+
+    def _water_frame(self, z0: float):
+        L = 8.0
+        coord = torch.tensor(
+            [[[2.0, 4.0, z0], [2.0, 4.9, z0 - 0.07 * L], [1.2, 3.7, z0 - 0.08 * L]]],
+            dtype=torch.float64,
+            device=env.DEVICE,
+        )
+        atype = torch.tensor([[0, 1, 1]], dtype=torch.int64, device=env.DEVICE)
+        cs = torch.tensor([[0.0, 1.0]], dtype=torch.float64, device=env.DEVICE)
+        box = (torch.eye(3, dtype=torch.float64, device=env.DEVICE) * L)[None]
+        return coord, atype, cs, box
+
+    def test_straddling_molecule_matches_equivalent_config(self) -> None:
+        """Energy AND force of a straddling molecule equal those of its
+        whole-molecule lattice translation (no artificial dipole, no jump).
+        """
+        m = self._model()
+        fp = self._field(0.1)
+        coord_a, atype, cs, box = self._water_frame(0.05 * 8.0)
+        out_a = m(coord_a, atype, charge_spin=cs, box=box, fparam=fp)
+        coord_b, _, _, _ = self._water_frame(-0.05 * 8.0)
+        out_b = m(coord_b, atype, charge_spin=cs, box=box, fparam=fp)
+        torch.testing.assert_close(
+            out_a["energy"], out_b["energy"], rtol=1e-8, atol=1e-8
+        )
+        torch.testing.assert_close(out_a["force"], out_b["force"], rtol=1e-8, atol=1e-8)
+
+    def test_periodic_fd_conservative(self) -> None:
+        """Forces match finite differences of the energy with the molecular
+        unwrap active (conservativity inherited from the branch machinery).
+        """
+        m = self._model()
+        coord, atype, cs, box = self._water_frame(0.45 * 8.0)
+        fp = self._field(0.1)
+        out = m(coord, atype, charge_spin=cs, box=box, fparam=fp)
+        eps = 1e-6
+        for i in range(3):
+            for d in range(3):
+                dp = torch.zeros_like(coord)
+                dp[0, i, d] = eps
+                e_plus = m(coord + dp, atype, charge_spin=cs, box=box, fparam=fp)[
+                    "energy"
+                ]
+                e_minus = m(coord - dp, atype, charge_spin=cs, box=box, fparam=fp)[
+                    "energy"
+                ]
+                fd = -(e_plus - e_minus).flatten()[0].item() / (2 * eps)
+                assert abs(fd - out["force"][0, i, d].item()) < 1e-5, (
+                    f"atom {i} dim {d}: FD {fd:.6e} vs force "
+                    f"{out['force'][0, i, d].item():.6e}"
+                )
