@@ -715,3 +715,84 @@ def migrate_dpa4c_lr_record(record: dict) -> dict:
     record["@version"] = 3
     _out_stat_of(record, lr_kernel, int(fitting.get("lr_update_steps", 0)))
     return record
+
+
+# ---------------------------------------------------------------------------
+# Non-periodic -> periodic evaluation conversion
+# ---------------------------------------------------------------------------
+
+
+def _convert_one_long_range_config(lr: dict, k_grid_mode: str, head: str) -> dict:
+    """Flip one ``long_range`` config section to periodic evaluation."""
+    lr = deepcopy(lr)
+    if lr.get("periodic", False):
+        raise ValueError(
+            f"the long-range plugin of {head} already evaluates periodic "
+            "cells (`periodic: true`); nothing to convert"
+        )
+    lr["periodic"] = True
+    lr["k_grid_mode"] = k_grid_mode
+    if k_grid_mode == "kgrid":
+        # The explicit k grid is sized from every frame's cell and needs no
+        # mesh calibration; drop any stale mesh pinning.
+        lr["pme_mesh"] = None
+        lr["pme_mesh_spacing"] = None
+    return lr
+
+
+def convert_long_range_config_to_periodic(
+    model_params: dict,
+    k_grid_mode: str = "kgrid",
+) -> dict:
+    """Convert a non-periodic long-range model config to periodic evaluation.
+
+    The LES/SOG kernel, the charge/dipole readout, the LEF update networks
+    and every trained weight are untouched: the same latent charges and
+    dipoles are simply summed with periodic boundary conditions (tin-foil)
+    instead of as an isolated cluster.  The converted model still evaluates
+    ``box=None`` frames with the direct all-pairs sum (the topology builder
+    dispatches on the presence of a cell), so it remains bitwise-compatible
+    with the original model on non-periodic data.
+
+    Parameters
+    ----------
+    model_params
+        The model config (``_extra_state["model_params"]`` of a training
+        checkpoint): either a single-model config carrying a top-level
+        ``long_range`` section, or a multi-task config whose
+        ``model_dict`` heads carry one each.
+    k_grid_mode
+        ``"kgrid"`` (default): a per-frame explicit wave-number grid sized
+        from the cell by ``kspace_tolerance`` -- the accuracy reference,
+        adaptive to cell changes (NPT-safe).  ``"pme"``: the smooth
+        particle-mesh Ewald mesh, faster at large N but fixed-size.
+
+    Returns
+    -------
+    dict
+        A converted deep copy; the input is not mutated.
+    """
+    if k_grid_mode not in ("kgrid", "pme"):
+        raise ValueError(f"`k_grid_mode` must be 'kgrid' or 'pme', got {k_grid_mode!r}")
+    model_params = deepcopy(model_params)
+    converted = 0
+    if isinstance(model_params.get("long_range"), dict):
+        model_params["long_range"] = _convert_one_long_range_config(
+            model_params["long_range"], k_grid_mode, "the model"
+        )
+        converted += 1
+    for head, head_config in (model_params.get("model_dict") or {}).items():
+        if isinstance(head_config, dict) and isinstance(
+            head_config.get("long_range"), dict
+        ):
+            head_config["long_range"] = _convert_one_long_range_config(
+                head_config["long_range"], k_grid_mode, f"head {head!r}"
+            )
+            converted += 1
+    if converted == 0:
+        raise ValueError(
+            "no `long_range` section found in the model config; this "
+            "conversion applies to latent-charge/latent-multipole plugin "
+            "models only"
+        )
+    return model_params

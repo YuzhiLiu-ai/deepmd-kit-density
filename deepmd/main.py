@@ -1020,6 +1020,35 @@ def main_parser() -> argparse.ArgumentParser:
         "Ignored (with a warning) for other output backends.",
     )
 
+    # * convert-lr-periodic **********************************************************
+    parser_convert_lr_periodic = subparsers.add_parser(
+        "convert-lr-periodic",
+        parents=[parser_log],
+        help="Convert a non-periodic long-range checkpoint to periodic evaluation.",
+        formatter_class=RawTextArgumentDefaultsHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+        examples:
+            dp convert-lr-periodic model.ckpt.pt model_periodic.pt
+            dp convert-lr-periodic model.ckpt.pt model_periodic.pt --k-grid-mode pme
+        """
+        ),
+    )
+    parser_convert_lr_periodic.add_argument(
+        "INPUT", help="The input pt_expt training checkpoint (.pt)."
+    )
+    parser_convert_lr_periodic.add_argument(
+        "OUTPUT", help="The output checkpoint with periodic long-range evaluation."
+    )
+    parser_convert_lr_periodic.add_argument(
+        "--k-grid-mode",
+        choices=["kgrid", "pme"],
+        default="kgrid",
+        help="Reciprocal-space evaluation: 'kgrid' sizes an explicit wave-number "
+        "grid from every frame's cell (adaptive, NPT-safe, accuracy reference); "
+        "'pme' uses a fixed particle-mesh Ewald mesh (faster at large N).",
+    )
+
     # * show model ******************************************************************
     parser_show = subparsers.add_parser(
         "show",
@@ -1134,6 +1163,7 @@ def main(args: list[str] | None = None) -> None:
         "neighbor-stat",
         "gui",
         "convert-backend",
+        "convert-lr-periodic",
         "show",
         "pretrained",
     ):

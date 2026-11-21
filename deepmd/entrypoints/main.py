@@ -15,6 +15,9 @@ from deepmd.backend.suffix import (
 from deepmd.entrypoints.convert_backend import (
     convert_backend,
 )
+from deepmd.entrypoints.convert_lr_periodic import (
+    convert_checkpoint_to_periodic,
+)
 from deepmd.entrypoints.doc import (
     doc_train_input,
 )
@@ -109,6 +112,8 @@ def main(args: argparse.Namespace) -> None:
         start_dpgui(**dict_args)
     elif args.command == "convert-backend":
         convert_backend(**dict_args)
+    elif args.command == "convert-lr-periodic":
+        convert_checkpoint_to_periodic(**dict_args)
     elif args.command == "show":
         show(**dict_args)
     elif args.command == "pretrained":
