@@ -42,12 +42,14 @@ from deepmd.dpmodel.utils.neighbor_graph import (
 #: Modes for the charge-field coupling of ``latent_multipole``.
 #: "branch" couples the field through the charge potential on the
 #: continuous polarization branch (conservative, needs unwrapped
-#: coordinates); "bec" adds NO charge-field energy and instead injects
-#: the Born-effective-charge force -- the rigid q_i E plus the local
-#: (qNEP-style) charge response (1/2)(E . r_ij) d(q_i - q_j)/d r_ij --
-#: which is branch-free but NOT the gradient of the reported energy;
-#: "force_only" is the legacy coupling that only adds the uniform
-#: force q_i E.
+#: coordinates); "bec" adds the charge-field energy on the pair
+#: center-of-geometry identity, -(1/N) sum_pairs (E.r_ij)(q_i-q_j),
+#: which is exact for neutral frames on the complete pair set and whose
+#: autograd carries the rigid q_i E force plus the full charge response
+#: (conservative on non-periodic frames, no coordinate leaf, no
+#: unwrapped coordinates; rejected for periodic plugins, where the pair
+#: topology is empty); "force_only" is the legacy coupling that only
+#: adds the uniform force q_i E.
 EFIELD_POTENTIAL_MODES = ("force_only", "branch", "bec")
 
 

@@ -4175,17 +4175,18 @@ def long_range_latent_multipole() -> list[Argument]:
             "the LEF charge equilibration sees the applied potential, and "
             "the energy is continuous across cell crossings (for a neutral "
             "frame it is invariant under a global translation). 'sawtooth' "
-            "is accepted as a deprecated alias for 'branch'. 'bec' adds no "
-            "charge-field energy and instead injects the Born-effective-charge "
-            "force (rigid q_i E plus the local charge response "
-            "0.5*(E . r_ij) d(q_i - q_j)/d r_ij on the pair graph): "
-            "branch-free (no unwrapped coordinates), but the external force "
-            "is NOT the gradient of the reported energy and the charge "
-            "response is cutoff-local -- intended as the deployment mode for "
-            "periodic MD with models trained in 'branch' mode. 'force_only' "
-            "is the legacy coupling: the uniform force q_i E is added "
-            "directly and the charge-field potential is omitted. Records "
-            "without this key always read as 'force_only'.",
+            "is accepted as a deprecated alias for 'branch'. 'bec' adds the "
+            "charge-field energy on the pair center-of-geometry identity "
+            "-(1/N) sum_pairs (E . r_ij)(q_i - q_j): exact for neutral frames "
+            "on the complete pair set, its autograd carries the rigid q_i E "
+            "force plus the full charge response (conservative on "
+            "non-periodic frames, no unwrapped coordinates needed), and the "
+            "reported energy is comparable across field strengths. 'bec' is "
+            "rejected for periodic plugins (their pair topology is empty); "
+            "use 'branch' or 'force_only' there. 'force_only' is the legacy "
+            "coupling: the uniform force q_i E is added directly and the "
+            "charge-field potential is omitted. Records without this key "
+            "always read as 'force_only'.",
         ),
         Argument("lr_update_steps", int, optional=True, default=0),
         Argument(
