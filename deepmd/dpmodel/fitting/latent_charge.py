@@ -100,7 +100,9 @@ class LatentChargeFitting(InvarFitting):
                         in_dim,
                         self.dim_out,
                         self.neuron,
-                        activation_function=self.activation_function,
+                        # The legacy LR charge readout is always tanh,
+                        # independent of the main fitting activation.
+                        activation_function="tanh",
                         resnet_dt=self.resnet_dt,
                         precision=self.precision,
                         bias_out=self.bias_out,
@@ -132,7 +134,9 @@ class LatentChargeFitting(InvarFitting):
                         in_dim,
                         self.dim_out,
                         self.neuron,
-                        self.activation_function,
+                        # The legacy LR charge readout is always tanh,
+                        # independent of the main fitting activation.
+                        "tanh",
                         self.resnet_dt,
                         self.precision,
                         bias_out=self.bias_out,

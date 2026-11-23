@@ -132,6 +132,9 @@ def _charge_net_config(lr: dict, fitting: dict) -> dict:
         "neuron": list(lr.get("neuron_lr") or [64, 64]),
         "use_glu": bool(lr.get("use_glu", True)),
         "bias_out": bool(fitting.get("bias_out", False)),
+        # Preserve the legacy main fitting activation for the dipole head
+        # and the LEF update net; the charge readout remains tanh by design.
+        "activation_function": fitting.get("activation_function", "silu"),
     }
     if lr.get("charge_bound") is not None:
         charge_net["charge_bound"] = float(lr["charge_bound"])
@@ -278,6 +281,9 @@ def migrate_dpa4_lr_config(config: dict) -> dict:
         "neuron": list(lr.get("neuron_lr") or [64, 64]),
         "use_glu": bool(lr.get("use_glu", True)),
         "bias_out": False,
+        # Preserve the legacy main fitting activation for the dipole head
+        # and the LEF update net; the charge readout remains tanh by design.
+        "activation_function": fitting.get("activation_function", "silu"),
     }
     if lr.get("charge_bound") is not None:
         charge_net["charge_bound"] = float(lr["charge_bound"])
@@ -296,8 +302,8 @@ def migrate_dpa4_lr_config(config: dict) -> dict:
         "kernel": kernel,
         "periodic": False,
     }
-    if lr_kernel == "sog" and not lr.get("remove_self_interaction", False):
-        # The legacy DPA4 SOG default keeps the self-interaction term.
+    if lr_kernel == "sog" and not lr.get("remove_self_interaction", True):
+        # The legacy DPA4 SOG default removes the self-interaction term.
         long_range["self_interaction"] = True
     constraint = _constraint_of(
         lr, fitting, config.get("descriptor", {}), charge_spin_first=False
@@ -677,7 +683,7 @@ def migrate_dpa4_lr_record(record: dict) -> dict:
             charge_spin_first=False,
         ),
     }
-    if lr_kernel == "sog" and not fitting.get("remove_self_interaction", False):
+    if lr_kernel == "sog" and not fitting.get("remove_self_interaction", True):
         long_range["self_interaction"] = True
     if lr_kernel == "dipole":
         long_range["use_self_pol"] = bool(fitting.get("use_self_pol", True))

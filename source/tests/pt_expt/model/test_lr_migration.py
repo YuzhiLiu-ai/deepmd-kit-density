@@ -428,10 +428,13 @@ def test_dpa4_config_migration_constraint_prefers_fparam() -> None:
 
 
 def test_dpa4_sog_migration_self_interaction_semantics() -> None:
-    """The legacy DPA4 SOG keeps the self-interaction term unless removed."""
+    """The legacy DPA4 SOG default removes the self-interaction term."""
     migrated = migrate_dpa4_lr_config(_legacy_dpa4_config("sog"))
-    assert migrated["long_range"]["self_interaction"] is True
+    assert "self_interaction" not in migrated["long_range"]
     config = _legacy_dpa4_config("sog")
+    config["fitting_net"]["remove_self_interaction"] = False
+    migrated = migrate_dpa4_lr_config(config)
+    assert migrated["long_range"]["self_interaction"] is True
     config["fitting_net"]["remove_self_interaction"] = True
     migrated = migrate_dpa4_lr_config(config)
     assert "self_interaction" not in migrated["long_range"]

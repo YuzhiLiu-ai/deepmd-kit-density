@@ -418,7 +418,13 @@ def _multipole_config(steps: int = 0, use_self_pol: bool = True) -> dict:
     config = _charge_config(with_long_range=False)
     config["long_range"] = {
         "type": "latent_multipole",
-        "charge_net": {"neuron": [8, 8], "use_glu": False},
+        "charge_net": {
+            "neuron": [8, 8],
+            "use_glu": False,
+            # Match the legacy dipole head activation; the charge readout
+            # remains tanh by construction.
+            "activation_function": "silu",
+        },
         "kernel": {"type": "les", "alpha": 0.9},
         "charge_constraint": {"source": "neutral"},
         "use_self_pol": use_self_pol,
@@ -1554,7 +1560,9 @@ def test_pol_stiffness_loads_legacy_alpha_pol_checkpoint() -> None:
     m = _multipole_model(steps=1, train=False)
     theta_ref = m.atomic_model.long_range.charge_net.pol_stiffness
     with torch.no_grad():
-        theta_ref.copy_(torch.as_tensor([0.8, 1.4], dtype=theta_ref.dtype, device=env.DEVICE))
+        theta_ref.copy_(
+            torch.as_tensor([0.8, 1.4], dtype=theta_ref.dtype, device=env.DEVICE)
+        )
     legacy: dict[str, torch.Tensor] = {}
     for name, value in m.state_dict().items():
         if name.endswith("pol_stiffness"):
