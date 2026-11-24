@@ -63,6 +63,11 @@ class LatentChargeFitting(InvarFitting):
     charge_bound
         Bound the charge as ``charge_bound * tanh(q / charge_bound)``;
         ``None`` (default) leaves the output unbounded.
+    charge_activation_function
+        Activation of the latent-charge readout. Defaults to
+        ``activation_function`` (itself ``tanh`` by default). The separate key
+        preserves legacy models with tanh charge readout but silu dipole/LEF
+        networks. Old serialized records without this key retain tanh readout.
     """
 
     def __init__(
@@ -71,6 +76,7 @@ class LatentChargeFitting(InvarFitting):
         use_glu: bool = False,
         charge_bound: float | None = None,
         bias_out: bool = False,
+        charge_activation_function: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.use_glu = bool(use_glu)
@@ -80,6 +86,14 @@ class LatentChargeFitting(InvarFitting):
         self.bias_out = bool(bias_out)
         seed = kwargs.get("seed")
         super().__init__(*args, **kwargs)
+        # New configs use activation_function for the charge readout too. A
+        # separate charge_activation_function allows legacy dipole models to
+        # retain their split policy: tanh charge readout + silu dipole/LEF nets.
+        self.charge_activation_function = (
+            self.activation_function
+            if charge_activation_function is None
+            else str(charge_activation_function)
+        )
         # Rebuild the networks with the legacy dpa4c_lr readout
         # parameterization: the layer bias defaults to off (the per-type bias
         # carries it), unlike the energy fitting's nets.
@@ -100,9 +114,7 @@ class LatentChargeFitting(InvarFitting):
                         in_dim,
                         self.dim_out,
                         self.neuron,
-                        # The legacy LR charge readout is always tanh,
-                        # independent of the main fitting activation.
-                        activation_function="tanh",
+                        activation_function=self.charge_activation_function,
                         resnet_dt=self.resnet_dt,
                         precision=self.precision,
                         bias_out=self.bias_out,
@@ -134,9 +146,7 @@ class LatentChargeFitting(InvarFitting):
                         in_dim,
                         self.dim_out,
                         self.neuron,
-                        # The legacy LR charge readout is always tanh,
-                        # independent of the main fitting activation.
-                        "tanh",
+                        self.charge_activation_function,
                         self.resnet_dt,
                         self.precision,
                         bias_out=self.bias_out,
@@ -224,6 +234,10 @@ class LatentChargeFitting(InvarFitting):
     def serialize(self) -> dict:
         data = super().serialize()
         data["type"] = "latent_charge"
+        # Persist both policies explicitly. In particular, old migrated models
+        # may use silu for dipole/LEF but tanh for the charge readout.
+        data["activation_function"] = self.activation_function
+        data["charge_activation_function"] = self.charge_activation_function
         data["use_glu"] = self.use_glu
         data["charge_bound"] = self.charge_bound
         data["bias_out"] = self.bias_out
@@ -237,6 +251,9 @@ class LatentChargeFitting(InvarFitting):
         data.pop("type")
         variables = data.pop("@variables")
         nets = data.pop("nets")
+        # Records written before charge_activation_function existed had a
+        # hard-coded tanh readout, even when dipole/LEF used activation_function.
+        data.setdefault("charge_activation_function", "tanh")
         use_glu = data.get("use_glu", False)
         obj = cls(**data)
         for key, value in variables.items():

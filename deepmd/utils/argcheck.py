@@ -3986,6 +3986,9 @@ def latent_charge_net_args() -> list[Argument]:
     return [
         Argument("neuron", list[int], optional=True, default=[64, 64]),
         Argument("activation_function", str, optional=True),
+        # Optional readout override for legacy tanh-charge + silu-dipole/LEF
+        # models. New configs can use activation_function for all three nets.
+        Argument("charge_activation_function", str, optional=True),
         Argument("resnet_dt", bool, optional=True),
         Argument("precision", str, optional=True),
         Argument("trainable", [list[bool], bool], optional=True, default=True),

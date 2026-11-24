@@ -22,6 +22,24 @@ from deepmd.pt_expt.train.utils import (
 log = logging.getLogger(__name__)
 
 
+def _sync_long_range_activation(
+    model: torch.nn.Module, model_params: dict[str, Any] | None
+) -> None:
+    """Record the effective readout activations in checkpoint model params."""
+    if not isinstance(model_params, dict):
+        return
+    lr_params = model_params.get("long_range")
+    if not isinstance(lr_params, dict):
+        return
+    long_range = getattr(getattr(model, "atomic_model", None), "long_range", None)
+    charge_net = getattr(long_range, "charge_net", None)
+    if charge_net is None:
+        return
+    charge_params = lr_params.setdefault("charge_net", {})
+    charge_params["activation_function"] = charge_net.activation_function
+    charge_params["charge_activation_function"] = charge_net.charge_activation_function
+
+
 def _share_descriptor(
     link_model: torch.nn.Module,
     link_type: str,
@@ -116,6 +134,12 @@ class ModelWrapper(torch.nn.Module):
             else:
                 self.loss = {"Default": loss}
         self.inference_only = self.loss is None
+        if self.multi_task:
+            params_by_task = self.model_params.get("model_dict", {})
+            for task_key, task_model in self.model.items():
+                _sync_long_range_activation(task_model, params_by_task.get(task_key))
+        else:
+            _sync_long_range_activation(self.model["Default"], self.model_params)
 
     def share_params(
         self,
@@ -266,6 +290,12 @@ class ModelWrapper(torch.nn.Module):
     def set_extra_state(self, state: dict) -> None:
         self.model_params = state.get("model_params", {})
         self.train_infos = state.get("train_infos", {"lr": 0, "step": 0})
+        if self.multi_task:
+            params_by_task = self.model_params.get("model_dict", {})
+            for task_key, task_model in self.model.items():
+                _sync_long_range_activation(task_model, params_by_task.get(task_key))
+        else:
+            _sync_long_range_activation(self.model["Default"], self.model_params)
 
     def get_extra_state(self) -> dict:
         return {

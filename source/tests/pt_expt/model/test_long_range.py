@@ -421,9 +421,10 @@ def _multipole_config(steps: int = 0, use_self_pol: bool = True) -> dict:
         "charge_net": {
             "neuron": [8, 8],
             "use_glu": False,
-            # Match the legacy dipole head activation; the charge readout
-            # remains tanh by construction.
+            # Match the legacy split policy: silu dipole/LEF nets and a tanh
+            # charge readout.
             "activation_function": "silu",
+            "charge_activation_function": "tanh",
         },
         "kernel": {"type": "les", "alpha": 0.9},
         "charge_constraint": {"source": "neutral"},

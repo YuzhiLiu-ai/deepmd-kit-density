@@ -135,6 +135,7 @@ def _charge_net_config(lr: dict, fitting: dict) -> dict:
         # Preserve the legacy main fitting activation for the dipole head
         # and the LEF update net; the charge readout remains tanh by design.
         "activation_function": fitting.get("activation_function", "silu"),
+        "charge_activation_function": "tanh",
     }
     if lr.get("charge_bound") is not None:
         charge_net["charge_bound"] = float(lr["charge_bound"])
@@ -284,6 +285,7 @@ def migrate_dpa4_lr_config(config: dict) -> dict:
         # Preserve the legacy main fitting activation for the dipole head
         # and the LEF update net; the charge readout remains tanh by design.
         "activation_function": fitting.get("activation_function", "silu"),
+        "charge_activation_function": "tanh",
     }
     if lr.get("charge_bound") is not None:
         charge_net["charge_bound"] = float(lr["charge_bound"])
@@ -396,6 +398,7 @@ def _charge_net_record(lr_kernel: str, fitting: dict) -> dict:
         "default_fparam": fitting["default_fparam"],
         "rcond": fitting["rcond"],
         "activation_function": fitting["activation_function"],
+        "charge_activation_function": "tanh",
         "precision": fitting["precision"],
         "mixed_types": fitting["mixed_types"],
         "exclude_types": fitting["exclude_types"],
@@ -629,6 +632,7 @@ def migrate_dpa4_lr_record(record: dict) -> dict:
         "default_fparam": fitting["default_fparam"],
         "rcond": fitting["rcond"],
         "activation_function": fitting["activation_function"],
+        "charge_activation_function": "tanh",
         "precision": precision,
         "mixed_types": fitting["mixed_types"],
         "exclude_types": fitting["exclude_types"],
