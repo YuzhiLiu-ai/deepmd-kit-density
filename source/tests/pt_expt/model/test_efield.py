@@ -3,9 +3,10 @@
 
 The field enters the latent electrostatic feedback (LEF), polarizing the
 latent dipoles, and adds a dipole-field energy. It is gated to LEF-only
-(``lr_update_steps > 0``); every other configuration raises. Two transports:
-the explicit per-frame ``efield`` input (API/tests, eager-only) and
-``fparam[:, :3]`` (training data, compile/export/deploy-friendly).
+(``lr_update_steps > 0``); every other configuration raises. The dedicated
+per-frame ``efield`` input is supported by eager, compiled, export and
+inference paths; ``fparam[:, :3]`` remains as a deprecated compatibility
+fallback.
 """
 
 import numpy as np
@@ -212,22 +213,36 @@ class TestEfieldPhysics:
 
 
 class TestEfieldTrainingWiring:
-    """The training pipeline feeds the field via fparam[:, :3] (V/AA)."""
+    """The training pipeline feeds the dedicated efield input (V/AA)."""
 
     def test_data_requirement_registered_when_enabled(self) -> None:
         from deepmd.pt_expt.train.training import get_additional_data_requirement
 
         reqs = get_additional_data_requirement(_model(efield=True, steps=2))
-        # dim_fparam == 0 model: the field transport registers fparam dim 3.
+        # dim_fparam == 0 model: register the dedicated field and the legacy
+        # fparam fallback, both optional so zero-field datasets still train.
+        for key in ("efield", "fparam"):
+            key_reqs = [r for r in reqs if r.key == key]
+            assert len(key_reqs) == 1
+            req = key_reqs[0]
+            assert req.ndof == 3
+            assert req.atomic is False
+            assert req.must is False
+
+    def test_data_requirement_with_sr_fparam(self) -> None:
+        """Dedicated efield is registered even when SR fitting reads fparam."""
+        from deepmd.pt_expt.train.training import get_additional_data_requirement
+
+        cfg = _model_config(efield=True, steps=2)
+        cfg["fitting_net"]["numb_fparam"] = 4
+        reqs = get_additional_data_requirement(get_model(cfg).to(env.DEVICE).eval())
+        efield_reqs = [r for r in reqs if r.key == "efield"]
         fparam_reqs = [r for r in reqs if r.key == "fparam"]
+        assert len(efield_reqs) == 1
+        assert efield_reqs[0].ndof == 3
+        assert efield_reqs[0].must is False
         assert len(fparam_reqs) == 1
-        req = fparam_reqs[0]
-        assert req.ndof == 3
-        assert req.atomic is False
-        # Optional: a system without fparam.npy trains field-free.
-        assert req.must is False
-        # No separate efield data key.
-        assert all(r.key != "efield" for r in reqs)
+        assert fparam_reqs[0].ndof == 4
 
     def test_no_data_requirement_when_disabled(self) -> None:
         from deepmd.pt_expt.train.training import get_additional_data_requirement
@@ -275,25 +290,23 @@ class TestEfieldTrainingWiring:
         direct = m(coord, atype, charge_spin=cs)
         torch.testing.assert_close(pred["energy"], direct["energy"])
 
-    def test_compiled_model_rejects_efield(self) -> None:
+    def test_compiled_model_accepts_efield(self) -> None:
         from deepmd.pt_expt.train.training import _CompiledModel
 
         m = _model(efield=True, steps=1)
         compiled = _CompiledModel(m, structure_key=(0,))
         compiled.train()
         coord, atype, cs = _batch()
-        with pytest.raises(NotImplementedError, match="enable_compile"):
-            compiled(
-                coord,
-                atype,
-                None,
-                charge_spin=cs,
-                efield=_efield(0.5),
-            )
+        ef = _efield(0.5)
+        out_c = compiled(coord, atype, None, charge_spin=cs, efield=ef)
+        m.train()
+        out_e = m(coord, atype, charge_spin=cs, efield=ef)
+        torch.testing.assert_close(out_c["energy"], out_e["energy"])
+        torch.testing.assert_close(out_c["force"], out_e["force"])
 
 
 class TestEfieldFparamTransport:
-    """The compile/export-friendly transport: the field rides fparam[:, :3]."""
+    """Deprecated fparam[:, :3] fallback, kept for old datasets and callers."""
 
     def test_fparam_transport_matches_explicit_kwarg(self) -> None:
         m = _model(efield=True, steps=2)
@@ -469,7 +482,7 @@ class TestEfieldFparamTransport:
 
 
 class TestEfieldInference:
-    """dp test / DeepEval transport the field via fparam[:, :3]."""
+    """dp test / DeepEval support dedicated efield and the fparam fallback."""
 
     @staticmethod
     def _save_ckpt(tmp_path) -> str:
@@ -501,6 +514,9 @@ class TestEfieldInference:
         out1 = dp.eval(coord_np, None, atype_np, fparam=field)
         assert not np.allclose(out0[0], out1[0])  # energy responds
         assert not np.allclose(out0[1], out1[1])  # force responds
+        out_kw = dp.eval(coord_np, None, atype_np, efield=field)
+        np.testing.assert_allclose(out_kw[0], out1[0], rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(out_kw[1], out1[1], rtol=1e-10, atol=1e-10)
         # And a zero-field evaluation without fparam still works.
         out2 = dp.eval(coord_np, None, atype_np)
         np.testing.assert_allclose(out2[0], out0[0], rtol=1e-10, atol=1e-10)
@@ -862,9 +878,10 @@ class TestEfieldBranch:
         assert restored.efield_potential == "force_only"
 
     def test_compiled_model_matches_eager(self, tmp_path) -> None:
-        """The branch path is compile-safe: compiled energy/force/gradients
-        match eager to machine precision (the trace sample must carry the
-        field's fparam even though dim_fparam is 0).
+        """Compiled energy/force/gradients match eager with dedicated efield.
+
+        The same traced graph also accepts the deprecated fparam fallback and
+        normalizes an absent field without changing its positional ABI.
         """
         from deepmd.pt_expt.train.training import _CompiledModel
 
@@ -875,9 +892,9 @@ class TestEfieldBranch:
         fp = self._field(0.1, nf=2)
         zero = torch.zeros((2, 3), dtype=torch.float64, device=env.DEVICE)
 
-        out_c = compiled(coord, atype, None, charge_spin=cs, fparam=fp)
+        out_c = compiled(coord, atype, None, charge_spin=cs, efield=fp)
         m.train()
-        out_e = m(coord, atype, charge_spin=cs, fparam=fp)
+        out_e = m(coord, atype, charge_spin=cs, efield=fp)
         torch.testing.assert_close(
             out_c["energy"], out_e["energy"], rtol=1e-10, atol=1e-10
         )
@@ -886,15 +903,86 @@ class TestEfieldBranch:
         )
 
         # A zero-field batch through the same compiled graph matches too.
-        out_c0 = compiled(coord, atype, None, charge_spin=cs, fparam=zero)
-        out_e0 = m(coord, atype, charge_spin=cs, fparam=zero)
+        out_c0 = compiled(coord, atype, None, charge_spin=cs, efield=zero)
+        out_e0 = m(coord, atype, charge_spin=cs, efield=zero)
         torch.testing.assert_close(
             out_c0["energy"], out_e0["energy"], rtol=1e-10, atol=1e-10
+        )
+
+        # Legacy fparam-only calls resolve to the same dedicated input slot.
+        with pytest.warns(DeprecationWarning, match="fparam"):
+            out_legacy_c = compiled(coord, atype, None, charge_spin=cs, fparam=fp)
+        with pytest.warns(DeprecationWarning, match="fparam"):
+            out_legacy_e = m(coord, atype, charge_spin=cs, fparam=fp)
+        torch.testing.assert_close(
+            out_legacy_c["energy"], out_legacy_e["energy"], rtol=1e-10, atol=1e-10
+        )
+        torch.testing.assert_close(
+            out_legacy_c["force"], out_legacy_e["force"], rtol=1e-10, atol=1e-10
         )
 
         # Training gradients flow through the compiled graph.
         (out_c["energy"].square().sum() + out_c["force"].square().sum()).backward()
         assert all(p.grad is not None for p in compiled.parameters() if p.requires_grad)
+
+    def test_graph_export_carries_dedicated_efield(self) -> None:
+        """The graph export traces efield/coordinate/topology inputs together."""
+        from deepmd.pt_expt.utils.serialization import _trace_and_export
+
+        m = self._model().to("cpu").eval()
+        exported, metadata, _, output_keys = _trace_and_export(
+            {"model": m.serialize()}, lower_kind="graph"
+        )
+        assert exported is not None
+        assert metadata["has_efield"] is True
+        assert metadata["efield_potential"] == "branch"
+        assert "energy" in output_keys
+        assert "force" in output_keys
+
+        from deepmd.dpmodel.utils.neighbor_graph import flatten_topologies
+        from deepmd.pt_expt.utils.serialization import (
+            build_synthetic_graph_inputs,
+            build_synthetic_topologies,
+        )
+
+        # Execute with a different dynamic shape and a NONZERO dedicated field;
+        # matching eager here proves that the new positional slot is not merely
+        # present in the signature but numerically reaches the plugin.
+        model = m.to(env.DEVICE)
+        sample = list(
+            build_synthetic_graph_inputs(
+                model,
+                e_max=None,
+                nframes=2,
+                nloc=5,
+                dtype=torch.float64,
+                device=env.DEVICE,
+                want_efield_coord=True,
+            )
+        )
+        sample[2] = sample[1].clone()
+        sample[13] = torch.full_like(sample[13], 0.1)
+        topologies = build_synthetic_topologies(
+            model,
+            10,
+            7,
+            dtype=torch.float64,
+            device=env.DEVICE,
+            nframes=2,
+        )
+        out = exported.module()(*sample, *flatten_topologies(topologies))
+        ref = model.forward_common_lower_graph(
+            *sample[:10],
+            fparam=sample[10],
+            aparam=sample[11],
+            charge_spin=sample[12],
+            efield=sample[13],
+            efield_coord=sample[14],
+            topologies=topologies,
+            do_atomic_virial=False,
+        )
+        torch.testing.assert_close(out["energy"], ref["energy_redu"])
+        torch.testing.assert_close(out["force"], ref["energy_derv_r"].squeeze(-2))
 
     def test_branch_has_no_manual_side_output(self) -> None:
         """Branch force is fully autograd (coordinate leaf); only the legacy

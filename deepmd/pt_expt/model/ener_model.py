@@ -632,8 +632,10 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         aparam: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
         efield_coord: torch.Tensor | None = None,
         destination_sorted: bool = False,
+        topologies: dict[str, Any] | None = None,
         **make_fx_kwargs: Any,
     ) -> torch.nn.Module:
         """Trace ``forward_common_lower_graph`` into an exportable module with
@@ -699,9 +701,11 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam=fparam,
             aparam=aparam,
             charge_spin=charge_spin,
+            efield=efield,
             efield_coord=efield_coord,
             do_atomic_virial=do_atomic_virial,
             destination_sorted=destination_sorted,
+            topologies=topologies,
             **make_fx_kwargs,
         )
 
@@ -709,6 +713,9 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         # Capture model config at trace time via closures.
         do_grad_r = self.do_grad_r("energy")
         do_grad_c = self.do_grad_c("energy")
+        has_efield = efield is not None
+        has_efield_coord = efield_coord is not None
+        n_conditioning = int(has_efield) + int(has_efield_coord)
 
         def fn(
             atype: torch.Tensor,
@@ -724,9 +731,12 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam: torch.Tensor | None,
             aparam: torch.Tensor | None,
             charge_spin: torch.Tensor | None,
-            efield_coord: torch.Tensor | None = None,
+            *extra_vals: torch.Tensor,
         ) -> dict[str, torch.Tensor]:
-            model_ret = traced(
+            efield_arg = extra_vals[0] if has_efield else None
+            efield_coord_arg = extra_vals[int(has_efield)] if has_efield_coord else None
+            topology_vals = extra_vals[n_conditioning:]
+            traced_inputs = (
                 atype,
                 n_node,
                 n_local,
@@ -740,8 +750,17 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                 fparam,
                 aparam,
                 charge_spin,
-                efield_coord,
             )
+            # make_fx drops absent optional inputs from the inner graph. Match
+            # that pytree exactly: legacy models keep the original 13-slot ABI,
+            # efield models append the field and, for branch coupling, its
+            # coordinate leaf in the same order as the synthetic export sample.
+            if efield_arg is not None:
+                traced_inputs += (efield_arg,)
+            if efield_coord_arg is not None:
+                traced_inputs += (efield_coord_arg,)
+            traced_inputs += tuple(topology_vals)
+            model_ret = traced(*traced_inputs)
             return _translate_energy_keys(
                 model_ret,
                 do_grad_r=do_grad_r,
@@ -749,6 +768,8 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                 do_atomic_virial=do_atomic_virial,
                 local=True,
             )
+
+        from deepmd.dpmodel.utils.neighbor_graph import flatten_topologies
 
         return make_fx(fn, **make_fx_kwargs)(
             atype,
@@ -764,7 +785,9 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam,
             aparam,
             charge_spin,
-            efield_coord,
+            *((efield,) if has_efield else ()),
+            *((efield_coord,) if has_efield_coord else ()),
+            *flatten_topologies(topologies or {}),
         )
 
     def forward_lower_graph_exportable_with_comm(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import contextlib
 import ctypes
+import dataclasses
 import json
 import logging
 import os
@@ -494,6 +495,7 @@ def build_synthetic_graph_inputs(
     want_aparam: bool = True,
     want_charge_spin: bool = True,
     want_spin: bool = False,
+    want_efield: bool = True,
     want_efield_coord: bool = False,
     canonicalize: bool = True,
 ) -> tuple[torch.Tensor | None, ...]:
@@ -512,7 +514,8 @@ def build_synthetic_graph_inputs(
     ``forward_(common_)lower_graph``:
     ``(atype, n_node, n_local, edge_index, edge_vec, edge_mask, destination_order,
     destination_row_ptr, source_order, source_row_ptr, fparam, aparam,
-    charge_spin)`` -- or, when ``want_spin=True``, the native-spin ABI
+    charge_spin)``, followed by the optional dedicated ``efield`` and branch
+    ``efield_coord`` inputs -- or, when ``want_spin=True``, the native-spin ABI
     (:meth:`~deepmd.pt_expt.model.native_spin_model.NativeSpinEnergyModel.forward_lower_graph_exportable`):
     ``(atype, n_node, n_local, edge_index, edge_vec, edge_mask, destination_order,
     destination_row_ptr, source_order, source_row_ptr, spin, fparam, aparam)``
@@ -580,11 +583,11 @@ def build_synthetic_graph_inputs(
     rcut = model.get_rcut()
     ntypes = len(model.get_type_map())
     dim_fparam = model.get_dim_fparam()
+    _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
     if dim_fparam == 0:
-        # An efield-enabled long-range plugin reads the field from
-        # fparam[:, :3] even though the model's own dim_fparam is 0
-        # (mirrors the training-side requirement in pt_expt/train/training.py).
-        _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
+        # Preserve the deprecated fparam[:, :3] fallback in the ABI even
+        # though the model's own dim_fparam is 0. The dedicated efield input
+        # is appended separately below.
         if getattr(_lr, "efield", False):
             dim_fparam = 3
     dim_aparam = model.get_dim_aparam()
@@ -680,6 +683,9 @@ def build_synthetic_graph_inputs(
         aparam,
         charge_spin,
     )
+    if want_efield and getattr(_lr, "efield", False):
+        # Dedicated external-field input (nf, 3), independent of fparam.
+        inputs = (*inputs, torch.zeros(nframes, 3, dtype=dtype, device=device))
     if want_efield_coord:
         # Continuous-polarization-branch efield ABI: the coordinates ride as
         # the last conditioning input, (N, 3) on the flat node axis (like
@@ -915,9 +921,33 @@ def count_synthetic_graph_edges(
     return int(edge_mask.sum())
 
 
+def _build_topology_dynamic_shapes(
+    topologies: dict[str, Any],
+    nframes_dim: torch.export.Dim,
+    n_node_total_dim: torch.export.Dim,
+) -> tuple:
+    """Build dynamic-shape specs from each topology's declared ``AXES``."""
+    dims = {"frame": nframes_dim, "node": n_node_total_dim}
+    shapes = []
+    for topology in topologies.values():
+        for field in dataclasses.fields(topology):
+            axes = topology.AXES.get(field.name, {})
+            if not axes:
+                shapes.append(None)
+                continue
+            spec = {}
+            for axis, name in axes.items():
+                if name not in dims:
+                    dims[name] = torch.export.Dim(f"topology_{name}", min=1)
+                spec[axis] = dims[name]
+            shapes.append(spec)
+    return tuple(shapes)
+
+
 def _build_graph_dynamic_shapes(
     *sample_inputs: torch.Tensor | None,
     is_native_spin: bool = False,
+    topologies: dict[str, Any] | None = None,
 ) -> tuple:
     """Build dynamic-shape specifications for the graph-form forward_lower export.
 
@@ -935,7 +965,8 @@ def _build_graph_dynamic_shapes(
         Regular (energy) ABI: ``(atype, n_node, n_local, edge_index,
         edge_vec, edge_mask, destination_order, destination_row_ptr,
         source_order, source_row_ptr, fparam, aparam, charge_spin)`` — 13
-        entries matching ``forward_lower_graph_exportable``. Native-spin ABI
+        entries, plus optional ``efield``, ``efield_coord`` and flattened
+        topology fields matching ``forward_lower_graph_exportable``. Native-spin ABI
         (``is_native_spin=True``): same shared CSR block (slots 0-9), but
         slot 10 is ``spin`` (mandatory, node-axis-shaped), slot 11
         ``fparam``, slot 12 ``aparam``, slot 13 the conditional
@@ -961,6 +992,9 @@ def _build_graph_dynamic_shapes(
         {0: nedge_dim},  # source_order: (E,)
         {0: n_node_total_dim + 1},  # source_row_ptr: (N + 1,)
     )
+    topology_shapes = _build_topology_dynamic_shapes(
+        topologies or {}, nframes_dim, n_node_total_dim
+    )
     if is_native_spin:
         spin = sample_inputs[10]
         fparam = sample_inputs[11]
@@ -974,10 +1008,19 @@ def _build_graph_dynamic_shapes(
             {0: nframes_dim} if fparam is not None else None,  # fparam
             {0: n_node_total_dim} if aparam is not None else None,  # aparam
             {0: nframes_dim} if charge_spin is not None else None,  # charge_spin
+            *topology_shapes,
         )
     fparam = sample_inputs[10]
     aparam = sample_inputs[11]
     charge_spin = sample_inputs[12]
+    # Topology fields trail the conditioning inputs; do not mistake the first
+    # pair/k-grid field for efield on models without a dedicated field slot.
+    n_topology_vals = sum(
+        len(dataclasses.fields(topology)) for topology in (topologies or {}).values()
+    )
+    n_conditioning = len(sample_inputs) - n_topology_vals
+    efield = sample_inputs[13] if n_conditioning > 13 else None
+    efield_coord = sample_inputs[14] if n_conditioning > 14 else None
     return (
         *base,
         {0: nframes_dim} if fparam is not None else None,  # fparam: (nf, ndf)
@@ -986,6 +1029,20 @@ def _build_graph_dynamic_shapes(
         # dim would make torch.export prove/reject the equality).
         {0: n_node_total_dim} if aparam is not None else None,  # aparam
         {0: nframes_dim} if charge_spin is not None else None,  # charge_spin
+        # Optional conditioning slots exist only when the traced ABI carries
+        # them; a legacy model keeps exactly its original 13 inputs.
+        *(
+            ({0: nframes_dim} if efield is not None else None,)
+            if n_conditioning > 13
+            else ()
+        ),
+        # Branch-potential coordinates share the flat node axis with atype.
+        *(
+            ({0: n_node_total_dim} if efield_coord is not None else None,)
+            if n_conditioning > 14
+            else ()
+        ),
+        *topology_shapes,
     )
 
 
@@ -1284,6 +1341,10 @@ def _collect_metadata(
         "sel_type": [int(t) for t in model.get_sel_type()],
         "is_spin": is_spin,
     }
+    _lr = getattr(getattr(model, "atomic_model", None), "long_range", None)
+    meta["has_efield"] = bool(getattr(_lr, "efield", False))
+    if meta["has_efield"]:
+        meta["efield_potential"] = getattr(_lr, "efield_potential", "force_only")
     if is_spin:
         # The scheme is what selects the serving backend class in C++
         # (``deepmd_create_deepspin_backend_v1``): "native" is served by
@@ -2250,6 +2311,21 @@ def _trace_and_export_impl(
                 want_spin=is_native_spin,
                 want_efield_coord=_want_ec,
             )
+            from deepmd.dpmodel.utils.neighbor_graph import flatten_topologies
+
+            n_node_total = nframes_sample * nloc_sample
+            s_topologies = build_synthetic_topologies(
+                model,
+                n_node_total,
+                next_safe_prime(
+                    n_node_total + 2,
+                    _forbidden | {nframes_sample, n_node_total, e_sample},
+                ),
+                dtype=torch.float64,
+                device=torch.device("cpu"),
+                nframes=nframes_sample,
+                forbidden=_forbidden,
+            )
             if is_native_spin:
                 # Native-spin ABI (NativeSpinEnergyModel.forward_lower_graph_exportable):
                 # slot 10 is ``spin`` (mandatory), slots 11/12 are
@@ -2268,19 +2344,27 @@ def _trace_and_export_impl(
                     _allow_non_fake_inputs=True,
                 )
             else:
+                _want_efield = bool(getattr(_lr, "efield", False))
                 traced = model.forward_lower_graph_exportable(
                     *sample_inputs[:10],
                     fparam=sample_inputs[10],
                     aparam=sample_inputs[11],
                     do_atomic_virial=do_atomic_virial,
                     charge_spin=sample_inputs[12],
-                    efield_coord=sample_inputs[13] if _want_ec else None,
+                    efield=sample_inputs[13] if _want_efield else None,
+                    efield_coord=sample_inputs[13 + int(_want_efield)]
+                    if _want_ec
+                    else None,
+                    topologies=s_topologies,
                     destination_sorted=True,
                     tracing_mode="symbolic",
                     _allow_non_fake_inputs=True,
                 )
+            sample_inputs = (*sample_inputs, *flatten_topologies(s_topologies))
             dynamic_shapes = _build_graph_dynamic_shapes(
-                *sample_inputs, is_native_spin=is_native_spin
+                *sample_inputs,
+                is_native_spin=is_native_spin,
+                topologies=s_topologies,
             )
         output_keys = traced_output_keys(traced)
         exported = torch.export.export(

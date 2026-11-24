@@ -478,21 +478,30 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
                 source_policy="default" if has_default_cs else "tracked",
             )
         )
-    if _model_has_efield(_model) and _model.get_dim_fparam() == 0:
-        # The external field RIDES fparam[:, :3] (V/AA): fparam is part of
-        # the traced ABI, so the field stays compile/export/deploy-compatible
-        # without a new input slot. Registered here because the model's own
-        # dim_fparam is 0 (fitting/descriptor ignore fparam; only the plugin
-        # reads it). Tracked and optional: a system without fparam.npy reports
-        # find_fparam=False and the model sees a zero field.
+    if _model_has_efield(_model):
+        # The dedicated field is independent of the SR fitting condition, so
+        # register it for numb_fparam > 0 models as well. Optional: a dataset
+        # without efield.npy evaluates at zero field (or uses old fparam data).
         additional_data_requirement.append(
             DataRequirementItem(
-                "fparam",
+                "efield",
                 ndof=3,
                 atomic=False,
                 must=False,
             )
         )
+        if _model.get_dim_fparam() == 0:
+            # Backward compatibility: datasets that only have fparam.npy keep
+            # working through resolve_efield_frame's fallback. When dim_fparam
+            # is positive, the generic requirement above already carries it.
+            additional_data_requirement.append(
+                DataRequirementItem(
+                    "fparam",
+                    ndof=3,
+                    atomic=False,
+                    must=False,
+                )
+            )
     return additional_data_requirement
 
 
@@ -805,6 +814,7 @@ def _trace_and_compile_graph(
     aparam: torch.Tensor | None,
     charge_spin: torch.Tensor | None,
     spin: torch.Tensor | None,
+    efield: torch.Tensor | None = None,
     compile_opts: dict[str, Any] | None = None,
     task_buffers: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.nn.Module, tuple[str, ...]]:
@@ -965,7 +975,8 @@ def _trace_and_compile_graph(
     # tensors, while forward_common_lower_graph takes it after them.
     s_spin = s_conditioning.pop(0) if spin is not None else None
     s_fparam, s_aparam, s_charge_spin = s_conditioning[:3]
-    s_efield_coord = s_conditioning[3] if len(s_conditioning) > 3 else None
+    s_efield = s_conditioning[3] if len(s_conditioning) > 3 else None
+    s_efield_coord = s_conditioning[4] if len(s_conditioning) > 4 else None
 
     # Build a synthetic long-range all-pairs graph for models that consume one
     # (e.g. DPA4C-LR).  The exact coordinates do not matter for shape tracing;
@@ -1001,6 +1012,8 @@ def _trace_and_compile_graph(
     s_topology_vals = flatten_topologies(s_topologies)
     n_topology_vals = len(s_topology_vals)
 
+    has_efield = _model_has_efield(model)
+
     def fn(
         atype: torch.Tensor,
         n_node: torch.Tensor,
@@ -1016,12 +1029,16 @@ def _trace_and_compile_graph(
         aparam: torch.Tensor | None,
         charge_spin: torch.Tensor | None,
         spin: torch.Tensor | None,
-        efield_coord: torch.Tensor | None,
-        lr_edge_index: torch.Tensor,
-        lr_edge_vec: torch.Tensor,
-        lr_edge_mask: torch.Tensor,
         *extra_vals: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        # Insert the dedicated field only for efield-enabled models. All other
+        # models retain the exact pre-efield lower ABI (including its optional
+        # pruning of unused trailing inputs by make_fx).
+        efield = extra_vals[0] if has_efield else None
+        offset = int(has_efield)
+        efield_coord = extra_vals[offset]
+        lr_edge_index, lr_edge_vec, lr_edge_mask = extra_vals[offset + 1 : offset + 4]
+        extra_vals = extra_vals[offset + 4 :]
         topologies = unflatten_topologies(topology_names, extra_vals[:n_topology_vals])
         task_buf_vals = extra_vals[n_topology_vals:]
         # Patch task-specific buffers with the proxy tensors so make_fx records
@@ -1066,6 +1083,7 @@ def _trace_and_compile_graph(
                 aparam=aparam,
                 charge_spin=charge_spin,
                 spin=spin,
+                efield=efield,
                 efield_coord=efield_coord,
                 topologies=topologies,
                 **legacy_lr_kwargs,
@@ -1115,6 +1133,7 @@ def _trace_and_compile_graph(
         s_aparam,
         s_charge_spin,
         s_spin,
+        *((s_efield,) if has_efield else ()),
         s_efield_coord,
         s_lr_graph.edge_index,
         s_lr_graph.edge_vec,
@@ -1335,16 +1354,6 @@ class _CompiledModel(torch.nn.Module):
                 spin,
                 efield=efield,
             )
-        if efield is not None:
-            # The traced ABI is shared with the .pt2 export; threading a new
-            # conditioning input through make_fx and the serialization is not
-            # done yet, so the field requires the eager path for now.
-            raise NotImplementedError(
-                "the external electric field (efield) is not yet supported "
-                "with enable_compile; train with enable_compile=false or run "
-                "the eager evaluation"
-            )
-
         from deepmd.dpmodel.utils.nlist import (
             build_neighbor_list,
             extend_coord_with_ghosts,
@@ -1374,6 +1383,7 @@ class _CompiledModel(torch.nn.Module):
                 nframes,
                 nloc,
                 rcut,
+                efield=efield,
             )
 
         nsel = self.original_model.get_nsel()
@@ -1460,9 +1470,8 @@ class _CompiledModel(torch.nn.Module):
                     .expand(nframes, -1)
                 )
         if fparam is None and _dim_fparam == 0 and _model_has_efield(_model):
-            # The field rides fparam[:, :3]; the traced branch is frozen with
-            # the input present, so normalize an absent one to a zero field
-            # (numerically identical to None) instead of changing the pytree.
+            # Keep the legacy fparam fallback in the traced ABI and normalize
+            # an absent one to zeros instead of changing the pytree.
             fparam = torch.zeros(
                 nframes, 3, dtype=ext_coord.dtype, device=ext_coord.device
             )
@@ -1594,6 +1603,7 @@ class _CompiledModel(torch.nn.Module):
         do_atomic_virial: bool = False,
         charge_spin: torch.Tensor | None = None,
         spin: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compiled forward over a batch whose node axis is already flat.
 
@@ -1646,6 +1656,7 @@ class _CompiledModel(torch.nn.Module):
                 charge_spin,
                 spin,
                 n_node,
+                efield=efield,
             )
         del do_atomic_virial
         if self._graph_eligible is None:
@@ -1668,6 +1679,7 @@ class _CompiledModel(torch.nn.Module):
             0,
             self.original_model.get_rcut(),
             n_node=n_node,
+            efield=efield,
         )
 
     def _forward_graph(
@@ -1683,6 +1695,7 @@ class _CompiledModel(torch.nn.Module):
         nloc: int,
         rcut: float,
         n_node: torch.Tensor | None = None,
+        efield: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Carry-all GRAPH forward -> compiled ``forward_common_lower_graph``.
 
@@ -1753,11 +1766,24 @@ class _CompiledModel(torch.nn.Module):
                     .expand(nframes, -1)
                 )
         if fparam is None and _dim_fparam == 0 and _model_has_efield(_model):
-            # See the dense path: the field rides fparam[:, :3], so an absent
-            # fparam is normalized to a zero field (identical to None).
+            # Keep the legacy fparam fallback in the traced ABI. An absent
+            # fparam is normalized to zeros; the dedicated efield input below
+            # takes precedence whenever it is supplied.
             fparam = torch.zeros(
                 nframes, 3, dtype=coord_3d.dtype, device=coord_3d.device
             )
+        if _model_has_efield(_model):
+            from deepmd.dpmodel.long_range.efield import resolve_efield_frame
+
+            # The traced graph always carries a dedicated efield tensor.
+            # Resolve the deprecated fparam[:, :3] fallback OUTSIDE that graph,
+            # then normalize a wholly absent field to zeros, so runtime input
+            # presence never changes the compiled pytree.
+            efield = resolve_efield_frame(True, efield, fparam)
+            if efield is None:
+                efield = torch.zeros(
+                    nframes, 3, dtype=coord_3d.dtype, device=coord_3d.device
+                )
         _dim_cs = _model.get_dim_chg_spin()
         if charge_spin is None and _dim_cs > 0:
             _default_cs = _model.get_default_chg_spin()
@@ -1867,6 +1893,7 @@ class _CompiledModel(torch.nn.Module):
                     aparam,
                     charge_spin,
                     spin,
+                    efield,
                     task_buffers=self._task_buffers,
                     compile_opts=self._compile_opts,
                 ),
@@ -1924,6 +1951,7 @@ class _CompiledModel(torch.nn.Module):
                 aparam,
                 charge_spin,
                 spin,
+                *((efield,) if _model_has_efield(_model) else ()),
                 efield_coord,
                 lr_edge_index,
                 lr_edge_vec,

@@ -1403,6 +1403,7 @@ def make_model(
             do_atomic_virial: bool = False,
             charge_spin: torch.Tensor | None = None,
             spin: torch.Tensor | None = None,
+            efield: torch.Tensor | None = None,
             efield_coord: torch.Tensor | None = None,
             destination_sorted: bool = False,
             topologies: dict[str, Any] | None = None,
@@ -1494,6 +1495,7 @@ def make_model(
                         fparam: torch.Tensor | None,
                         aparam: torch.Tensor | None,
                         charge_spin: torch.Tensor | None,
+                        efield: torch.Tensor | None,
                         efield_coord: torch.Tensor | None,
                         *topology_vals: torch.Tensor,
                     ) -> dict[str, torch.Tensor]:
@@ -1513,6 +1515,7 @@ def make_model(
                             fparam=fparam,
                             aparam=aparam,
                             charge_spin=charge_spin,
+                            efield=efield,
                             efield_coord=efield_coord,
                             topologies=unflatten_topologies(
                                 topology_names, topology_vals
@@ -1533,9 +1536,12 @@ def make_model(
                         fparam,
                         aparam,
                         charge_spin,
+                        efield,
                         efield_coord,
                         *flatten_topologies(topologies),
                     )
+
+                has_efield = efield is not None
 
                 def fn_topologies(
                     atype: torch.Tensor,
@@ -1551,8 +1557,10 @@ def make_model(
                     fparam: torch.Tensor | None,
                     aparam: torch.Tensor | None,
                     charge_spin: torch.Tensor | None,
-                    *topology_vals: torch.Tensor,
+                    *extra_vals: torch.Tensor,
                 ) -> dict[str, torch.Tensor]:
+                    efield_arg = extra_vals[0] if has_efield else None
+                    topology_vals = extra_vals[int(has_efield) :]
                     return model.forward_common_lower_graph(
                         atype,
                         n_node,
@@ -1569,6 +1577,7 @@ def make_model(
                         fparam=fparam,
                         aparam=aparam,
                         charge_spin=charge_spin,
+                        efield=efield_arg,
                         topologies=unflatten_topologies(topology_names, topology_vals),
                     )
 
@@ -1586,7 +1595,65 @@ def make_model(
                     fparam,
                     aparam,
                     charge_spin,
+                    *((efield,) if has_efield else ()),
                     *flatten_topologies(topologies),
+                )
+
+            if spin is None and efield is not None:
+
+                def fn_efield(
+                    atype: torch.Tensor,
+                    n_node: torch.Tensor,
+                    n_local: torch.Tensor,
+                    edge_index: torch.Tensor,
+                    edge_vec: torch.Tensor,
+                    edge_mask: torch.Tensor,
+                    destination_order: torch.Tensor,
+                    destination_row_ptr: torch.Tensor,
+                    source_order: torch.Tensor,
+                    source_row_ptr: torch.Tensor,
+                    fparam: torch.Tensor | None,
+                    aparam: torch.Tensor | None,
+                    charge_spin: torch.Tensor | None,
+                    efield: torch.Tensor | None,
+                    efield_coord: torch.Tensor | None,
+                ) -> dict[str, torch.Tensor]:
+                    return model.forward_common_lower_graph(
+                        atype,
+                        n_node,
+                        n_local,
+                        edge_index,
+                        edge_vec,
+                        edge_mask,
+                        destination_order,
+                        destination_row_ptr,
+                        source_order,
+                        source_row_ptr,
+                        destination_sorted=destination_sorted,
+                        do_atomic_virial=do_atomic_virial,
+                        fparam=fparam,
+                        aparam=aparam,
+                        charge_spin=charge_spin,
+                        efield=efield,
+                        efield_coord=efield_coord,
+                    )
+
+                return make_fx(fn_efield, **make_fx_kwargs)(
+                    atype,
+                    n_node,
+                    n_local,
+                    edge_index,
+                    edge_vec,
+                    edge_mask,
+                    destination_order,
+                    destination_row_ptr,
+                    source_order,
+                    source_row_ptr,
+                    fparam,
+                    aparam,
+                    charge_spin,
+                    efield,
+                    efield_coord,
                 )
 
             # ``spin`` is a traced INPUT only when a real spin tensor is

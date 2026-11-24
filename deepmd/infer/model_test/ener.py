@@ -402,6 +402,10 @@ class EnerTester(ModelTester):
         efield_mode = getattr(dp, "efield_mode", None)
         if efield_mode == "atomic":
             data.add("efield", 3, atomic=True, must=True, high_prec=False)
+        if efield_mode in ("uniform_fparam", "uniform_efield"):
+            # Dedicated external-field input; optional zero-field datasets
+            # still evaluate (the model sees no field or a zero field).
+            data.add("efield", 3, atomic=False, must=False, high_prec=False)
         if self.atomic:
             data.add("atom_ener", 1, atomic=True, must=True, high_prec=False)
         if dp.get_dim_fparam() > 0:
@@ -458,7 +462,8 @@ class EnerTester(ModelTester):
         efield_mode = getattr(dp, "efield_mode", None)
         efield = (
             test_data["efield"].reshape([nframes, -1])
-            if efield_mode == "atomic"
+            if efield_mode in ("atomic", "uniform_fparam", "uniform_efield")
+            and test_data.get("find_efield", 0.0) != 0.0
             else None
         )
         spin = test_data["spin"].reshape([nframes, -1]) if dp.has_spin else None

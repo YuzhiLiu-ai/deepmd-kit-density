@@ -538,11 +538,14 @@ class FullValidator:
             coord=test_data["coord"].reshape(nframes, -1),
             atom_types=test_data["type"],
             box=test_data["box"] if data_system.pbc else None,
-            # The field rides fparam[:, :3] (V/AA): an efield-enabled plugin
-            # needs fparam even when the model's own dim_fparam is 0.
+            # Keep the deprecated fparam transport for old datasets; the
+            # dedicated efield input takes precedence when both are present.
             fparam=test_data["fparam"]
             if (self.model.get_dim_fparam() > 0 or _has_efield)
             and bool(test_data.get("find_fparam", 0.0))
+            else None,
+            efield=test_data["efield"]
+            if _has_efield and bool(test_data.get("find_efield", 0.0))
             else None,
             aparam=test_data["aparam"] if self.model.get_dim_aparam() > 0 else None,
             spin=spin,
@@ -561,6 +564,7 @@ class FullValidator:
         atom_types: np.ndarray,
         box: np.ndarray | None,
         fparam: np.ndarray | None,
+        efield: np.ndarray | None,
         aparam: np.ndarray | None,
         spin: np.ndarray | None,
         include_virial: bool,
@@ -579,6 +583,7 @@ class FullValidator:
             atom_types_batch: np.ndarray,
             box_batch: np.ndarray | None,
             fparam_batch: np.ndarray | None,
+            efield_batch: np.ndarray | None,
             aparam_batch: np.ndarray | None,
             spin_batch: np.ndarray | None,
         ) -> dict[str, np.ndarray]:
@@ -616,6 +621,11 @@ class FullValidator:
                 )
             else:
                 fparam_input = None
+            efield_input = (
+                to_torch_tensor(efield_batch.reshape(-1, 3))
+                if efield_batch is not None
+                else None
+            )
             if aparam_batch is not None:
                 aparam_input = to_torch_tensor(
                     aparam_batch.reshape(-1, natoms, self.model.get_dim_aparam())
@@ -644,6 +654,7 @@ class FullValidator:
                 type_input,
                 box=box_input,
                 fparam=fparam_input,
+                efield=efield_input,
                 aparam=aparam_input,
                 **spin_kwargs,
             )
@@ -688,6 +699,7 @@ class FullValidator:
             atom_types,
             box,
             fparam,
+            efield,
             aparam,
             spin,
         )

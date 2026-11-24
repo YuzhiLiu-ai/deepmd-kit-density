@@ -836,6 +836,7 @@ class DeepEval(DeepEvalBackend):
                     fparam: torch.Tensor | None,
                     aparam: torch.Tensor | None,
                     charge_spin: torch.Tensor | None = None,
+                    efield: torch.Tensor | None = None,
                     lr_edge_index: torch.Tensor | None = None,
                     lr_edge_vec: torch.Tensor | None = None,
                     lr_edge_mask: torch.Tensor | None = None,
@@ -865,6 +866,7 @@ class DeepEval(DeepEvalBackend):
                         fparam=fparam,
                         aparam=aparam,
                         charge_spin=charge_spin,
+                        efield=efield,
                         topologies=topologies,
                         efield_coord=efield_coord,
                         **long_range_kwargs,
@@ -1266,21 +1268,19 @@ class DeepEval(DeepEvalBackend):
     def get_has_efield(self) -> bool:
         """Check if the model has efield.
 
-        True when the reconstructed model's long-range plugin consumes a
-        uniform external field, read from ``fparam[:, :3]``. Metadata-only
-        mode (``.pt2``/``.pte`` without a model record) cannot reconstruct
-        the plugin and reports False; the exported artifacts do not carry
-        the field transport yet.
+        True when the model's long-range plugin consumes a uniform external
+        field through the dedicated ``efield`` input. The deprecated
+        ``fparam[:, :3]`` transport remains available as a fallback.
         """
         if self._dpmodel is not None:
             atomic_model = getattr(self._dpmodel, "atomic_model", None)
             has_efield = getattr(atomic_model, "has_efield", None)
             if has_efield is not None:
                 return bool(has_efield())
-        return False
+        return bool(self.metadata.get("has_efield", False))
 
     def get_efield_mode(self) -> str | None:
-        """The plugin's uniform field rides ``fparam[:, :3]``."""
+        """Return the legacy mode name expected by existing callers."""
         return "uniform_fparam" if self.get_has_efield() else None
 
     def get_has_spin(self) -> bool:
@@ -1308,6 +1308,7 @@ class DeepEval(DeepEvalBackend):
         fparam: np.ndarray | None = None,
         aparam: np.ndarray | None = None,
         charge_spin: np.ndarray | None = None,
+        efield: np.ndarray | None = None,
         **kwargs: Any,
     ) -> dict[str, np.ndarray]:
         """Evaluate the energy, force and virial by using this DP.
@@ -1388,6 +1389,7 @@ class DeepEval(DeepEvalBackend):
                 aparam,
                 request_defs,
                 charge_spin,
+                efield,
             )
         return dict(
             zip(
@@ -2019,6 +2021,7 @@ class DeepEval(DeepEvalBackend):
         aparam: np.ndarray | None,
         request_defs: list[OutputVariableDef],
         charge_spin: np.ndarray | None = None,
+        efield: np.ndarray | None = None,
     ) -> tuple[np.ndarray, ...]:
         if self.metadata.get("lower_input_kind") in (
             "graph",
@@ -2026,7 +2029,14 @@ class DeepEval(DeepEvalBackend):
             "dpa4c_canonical",
         ):
             return self._eval_model_graph(
-                coords, cells, atom_types, fparam, aparam, request_defs, charge_spin
+                coords,
+                cells,
+                atom_types,
+                fparam,
+                aparam,
+                request_defs,
+                charge_spin,
+                efield,
             )
         model_inputs, mapping_t, nframes, natoms = self._prepare_inputs(
             coords, cells, atom_types, fparam, aparam, charge_spin
@@ -2455,6 +2465,7 @@ class DeepEval(DeepEvalBackend):
         aparam: np.ndarray | None,
         request_defs: list[OutputVariableDef],
         charge_spin: np.ndarray | None = None,
+        efield: np.ndarray | None = None,
     ) -> tuple[np.ndarray, ...]:
         """Evaluate a graph-lower model (``lower_input_kind == "graph"``).
 
@@ -2623,6 +2634,27 @@ class DeepEval(DeepEvalBackend):
                 aparam_t,
                 charge_spin_t,
             )
+            if self.get_has_efield():
+                from deepmd.dpmodel.long_range.efield import resolve_efield_frame
+
+                efield_t = (
+                    torch.tensor(
+                        efield.reshape(nframes, 3),
+                        dtype=torch.float64,
+                        device=DEVICE,
+                    )
+                    if efield is not None
+                    else None
+                )
+                # The exported/compiled ABI always carries a tensor. Resolve
+                # the legacy fparam fallback here and normalize a wholly absent
+                # field to zero, without changing the positional input pytree.
+                efield_t = resolve_efield_frame(True, efield_t, fparam_t)
+                if efield_t is None:
+                    efield_t = torch.zeros(
+                        nframes, 3, dtype=torch.float64, device=DEVICE
+                    )
+                model_inputs += (efield_t,)
             if lr_graph is not None:
                 model_inputs += (
                     torch.as_tensor(
@@ -2642,6 +2674,10 @@ class DeepEval(DeepEvalBackend):
                     ),
                 )
         runner_kwargs: dict[str, Any] = {}
+        # .pt checkpoints use the eager runner's keyword topology/coordinate
+        # inputs; exported .pt2/.pte modules consume their flattened positional
+        # ABI instead.
+        flat_export = self._is_pt2 or self.model_path.endswith(".pte")
         dp_model = getattr(self, "_dpmodel", None)
         atomic_model = getattr(dp_model, "atomic_model", None)
         if atomic_model is not None and atomic_model.has_long_range():
@@ -2657,22 +2693,21 @@ class DeepEval(DeepEvalBackend):
                 if box_input is not None
                 else None
             )
-            runner_kwargs["topologies"] = atomic_model.build_topologies(
+            topologies = atomic_model.build_topologies(
                 coord_flat_t,
                 n_node_t,
                 box_t,
                 atype=atype_t,
             )
-            # Continuous-branch efield: pass the coordinates (for periodic
-            # molecular systems: whole-molecule unwrapped first) so the lower
-            # rebuilds the external potential on a differentiable leaf; the
-            # .pt2 ABI does not thread this input yet.
+            # Continuous-branch efield: pass whole-molecule-unwrapped
+            # coordinates so the lower rebuilds the external potential on a
+            # differentiable leaf. Exported artifacts carry this input directly
+            # after efield and before the flattened topology fields.
             _lr = getattr(atomic_model, "long_range", None)
             from deepmd.dpmodel.long_range.efield import uses_efield_potential
 
             if (
-                not self._is_pt2
-                and _lr is not None
+                _lr is not None
                 and getattr(_lr, "efield", False)
                 and uses_efield_potential(
                     getattr(_lr, "efield_potential", "force_only")
@@ -2691,7 +2726,16 @@ class DeepEval(DeepEvalBackend):
                         atype_t,
                         atomic_model.get_type_map(),
                     )
-                runner_kwargs["efield_coord"] = _efield_coord
+                if flat_export:
+                    model_inputs += (_efield_coord,)
+                else:
+                    runner_kwargs["efield_coord"] = _efield_coord
+            if flat_export:
+                from deepmd.dpmodel.utils.neighbor_graph import flatten_topologies
+
+                model_inputs += flatten_topologies(topologies)
+            else:
+                runner_kwargs["topologies"] = topologies
         if self._is_pt2:
             model_ret = self._pt2_runner(*model_inputs)
         else:

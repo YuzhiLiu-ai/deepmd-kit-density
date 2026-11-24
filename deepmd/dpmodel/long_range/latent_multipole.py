@@ -263,10 +263,10 @@ class LatentMultipoleLongRange(LatentChargeLongRange):
         # it shifts the field each atom responds to, never the geometry (which
         # enters only through the relative pair vectors).
         #
-        # Two transports: the explicit `efield` input (per-frame (nf, 3), API
-        # and tests) wins; otherwise the field RIDES fparam[:, :3] (V/AA) --
-        # the compile/export/deploy-friendly route, because fparam is already
-        # part of the traced ABI. With fparam as the transport the charge net
+        # The dedicated `efield` input (per-frame (nf, 3)) wins and is
+        # supported by eager/compiled/exported paths. The deprecated
+        # fparam[:, :3] fallback (V/AA) remains for old datasets. With fparam
+        # as the transport the charge net
         # (built for the model's own numb_fparam, 0 in this configuration)
         # must NOT see it as conditioning, so it receives None below.
         efield_frame = resolve_efield_frame(self.efield, efield, fparam)

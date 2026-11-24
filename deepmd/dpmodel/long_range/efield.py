@@ -94,6 +94,14 @@ def resolve_efield_frame(efield_flag: bool, efield: Any, fparam: Any) -> Any:
                 "`efield` reads the external field from fparam[:, :3], "
                 f"but the given fparam has dimension {fparam.shape[-1]} (< 3)."
             )
+        import warnings
+
+        warnings.warn(
+            "using fparam[:, :3] as the external electric field is deprecated; "
+            "use the dedicated `efield` input instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return fparam[..., :3]
     return None
 
@@ -221,7 +229,7 @@ def infer_molecule_ids(
                 a = parent[a]
             return a
 
-        cell = None if box_np is None else box_np[f]
+        cell = None if box_np is None else box_np[f].reshape(3, 3)
         for i in range(n):
             if not np.isfinite(rad[i]):
                 continue
@@ -327,7 +335,7 @@ def unwrap_molecules(
     offset = 0
     for f, n in enumerate(n_node_np):
         n = int(n)
-        cell = box_np[f]
+        cell = box_np[f].reshape(3, 3)
         inv_cell = np.linalg.inv(cell)
         pos = coord_np[offset : offset + n]
         mols = mol_np[offset : offset + n]
